@@ -49,6 +49,9 @@ class DualModelRunner:
             raise ValueError(
                 "DualModelRunner currently does not support speculative decoding."
             )
+        # add two streams (hardcoded for now)
+        self.decode_stream = torch.cuda.default_stream(device)
+        self.embed_stream = torch.cuda.Stream(device)
 
         dual_cfg = DualModelConfig.from_vllm_config(vllm_config)
         if dual_cfg is None:
@@ -68,6 +71,7 @@ class DualModelRunner:
         self.model: nn.Module | None = None
         self.req_id_to_model_id: dict[str, str] = {}
         self.pending_embed_output: ModelRunnerOutput | None = None
+        self.pending_embed_needs_pool = False
         self.pending_req_order: list[str] = []
         self.decode_kv_group_indices: tuple[int, ...] = ()
         self.embed_kv_group_indices: tuple[int, ...] = ()
@@ -313,14 +317,32 @@ class DualModelRunner:
 
         decode_output = None
         if split_outputs.decode.num_scheduled_tokens or split_outputs.decode.finished_req_ids:
-            decode_output = self.decode_runner.execute_model(
-                split_outputs.decode,
-                intermediate_tensors=intermediate_tensors,
-            )
+            with torch.cuda.stream(self.decode_stream):
+                decode_output = self.decode_runner.execute_model(
+                    split_outputs.decode,
+                    intermediate_tensors=intermediate_tensors,
+                )
 
+        embed_exec_output = None
         embed_output: ModelRunnerOutput | None = None
         if split_outputs.embed.num_scheduled_tokens or split_outputs.embed.finished_req_ids:
-            embed_exec_output = self.embed_runner.execute_model(split_outputs.embed)
+            with torch.cuda.stream(self.embed_stream):
+                embed_exec_output = self.embed_runner.execute_model(
+                    split_outputs.embed,
+                )
+
+        decode_needs_sample = (
+            decode_output is None and bool(split_outputs.decode.num_scheduled_tokens)
+        )
+        if decode_needs_sample:
+            self.pending_embed_output = embed_exec_output
+            self.pending_embed_needs_pool = (
+                split_outputs.embed.num_scheduled_tokens
+                or split_outputs.embed.finished_req_ids
+            ) and embed_exec_output is None
+            return None
+
+        if split_outputs.embed.num_scheduled_tokens or split_outputs.embed.finished_req_ids:
             embed_output = (
                 self.embed_runner.pool()
                 if embed_exec_output is None
@@ -329,11 +351,8 @@ class DualModelRunner:
             if embed_output is None:
                 raise RuntimeError("Embed runner failed to produce pooling output.")
 
-        if decode_output is None and split_outputs.decode.num_scheduled_tokens:
-            self.pending_embed_output = embed_output
-            return None
-
         self.pending_embed_output = None
+        self.pending_embed_needs_pool = False
         return merge_model_runner_outputs(
             scheduled_req_order=self.pending_req_order,
             decode_output=decode_output,
@@ -342,12 +361,18 @@ class DualModelRunner:
 
     def sample_tokens(self, grammar_output: GrammarOutput | None):
         decode_output = self.decode_runner.sample_tokens(grammar_output)
+        embed_output = self.pending_embed_output
+        if self.pending_embed_needs_pool:
+            embed_output = self.embed_runner.pool()
+            if embed_output is None:
+                raise RuntimeError("Embed runner failed to produce pooling output.")
         merged = merge_model_runner_outputs(
             scheduled_req_order=self.pending_req_order,
             decode_output=decode_output,
-            embed_output=self.pending_embed_output,
+            embed_output=embed_output,
         )
         self.pending_embed_output = None
+        self.pending_embed_needs_pool = False
         self.pending_req_order = []
         return merged
 
