@@ -26,6 +26,7 @@ class DualModelConfig:
     embed_enforce_eager: bool | None = None
     decode_running_reserve: int | None = None
     max_embed_running_reqs: int | None = None
+    embed_waiting_min_batch_reqs: int | None = None
     embed_release_running_decode_threshold: int | None = None
     embed_release_when_decode_waiting_drained: bool = False
 
@@ -56,6 +57,9 @@ class DualModelConfig:
             embed_enforce_eager=raw_cfg.get("embed_enforce_eager"),
             decode_running_reserve=raw_cfg.get("decode_running_reserve"),
             max_embed_running_reqs=raw_cfg.get("max_embed_running_reqs"),
+            embed_waiting_min_batch_reqs=raw_cfg.get(
+                "embed_waiting_min_batch_reqs"
+            ),
             embed_release_running_decode_threshold=raw_cfg.get(
                 "embed_release_running_decode_threshold"
             ),

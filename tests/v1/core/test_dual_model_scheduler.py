@@ -56,6 +56,41 @@ def test_dual_model_embed_requests_allocate_and_free_kv(monkeypatch):
     assert free_mock.call_count == 2
 
 
+def test_dual_model_scheduler_output_records_schedule_time_counts(monkeypatch):
+    monkeypatch.setattr(current_platform, "device_type", "cuda")
+    scheduler = create_scheduler(max_num_seqs=4, max_num_batched_tokens=32)
+    scheduler.dual_model_config = DualModelConfig(embed_model="embed-model")
+
+    decode_request = create_requests(num_requests=1, num_tokens=8)[0]
+    embed_request = Request(
+        request_id="embed-0",
+        prompt_token_ids=[7] * 8,
+        sampling_params=None,
+        pooling_params=PoolingParams(task="embed"),
+    )
+    scheduler.add_request(decode_request)
+    scheduler.add_request(embed_request)
+
+    output = scheduler.schedule()
+
+    assert output.schedule_start_running_reqs == 0
+    assert output.schedule_start_waiting_reqs == 2
+    assert output.schedule_start_running_decode_reqs == 0
+    assert output.schedule_start_running_embed_reqs == 0
+    assert output.schedule_start_waiting_decode_reqs == 1
+    assert output.schedule_start_waiting_embed_reqs == 1
+    assert output.schedule_end_running_reqs == 2
+    assert output.schedule_end_waiting_reqs == 0
+    assert output.schedule_end_running_decode_reqs == 1
+    assert output.schedule_end_running_embed_reqs == 1
+    assert output.schedule_end_waiting_decode_reqs == 0
+    assert output.schedule_end_waiting_embed_reqs == 0
+    assert output.schedule_max_tokens == 32
+    assert output.schedule_max_running_reqs == 4
+    assert output.schedule_running_slots_remaining == 2
+    assert output.schedule_waiting_stop_reason == "no_waiting_requests"
+
+
 def test_dual_model_without_embed_gate_does_not_scan_model_counts(monkeypatch):
     monkeypatch.setattr(current_platform, "device_type", "cuda")
     scheduler = create_scheduler(max_num_seqs=4, max_num_batched_tokens=32)

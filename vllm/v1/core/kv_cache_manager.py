@@ -127,6 +127,7 @@ class KVCacheManager:
         # this comment because when the log stats is enabled there are still
         # potential configs we could expose in the future.
         self.prefix_cache_stats = PrefixCacheStats() if log_stats else None
+        self.last_allocation_failure: dict[str, int | float | str] | None = None
 
         self.coordinator = get_kv_cache_coordinator(
             kv_cache_config=kv_cache_config,
@@ -160,6 +161,14 @@ class KVCacheManager:
             The KV cache usage (between 0.0 and 1.0).
         """
         return self.block_pool.get_usage()
+
+    def get_num_free_blocks(self) -> int:
+        """Get the number of currently free KV cache blocks."""
+        return self.block_pool.get_num_free_blocks()
+
+    def get_num_gpu_blocks(self) -> int:
+        """Get the total number of KV cache blocks, including the null block."""
+        return self.block_pool.num_gpu_blocks
 
     def make_prefix_cache_stats(self) -> PrefixCacheStats | None:
         """Get (and reset) the prefix cache stats.
@@ -297,6 +306,7 @@ class KVCacheManager:
         Returns:
             A list of new allocated blocks.
         """
+        self.last_allocation_failure = None
         # When loading KV data asynchronously, we may have zero new tokens to
         # compute while still allocating slots for externally computed tokens.
         if num_new_tokens == 0 and num_external_computed_tokens == 0:
@@ -345,8 +355,24 @@ class KVCacheManager:
             num_tokens_main_model=num_tokens_main_model,
         )
 
-        if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
+        num_free_blocks = self.block_pool.get_num_free_blocks()
+        if num_blocks_to_allocate > num_free_blocks:
             # Cannot allocate new blocks
+            self.last_allocation_failure = {
+                "request_id": request.request_id,
+                "num_blocks_to_allocate": num_blocks_to_allocate,
+                "num_free_blocks": num_free_blocks,
+                "num_gpu_blocks": self.block_pool.num_gpu_blocks,
+                "kv_cache_usage": self.block_pool.get_usage(),
+                "num_new_tokens": num_new_tokens,
+                "num_new_computed_tokens": num_new_computed_tokens,
+                "num_external_computed_tokens": num_external_computed_tokens,
+                "num_lookahead_tokens": num_lookahead_tokens,
+                "num_tokens_need_slot": num_tokens_need_slot,
+                "num_tokens_main_model": num_tokens_main_model,
+                "total_computed_tokens": total_computed_tokens,
+                "num_encoder_tokens": num_encoder_tokens,
+            }
             return None
 
         if (

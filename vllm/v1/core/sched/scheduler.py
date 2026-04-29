@@ -180,6 +180,7 @@ class Scheduler(SchedulerInterface):
         self._num_waiting_embed_reqs = 0
         self._embed_wait_drained_phase_started = False
         self._embed_wait_drained_phase_released = False
+        self._embed_waiting_burst_remaining: int | None = None
 
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
@@ -407,6 +408,25 @@ class Scheduler(SchedulerInterface):
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
             token_budget = 0
+        self._init_embed_waiting_burst_budget()
+        schedule_start_running_reqs = len(self.running)
+        schedule_start_waiting_reqs = len(self.waiting) + len(self.skipped_waiting)
+        if self.dual_model_config is None:
+            schedule_start_running_decode_reqs = 0
+            schedule_start_running_embed_reqs = 0
+        else:
+            schedule_start_running_decode_reqs = self._num_running_decode_reqs
+            schedule_start_running_embed_reqs = self._num_running_embed_reqs
+        schedule_start_waiting_decode_reqs = self._num_waiting_decode_reqs
+        schedule_start_waiting_embed_reqs = self._num_waiting_embed_reqs
+        schedule_waiting_stop_reason = ""
+        schedule_kv_failure_blocks_requested = 0
+        schedule_kv_failure_free_blocks = 0
+        schedule_kv_failure_num_tokens_need_slot = 0
+        schedule_kv_failure_num_new_tokens = 0
+        schedule_kv_failure_request_id = ""
+        schedule_kv_failure_model_id = -1
+        schedule_kv_failure_is_embed = False
 
         # Encoder-related.
         scheduled_encoder_inputs: dict[str, list[int]] = {}
@@ -616,10 +636,12 @@ class Scheduler(SchedulerInterface):
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
+                    schedule_waiting_stop_reason = "max_running_reqs"
                     break
 
                 request_queue = self._select_waiting_queue_for_scheduling()
                 if request_queue is None:
+                    schedule_waiting_stop_reason = "no_schedulable_queue"
                     break
 
                 request = request_queue.peek_request()
@@ -742,6 +764,9 @@ class Scheduler(SchedulerInterface):
                     ):
                         # If chunked_prefill is disabled,
                         # we can stop the scheduling here.
+                        schedule_waiting_stop_reason = (
+                            "chunked_prefill_disabled_token_budget"
+                        )
                         break
 
                     num_new_tokens = min(num_new_tokens, token_budget)
@@ -763,6 +788,9 @@ class Scheduler(SchedulerInterface):
                         )
                         if num_new_tokens == 0:
                             # The request cannot be scheduled.
+                            schedule_waiting_stop_reason = (
+                                "encoder_budget_or_cache_exhausted"
+                            )
                             break
 
                 if self.need_mamba_block_aligned_split:
@@ -773,6 +801,7 @@ class Scheduler(SchedulerInterface):
                         num_external_computed_tokens,
                     )
                     if num_new_tokens == 0:
+                        schedule_waiting_stop_reason = "mamba_block_aligned_split"
                         break
 
                 # Handles an edge case when P/D Disaggregation
@@ -812,6 +841,30 @@ class Scheduler(SchedulerInterface):
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
+                    schedule_waiting_stop_reason = "kv_allocation_failed"
+                    kv_failure = self.kv_cache_manager.last_allocation_failure
+                    if kv_failure is not None:
+                        schedule_kv_failure_blocks_requested = int(
+                            kv_failure.get("num_blocks_to_allocate", 0)
+                        )
+                        schedule_kv_failure_free_blocks = int(
+                            kv_failure.get("num_free_blocks", 0)
+                        )
+                        schedule_kv_failure_num_tokens_need_slot = int(
+                            kv_failure.get("num_tokens_need_slot", 0)
+                        )
+                        schedule_kv_failure_num_new_tokens = int(
+                            kv_failure.get("num_new_tokens", 0)
+                        )
+                    schedule_kv_failure_request_id = str(request.request_id)
+                    schedule_kv_failure_model_id = int(request.model_id)
+                    if self.dual_model_config is not None:
+                        schedule_kv_failure_is_embed = (
+                            request.model_id
+                            == self.dual_model_config.embed_model_id
+                        )
+                    else:
+                        schedule_kv_failure_is_embed = False
 
                     # NOTE: we need to untouch the request from the encode cache
                     # manager
@@ -904,6 +957,24 @@ class Scheduler(SchedulerInterface):
             # re-queue requests skipped in this pass ahead of older skipped items.
             if step_skipped_waiting:
                 self.skipped_waiting.prepend_requests(step_skipped_waiting)
+            if not schedule_waiting_stop_reason:
+                if token_budget <= 0:
+                    schedule_waiting_stop_reason = "token_budget_exhausted"
+                elif not (self.waiting or self.skipped_waiting):
+                    schedule_waiting_stop_reason = "no_waiting_requests"
+                elif len(self.running) == self.max_num_running_reqs:
+                    schedule_waiting_stop_reason = "max_running_reqs"
+                else:
+                    schedule_waiting_stop_reason = "waiting_loop_exited"
+        else:
+            if preempted_reqs:
+                schedule_waiting_stop_reason = "preempted_reqs"
+            elif self._pause_state != PauseState.UNPAUSED:
+                schedule_waiting_stop_reason = "paused"
+            elif token_budget <= 0:
+                schedule_waiting_stop_reason = "token_budget_exhausted"
+            else:
+                schedule_waiting_stop_reason = "waiting_not_attempted"
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
@@ -979,6 +1050,45 @@ class Scheduler(SchedulerInterface):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
+            schedule_start_running_reqs=schedule_start_running_reqs,
+            schedule_start_waiting_reqs=schedule_start_waiting_reqs,
+            schedule_start_running_decode_reqs=(
+                schedule_start_running_decode_reqs
+            ),
+            schedule_start_running_embed_reqs=schedule_start_running_embed_reqs,
+            schedule_start_waiting_decode_reqs=(
+                schedule_start_waiting_decode_reqs
+            ),
+            schedule_start_waiting_embed_reqs=schedule_start_waiting_embed_reqs,
+            schedule_end_running_reqs=len(self.running),
+            schedule_end_waiting_reqs=len(self.waiting) + len(self.skipped_waiting),
+            schedule_end_running_decode_reqs=self._num_running_decode_reqs,
+            schedule_end_running_embed_reqs=self._num_running_embed_reqs,
+            schedule_end_waiting_decode_reqs=self._num_waiting_decode_reqs,
+            schedule_end_waiting_embed_reqs=self._num_waiting_embed_reqs,
+            schedule_token_budget_remaining=token_budget,
+            schedule_max_tokens=self.max_num_scheduled_tokens,
+            schedule_max_running_reqs=self.max_num_running_reqs,
+            schedule_running_slots_remaining=(
+                self.max_num_running_reqs - len(self.running)
+            ),
+            schedule_waiting_stop_reason=schedule_waiting_stop_reason,
+            schedule_kv_cache_usage=self.kv_cache_manager.usage,
+            schedule_kv_free_blocks=self.kv_cache_manager.get_num_free_blocks(),
+            schedule_kv_total_blocks=self.kv_cache_manager.get_num_gpu_blocks(),
+            schedule_kv_failure_blocks_requested=(
+                schedule_kv_failure_blocks_requested
+            ),
+            schedule_kv_failure_free_blocks=schedule_kv_failure_free_blocks,
+            schedule_kv_failure_num_tokens_need_slot=(
+                schedule_kv_failure_num_tokens_need_slot
+            ),
+            schedule_kv_failure_num_new_tokens=(
+                schedule_kv_failure_num_new_tokens
+            ),
+            schedule_kv_failure_request_id=schedule_kv_failure_request_id,
+            schedule_kv_failure_model_id=schedule_kv_failure_model_id,
+            schedule_kv_failure_is_embed=schedule_kv_failure_is_embed,
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -1104,10 +1214,25 @@ class Scheduler(SchedulerInterface):
     def _embed_waiting_gate_enabled(dual_cfg: DualModelConfig) -> bool:
         return (
             dual_cfg.max_embed_running_reqs is not None
+            or dual_cfg.embed_waiting_min_batch_reqs is not None
             or dual_cfg.embed_release_when_decode_waiting_drained
             or dual_cfg.embed_release_running_decode_threshold is not None
             or dual_cfg.decode_running_reserve is not None
         )
+
+    def _init_embed_waiting_burst_budget(self) -> None:
+        self._embed_waiting_burst_remaining = None
+        dual_cfg = self.dual_model_config
+        if dual_cfg is None or dual_cfg.embed_waiting_min_batch_reqs is None:
+            return
+
+        min_batch_reqs = dual_cfg.embed_waiting_min_batch_reqs
+        if min_batch_reqs <= 1 or self._num_waiting_decode_reqs == 0:
+            self._embed_waiting_burst_remaining = self._num_waiting_embed_reqs
+        elif self._num_waiting_embed_reqs >= min_batch_reqs:
+            self._embed_waiting_burst_remaining = min_batch_reqs
+        else:
+            self._embed_waiting_burst_remaining = 0
 
     def _should_skip_embed_waiting_request(self, request: Request) -> bool:
         dual_cfg = self.dual_model_config
@@ -1149,6 +1274,15 @@ class Scheduler(SchedulerInterface):
             )
         ):
             return True
+
+        if (
+            dual_cfg.embed_waiting_min_batch_reqs is not None
+            and waiting_decode_total > 0
+        ):
+            assert self._embed_waiting_burst_remaining is not None
+            if self._embed_waiting_burst_remaining <= 0:
+                return True
+            self._embed_waiting_burst_remaining -= 1
 
         return False
 
@@ -1510,6 +1644,7 @@ class Scheduler(SchedulerInterface):
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+        scheduled_by_model = self._count_scheduled_by_model(num_scheduled_tokens)
         pooler_outputs = model_runner_output.pooler_output
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
@@ -1747,8 +1882,6 @@ class Scheduler(SchedulerInterface):
                     )
             finished_req_ids.clear()
 
-        scheduled_by_model = self._count_scheduled_by_model(
-            scheduler_output.num_scheduled_tokens)
         if (
             stats := self.make_stats(
                 num_scheduled_reqs=len(scheduler_output.num_scheduled_tokens),
@@ -1761,6 +1894,79 @@ class Scheduler(SchedulerInterface):
                 kv_connector_stats=kv_connector_stats,
                 cudagraph_stats=cudagraph_stats,
                 perf_stats=perf_stats,
+                schedule_start_running_reqs=(
+                    scheduler_output.schedule_start_running_reqs
+                ),
+                schedule_start_waiting_reqs=(
+                    scheduler_output.schedule_start_waiting_reqs
+                ),
+                schedule_start_running_decode_reqs=(
+                    scheduler_output.schedule_start_running_decode_reqs
+                ),
+                schedule_start_running_embed_reqs=(
+                    scheduler_output.schedule_start_running_embed_reqs
+                ),
+                schedule_start_waiting_decode_reqs=(
+                    scheduler_output.schedule_start_waiting_decode_reqs
+                ),
+                schedule_start_waiting_embed_reqs=(
+                    scheduler_output.schedule_start_waiting_embed_reqs
+                ),
+                schedule_end_running_reqs=(
+                    scheduler_output.schedule_end_running_reqs
+                ),
+                schedule_end_waiting_reqs=(
+                    scheduler_output.schedule_end_waiting_reqs
+                ),
+                schedule_end_running_decode_reqs=(
+                    scheduler_output.schedule_end_running_decode_reqs
+                ),
+                schedule_end_running_embed_reqs=(
+                    scheduler_output.schedule_end_running_embed_reqs
+                ),
+                schedule_end_waiting_decode_reqs=(
+                    scheduler_output.schedule_end_waiting_decode_reqs
+                ),
+                schedule_end_waiting_embed_reqs=(
+                    scheduler_output.schedule_end_waiting_embed_reqs
+                ),
+                schedule_token_budget_remaining=(
+                    scheduler_output.schedule_token_budget_remaining
+                ),
+                schedule_max_tokens=scheduler_output.schedule_max_tokens,
+                schedule_max_running_reqs=(
+                    scheduler_output.schedule_max_running_reqs
+                ),
+                schedule_running_slots_remaining=(
+                    scheduler_output.schedule_running_slots_remaining
+                ),
+                schedule_waiting_stop_reason=(
+                    scheduler_output.schedule_waiting_stop_reason
+                ),
+                schedule_kv_cache_usage=scheduler_output.schedule_kv_cache_usage,
+                schedule_kv_free_blocks=scheduler_output.schedule_kv_free_blocks,
+                schedule_kv_total_blocks=scheduler_output.schedule_kv_total_blocks,
+                schedule_kv_failure_blocks_requested=(
+                    scheduler_output.schedule_kv_failure_blocks_requested
+                ),
+                schedule_kv_failure_free_blocks=(
+                    scheduler_output.schedule_kv_failure_free_blocks
+                ),
+                schedule_kv_failure_num_tokens_need_slot=(
+                    scheduler_output.schedule_kv_failure_num_tokens_need_slot
+                ),
+                schedule_kv_failure_num_new_tokens=(
+                    scheduler_output.schedule_kv_failure_num_new_tokens
+                ),
+                schedule_kv_failure_request_id=(
+                    scheduler_output.schedule_kv_failure_request_id
+                ),
+                schedule_kv_failure_model_id=(
+                    scheduler_output.schedule_kv_failure_model_id
+                ),
+                schedule_kv_failure_is_embed=(
+                    scheduler_output.schedule_kv_failure_is_embed
+                ),
             )
         ) is not None:
             # Return stats to only one of the front-ends.
@@ -1821,6 +2027,11 @@ class Scheduler(SchedulerInterface):
         if (dual_cfg.decode_running_reserve is not None
                 and running_decode < dual_cfg.decode_running_reserve
                 and waiting_decode_total > 0):
+            return True
+
+        if (dual_cfg.embed_waiting_min_batch_reqs is not None
+                and waiting_decode_total > 0
+                and (self._embed_waiting_burst_remaining or 0) <= 0):
             return True
 
         return False
@@ -2208,6 +2419,33 @@ class Scheduler(SchedulerInterface):
         kv_connector_stats: KVConnectorStats | None = None,
         cudagraph_stats: CUDAGraphStat | None = None,
         perf_stats: PerfStats | None = None,
+        schedule_start_running_reqs: int = 0,
+        schedule_start_waiting_reqs: int = 0,
+        schedule_start_running_decode_reqs: int = 0,
+        schedule_start_running_embed_reqs: int = 0,
+        schedule_start_waiting_decode_reqs: int = 0,
+        schedule_start_waiting_embed_reqs: int = 0,
+        schedule_end_running_reqs: int = 0,
+        schedule_end_waiting_reqs: int = 0,
+        schedule_end_running_decode_reqs: int = 0,
+        schedule_end_running_embed_reqs: int = 0,
+        schedule_end_waiting_decode_reqs: int = 0,
+        schedule_end_waiting_embed_reqs: int = 0,
+        schedule_token_budget_remaining: int = 0,
+        schedule_max_tokens: int = 0,
+        schedule_max_running_reqs: int = 0,
+        schedule_running_slots_remaining: int = 0,
+        schedule_waiting_stop_reason: str = "",
+        schedule_kv_cache_usage: float = 0.0,
+        schedule_kv_free_blocks: int = 0,
+        schedule_kv_total_blocks: int = 0,
+        schedule_kv_failure_blocks_requested: int = 0,
+        schedule_kv_failure_free_blocks: int = 0,
+        schedule_kv_failure_num_tokens_need_slot: int = 0,
+        schedule_kv_failure_num_new_tokens: int = 0,
+        schedule_kv_failure_request_id: str = "",
+        schedule_kv_failure_model_id: int = -1,
+        schedule_kv_failure_is_embed: bool = False,
     ) -> SchedulerStats | None:
         if not self.log_stats:
             return None
@@ -2240,6 +2478,39 @@ class Scheduler(SchedulerInterface):
             num_running_embed_reqs=running_embed,
             num_waiting_decode_reqs=self._num_waiting_decode_reqs,
             num_waiting_embed_reqs=self._num_waiting_embed_reqs,
+            schedule_start_running_reqs=schedule_start_running_reqs,
+            schedule_start_waiting_reqs=schedule_start_waiting_reqs,
+            schedule_start_running_decode_reqs=schedule_start_running_decode_reqs,
+            schedule_start_running_embed_reqs=schedule_start_running_embed_reqs,
+            schedule_start_waiting_decode_reqs=schedule_start_waiting_decode_reqs,
+            schedule_start_waiting_embed_reqs=schedule_start_waiting_embed_reqs,
+            schedule_end_running_reqs=schedule_end_running_reqs,
+            schedule_end_waiting_reqs=schedule_end_waiting_reqs,
+            schedule_end_running_decode_reqs=schedule_end_running_decode_reqs,
+            schedule_end_running_embed_reqs=schedule_end_running_embed_reqs,
+            schedule_end_waiting_decode_reqs=schedule_end_waiting_decode_reqs,
+            schedule_end_waiting_embed_reqs=schedule_end_waiting_embed_reqs,
+            schedule_token_budget_remaining=schedule_token_budget_remaining,
+            schedule_max_tokens=schedule_max_tokens,
+            schedule_max_running_reqs=schedule_max_running_reqs,
+            schedule_running_slots_remaining=schedule_running_slots_remaining,
+            schedule_waiting_stop_reason=schedule_waiting_stop_reason,
+            schedule_kv_cache_usage=schedule_kv_cache_usage,
+            schedule_kv_free_blocks=schedule_kv_free_blocks,
+            schedule_kv_total_blocks=schedule_kv_total_blocks,
+            schedule_kv_failure_blocks_requested=(
+                schedule_kv_failure_blocks_requested
+            ),
+            schedule_kv_failure_free_blocks=schedule_kv_failure_free_blocks,
+            schedule_kv_failure_num_tokens_need_slot=(
+                schedule_kv_failure_num_tokens_need_slot
+            ),
+            schedule_kv_failure_num_new_tokens=(
+                schedule_kv_failure_num_new_tokens
+            ),
+            schedule_kv_failure_request_id=schedule_kv_failure_request_id,
+            schedule_kv_failure_model_id=schedule_kv_failure_model_id,
+            schedule_kv_failure_is_embed=schedule_kv_failure_is_embed,
             kv_cache_usage=self.kv_cache_manager.usage,
             encoder_cache_usage=self._get_encoder_cache_usage(),
             prefix_cache_stats=prefix_cache_stats,

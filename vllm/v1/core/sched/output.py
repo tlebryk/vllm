@@ -242,6 +242,37 @@ class SchedulerOutput:
     # preventing stale NaN/data from corrupting attention or SSM computation.
     new_block_ids_to_zero: list[int] | None = None
 
+    # Schedule-time diagnostics. These are captured inside schedule(), before
+    # model execution and before update_from_output() mutates request state.
+    schedule_start_running_reqs: int = 0
+    schedule_start_waiting_reqs: int = 0
+    schedule_start_running_decode_reqs: int = 0
+    schedule_start_running_embed_reqs: int = 0
+    schedule_start_waiting_decode_reqs: int = 0
+    schedule_start_waiting_embed_reqs: int = 0
+    schedule_end_running_reqs: int = 0
+    schedule_end_waiting_reqs: int = 0
+    schedule_end_running_decode_reqs: int = 0
+    schedule_end_running_embed_reqs: int = 0
+    schedule_end_waiting_decode_reqs: int = 0
+    schedule_end_waiting_embed_reqs: int = 0
+    schedule_token_budget_remaining: int = 0
+    schedule_max_tokens: int = 0
+    schedule_max_running_reqs: int = 0
+    schedule_running_slots_remaining: int = 0
+    schedule_waiting_stop_reason: str = ""
+    schedule_kv_cache_usage: float = 0.0
+    schedule_kv_free_blocks: int = 0
+    schedule_kv_total_blocks: int = 0
+    schedule_kv_failure_blocks_requested: int = 0
+    schedule_kv_failure_free_blocks: int = 0
+    schedule_kv_failure_num_tokens_need_slot: int = 0
+    schedule_kv_failure_num_new_tokens: int = 0
+    # Populated when schedule_waiting_stop_reason == kv_allocation_failed
+    schedule_kv_failure_request_id: str = ""
+    schedule_kv_failure_model_id: int = -1
+    schedule_kv_failure_is_embed: bool = False
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(
