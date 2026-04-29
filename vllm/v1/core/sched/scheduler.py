@@ -425,7 +425,7 @@ class Scheduler(SchedulerInterface):
         schedule_kv_failure_num_tokens_need_slot = 0
         schedule_kv_failure_num_new_tokens = 0
         schedule_kv_failure_request_id = ""
-        schedule_kv_failure_model_id = -1
+        schedule_kv_failure_model_id = ""
         schedule_kv_failure_is_embed = False
 
         # Encoder-related.
@@ -857,7 +857,7 @@ class Scheduler(SchedulerInterface):
                             kv_failure.get("num_new_tokens", 0)
                         )
                     schedule_kv_failure_request_id = str(request.request_id)
-                    schedule_kv_failure_model_id = int(request.model_id)
+                    schedule_kv_failure_model_id = str(request.model_id)
                     if self.dual_model_config is not None:
                         schedule_kv_failure_is_embed = (
                             request.model_id
@@ -2444,7 +2444,7 @@ class Scheduler(SchedulerInterface):
         schedule_kv_failure_num_tokens_need_slot: int = 0,
         schedule_kv_failure_num_new_tokens: int = 0,
         schedule_kv_failure_request_id: str = "",
-        schedule_kv_failure_model_id: int = -1,
+        schedule_kv_failure_model_id: str = "",
         schedule_kv_failure_is_embed: bool = False,
     ) -> SchedulerStats | None:
         if not self.log_stats:

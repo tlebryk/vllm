@@ -208,7 +208,7 @@ class SchedulerStats:
     schedule_kv_failure_num_tokens_need_slot: int = 0
     schedule_kv_failure_num_new_tokens: int = 0
     schedule_kv_failure_request_id: str = ""
-    schedule_kv_failure_model_id: int = -1
+    schedule_kv_failure_model_id: str = ""
     schedule_kv_failure_is_embed: bool = False
 
     # These are used for internal DP load-balancing.

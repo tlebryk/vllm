@@ -270,7 +270,7 @@ class SchedulerOutput:
     schedule_kv_failure_num_new_tokens: int = 0
     # Populated when schedule_waiting_stop_reason == kv_allocation_failed
     schedule_kv_failure_request_id: str = ""
-    schedule_kv_failure_model_id: int = -1
+    schedule_kv_failure_model_id: str = ""
     schedule_kv_failure_is_embed: bool = False
 
     @classmethod
