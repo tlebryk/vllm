@@ -653,6 +653,11 @@ class Scheduler(SchedulerInterface):
                     step_skipped_waiting.prepend_request(request)
                     continue
 
+                if self._should_skip_decode_waiting_request(request):
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
+
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(
                     request.status
@@ -1233,6 +1238,17 @@ class Scheduler(SchedulerInterface):
             self._embed_waiting_burst_remaining = min_batch_reqs
         else:
             self._embed_waiting_burst_remaining = 0
+
+    def _should_skip_decode_waiting_request(self, request: Request) -> bool:
+        """Skip a decode waiting request if it would push running_decode past
+        max_decode_running_reqs. This caps decode batch to leave KV headroom
+        for embed admission in mixed scheduling."""
+        dual_cfg = self.dual_model_config
+        if dual_cfg is None or request.model_id != dual_cfg.decode_model_id:
+            return False
+        if dual_cfg.max_decode_running_reqs is None:
+            return False
+        return self._num_running_decode_reqs >= dual_cfg.max_decode_running_reqs
 
     def _should_skip_embed_waiting_request(self, request: Request) -> bool:
         dual_cfg = self.dual_model_config
@@ -1993,6 +2009,17 @@ class Scheduler(SchedulerInterface):
             self.waiting.add_request(request)
         self._mark_waiting_added_by_model(request)
 
+    def _is_decode_gate_blocked_without_state_change(self,
+                                                     request: Request) -> bool:
+        """Mirrors _should_skip_decode_waiting_request but for the
+        skipped_waiting queue: stable check that won't mutate burst state."""
+        dual_cfg = self.dual_model_config
+        if dual_cfg is None or request.model_id != dual_cfg.decode_model_id:
+            return False
+        if dual_cfg.max_decode_running_reqs is None:
+            return False
+        return self._num_running_decode_reqs >= dual_cfg.max_decode_running_reqs
+
     def _is_embed_gate_blocked_without_state_change(self,
                                                     request: Request) -> bool:
         dual_cfg = self.dual_model_config
@@ -2040,6 +2067,8 @@ class Scheduler(SchedulerInterface):
         if self.skipped_waiting:
             skipped_req = self.skipped_waiting.peek_request()
             if self._is_embed_gate_blocked_without_state_change(skipped_req):
+                return self.waiting or None
+            if self._is_decode_gate_blocked_without_state_change(skipped_req):
                 return self.waiting or None
 
         if self.policy == SchedulingPolicy.FCFS:

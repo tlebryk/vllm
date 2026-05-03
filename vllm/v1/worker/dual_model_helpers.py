@@ -25,6 +25,7 @@ class DualModelConfig:
     embed_max_model_len: int | None = None
     embed_enforce_eager: bool | None = None
     decode_running_reserve: int | None = None
+    max_decode_running_reqs: int | None = None
     max_embed_running_reqs: int | None = None
     embed_waiting_min_batch_reqs: int | None = None
     embed_release_running_decode_threshold: int | None = None
@@ -56,6 +57,7 @@ class DualModelConfig:
             embed_max_model_len=raw_cfg.get("embed_max_model_len"),
             embed_enforce_eager=raw_cfg.get("embed_enforce_eager"),
             decode_running_reserve=raw_cfg.get("decode_running_reserve"),
+            max_decode_running_reqs=raw_cfg.get("max_decode_running_reqs"),
             max_embed_running_reqs=raw_cfg.get("max_embed_running_reqs"),
             embed_waiting_min_batch_reqs=raw_cfg.get(
                 "embed_waiting_min_batch_reqs"
