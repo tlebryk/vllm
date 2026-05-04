@@ -86,7 +86,12 @@ class DualModelRunner:
         if stream_mode == "default_stream":
             self.embed_stream = self.decode_stream
         elif stream_mode == "two_stream":
-            self.embed_stream = torch.cuda.Stream(device)
+            embed_priority = int(
+                os.environ.get("VLLM_DUAL_MODEL_EMBED_STREAM_PRIORITY", "0")
+            )
+            self.embed_stream = torch.cuda.Stream(
+                device, priority=embed_priority
+            )
         else:
             raise ValueError(
                 "VLLM_DUAL_MODEL_STREAM_MODE must be 'two_stream' or "
