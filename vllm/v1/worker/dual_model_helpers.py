@@ -30,6 +30,8 @@ class DualModelConfig:
     embed_waiting_min_batch_reqs: int | None = None
     embed_release_running_decode_threshold: int | None = None
     embed_release_when_decode_waiting_drained: bool = False
+    embed_delta_bundle: str | None = None
+    fuse_kv_cache: bool = False
 
     @classmethod
     def from_vllm_config(cls, vllm_config: Any) -> "DualModelConfig | None":
@@ -68,6 +70,8 @@ class DualModelConfig:
             embed_release_when_decode_waiting_drained=bool(
                 raw_cfg.get("embed_release_when_decode_waiting_drained", False)
             ),
+            embed_delta_bundle=raw_cfg.get("embed_delta_bundle"),
+            fuse_kv_cache=bool(raw_cfg.get("fuse_kv_cache", False)),
         )
 
 

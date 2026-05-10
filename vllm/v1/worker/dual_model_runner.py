@@ -61,6 +61,45 @@ def _resolve_model_runner_output(
     return output
 
 
+class DualAsyncModelRunnerOutput(AsyncModelRunnerOutput):
+    """Async wrapper that defers decode+embed merge until get_output().
+
+    Each child slot may be a sync ModelRunnerOutput, an AsyncModelRunnerOutput
+    (whose D2H copy is in flight on the child runner's async copy stream), or
+    None for a step that scheduled no work in that branch. get_output() is
+    invoked on the executor's async output thread; it resolves both children
+    (blocking on their D2H copy events) and emits the merged ModelRunnerOutput.
+
+    The scheduled_req_order is captured at construction time so this object is
+    safe to resolve after the next engine step has begun mutating the parent
+    DualModelRunner's pending_* instance attributes.
+    """
+
+    def __init__(
+        self,
+        scheduled_req_order: list[str],
+        decode_output: ModelRunnerOutput | AsyncModelRunnerOutput | None,
+        embed_output: ModelRunnerOutput | AsyncModelRunnerOutput | None,
+    ):
+        self._scheduled_req_order = list(scheduled_req_order)
+        self._decode_output = decode_output
+        self._embed_output = embed_output
+
+    def get_output(self) -> ModelRunnerOutput:
+        decode_resolved = _resolve_model_runner_output(
+            self._decode_output, "decode_output_get"
+        )
+        embed_resolved = _resolve_model_runner_output(
+            self._embed_output, "embed_output_get"
+        )
+        with _nvtx_range("merge_outputs"):
+            return merge_model_runner_outputs(
+                scheduled_req_order=self._scheduled_req_order,
+                decode_output=decode_resolved,
+                embed_output=embed_resolved,
+            )
+
+
 class DualModelRunner:
     """Experimental wrapper that hosts one decode and one embed runner."""
 
@@ -69,10 +108,14 @@ class DualModelRunner:
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         if not envs.VLLM_USE_V2_MODEL_RUNNER:
             raise ValueError("DualModelRunner currently requires V2 model runner.")
-        if vllm_config.scheduler_config.async_scheduling:
-            raise ValueError(
-                "DualModelRunner currently does not support async scheduling."
-            )
+        # POC (worktree async-dual-runner): async scheduling is now supported.
+        # When True, both child runners return AsyncModelRunnerOutput, and
+        # execute_model/sample_tokens return DualAsyncModelRunnerOutput so the
+        # decode+embed merge happens on the executor's async output thread,
+        # in parallel with the next engine step's CPU-side scheduling.
+        self.use_async_scheduling = bool(
+            vllm_config.scheduler_config.async_scheduling
+        )
         if vllm_config.parallel_config.pipeline_parallel_size != 1:
             raise ValueError(
                 "DualModelRunner currently requires pipeline_parallel_size=1."
@@ -98,6 +141,20 @@ class DualModelRunner:
                 f"'default_stream', got {stream_mode!r}."
             )
 
+        # Optional: bind both streams to disjoint CUDA green contexts to give
+        # decode/embed hard SM partitions (constrains cuBLAS too, unlike
+        # FA3 sm_margin which is FA3-only). Requires --enforce-eager.
+        if int(os.environ.get("VLLM_DUAL_MODEL_GREEN_CTX_DECODE_SM", "0")) > 0:
+            import sys
+            sys.path.insert(0, "/n/home07/tlebryk1/heterobatchvllm/scripts")
+            from green_ctx_helper import maybe_make_streams
+            d, e, info = maybe_make_streams(
+                device, self.decode_stream, self.embed_stream
+            )
+            self.decode_stream = d
+            self.embed_stream = e
+            self._green_ctx_info = info
+
         execute_order = os.environ.get(
             "VLLM_DUAL_MODEL_EXECUTE_ORDER", "decode_first"
         )
@@ -120,6 +177,13 @@ class DualModelRunner:
         self.vllm_config = vllm_config
         self.dual_cfg = dual_cfg
         self.device = device
+        self._fuse_kv_cache = bool(dual_cfg.fuse_kv_cache)
+        if self._fuse_kv_cache and vllm_config.cache_config.enable_prefix_caching:
+            raise ValueError(
+                "Fused KV cache requires --no-enable-prefix-caching. With "
+                "decode/embed sharing physical KV memory, a same-prefix cache "
+                "hit across models would read the wrong model's K/V."
+            )
         self.decode_runner = GPUModelRunner(vllm_config, device)
         self.embed_vllm_config = self._build_embed_vllm_config(vllm_config, dual_cfg)
         self.embed_runner = GPUModelRunner(self.embed_vllm_config, device)
@@ -202,6 +266,21 @@ class DualModelRunner:
         embed_vllm_config.additional_config = {}
         embed_vllm_config.compilation_config.static_forward_context.clear()
         embed_vllm_config.compilation_config.static_all_moe_layers.clear()
+        # If embed_enforce_eager is set OR a delta bundle is in use, also
+        # disable torch.compile / Inductor for the embed runner. The model_config
+        # eager flag alone doesn't suppress compilation_config.mode, and
+        # forward_pre_hooks that re-bind weight.data don't reach AOT-captured
+        # parameter inputs inside the compiled graph.
+        if (
+            dual_cfg.embed_enforce_eager is True
+            or dual_cfg.embed_delta_bundle is not None
+        ):
+            from vllm.config.compilation import CompilationMode, CUDAGraphMode
+
+            embed_vllm_config.compilation_config.mode = CompilationMode.NONE
+            embed_vllm_config.compilation_config.cudagraph_mode = (
+                CUDAGraphMode.NONE
+            )
         return embed_vllm_config
 
     def update_max_model_len(self, max_model_len: int) -> None:
@@ -279,6 +358,38 @@ class DualModelRunner:
             prefix=self.EMBED_MODEL_PREFIX,
             **kwargs,
         )
+
+        # Tier C: optionally swap embed transformer-block bf16 weights for
+        # int8-Δ storage so vLLM's KV-cache profile sees a smaller embed
+        # footprint and grows the KV pool. Forward hooks materialize bf16
+        # weight on demand for each Linear forward.
+        bundle_path = self.dual_cfg.embed_delta_bundle
+        if bundle_path is not None:
+            from pathlib import Path as _Path
+
+            from vllm.v1.worker.embed_delta_storage import (
+                apply_embed_delta_storage,
+            )
+
+            import torch as _torch
+
+            mem_before = _torch.cuda.memory_allocated()
+            self._embed_delta_summary = apply_embed_delta_storage(
+                self.embed_runner.model,
+                self.decode_runner.model,
+                _Path(bundle_path),
+            )
+            mem_after = _torch.cuda.memory_allocated()
+            self._embed_delta_summary["torch_mem_freed_GB"] = (
+                (mem_before - mem_after) / 1e9
+            )
+            # Reflect saved bytes in vLLM's accounting so cudagraph / KV
+            # profiles size correctly.
+            freed_bytes = int(self._embed_delta_summary["bytes_freed_GB"] * 1e9)
+            self.embed_runner.model_memory_usage = max(
+                0, self.embed_runner.model_memory_usage - freed_bytes
+            )
+
         self.decode_kv_cache_spec = self.decode_runner.get_kv_cache_spec()
         self.embed_kv_cache_spec = self.embed_runner.get_kv_cache_spec()
         overlap = set(self.decode_kv_cache_spec) & set(self.embed_kv_cache_spec)
@@ -298,12 +409,20 @@ class DualModelRunner:
         return self.model
 
     def get_kv_cache_spec(self):
+        if self._fuse_kv_cache:
+            # Hide embed layers from vLLM's global KV planner so num_blocks is
+            # computed for one model's worth of layers (~2x larger pool).
+            # Embed reuses decode's physical tensors via initialize_kv_cache.
+            return dict(self.decode_kv_cache_spec)
         return {
             **self.decode_kv_cache_spec,
             **self.embed_kv_cache_spec,
         }
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
+        if self._fuse_kv_cache:
+            self._initialize_kv_cache_fused(kv_cache_config)
+            return
         decode_kv_cache_config, self.decode_kv_group_indices = (
             self._project_kv_cache_config(kv_cache_config, self.decode_kv_cache_spec)
         )
@@ -312,6 +431,105 @@ class DualModelRunner:
         )
         self.decode_runner.initialize_kv_cache(decode_kv_cache_config)
         self.embed_runner.initialize_kv_cache(embed_kv_cache_config)
+
+    def _initialize_kv_cache_fused(self, kv_cache_config: KVCacheConfig) -> None:
+        """Allocate one physical KV pool and alias it across decode + embed.
+
+        Requires identical per-layer KV shape (block_size, num_kv_heads,
+        head_size, dtype, page_size) on both runners — enforced implicitly by
+        the shared global config that vLLM built from decode's spec only.
+        """
+        from vllm.model_executor.models.utils import extract_layer_index
+        from vllm.v1.worker.gpu import attn_utils as _attn_utils
+
+        if len(kv_cache_config.kv_cache_groups) != 1:
+            raise ValueError(
+                "Fused KV cache expects a single global KV group; got "
+                f"{len(kv_cache_config.kv_cache_groups)}."
+            )
+        decode_group = kv_cache_config.kv_cache_groups[0]
+        decode_layer_names = list(decode_group.layer_names)
+        embed_layer_names = list(self.embed_kv_cache_spec.keys())
+        if len(decode_layer_names) != len(embed_layer_names):
+            raise ValueError(
+                "Fused KV cache requires equal decode/embed layer counts; "
+                f"got {len(decode_layer_names)} decode vs "
+                f"{len(embed_layer_names)} embed."
+            )
+
+        decode_sorted = sorted(decode_layer_names, key=extract_layer_index)
+        embed_sorted = sorted(embed_layer_names, key=extract_layer_index)
+        decode_to_embed = dict(zip(decode_sorted, embed_sorted))
+        embed_to_decode = {v: k for k, v in decode_to_embed.items()}
+
+        decode_spec = next(iter(self.decode_kv_cache_spec.values()))
+        embed_spec = next(iter(self.embed_kv_cache_spec.values()))
+        if decode_spec.page_size_bytes != embed_spec.page_size_bytes:
+            raise ValueError(
+                "Fused KV cache requires equal page_size_bytes; got "
+                f"decode={decode_spec.page_size_bytes} vs "
+                f"embed={embed_spec.page_size_bytes}."
+            )
+
+        # The V2 model runner allocates raw KV tensors via the module-level
+        # function `vllm.v1.worker.gpu.attn_utils._allocate_kv_cache`. We
+        # swap it temporarily to (a) capture decode's int8 buffers, then (b)
+        # hand those same buffers to the embed runner. Both runners' per-
+        # layer kv_caches alias the same GPU memory after init.
+        original_alloc = _attn_utils._allocate_kv_cache
+        saved_raw: dict[str, torch.Tensor] = {}
+
+        def _capture_decode_alloc(cfg, device):
+            result = original_alloc(cfg, device)
+            saved_raw.update(result)
+            return result
+
+        _attn_utils._allocate_kv_cache = _capture_decode_alloc
+        try:
+            self.decode_runner.initialize_kv_cache(kv_cache_config)
+        finally:
+            _attn_utils._allocate_kv_cache = original_alloc
+
+        # Build embed-side config that mirrors decode's shape but references
+        # embed layer names.
+        embed_kv_cache_tensors = [
+            KVCacheTensor(
+                size=tensor.size,
+                shared_by=[decode_to_embed[n] for n in tensor.shared_by],
+            )
+            for tensor in kv_cache_config.kv_cache_tensors
+        ]
+        embed_kv_cache_groups = [
+            KVCacheGroupSpec(
+                layer_names=[
+                    decode_to_embed[n] for n in decode_group.layer_names
+                ],
+                kv_cache_spec=decode_group.kv_cache_spec,
+            )
+        ]
+        embed_kv_cache_config = KVCacheConfig(
+            num_blocks=kv_cache_config.num_blocks,
+            kv_cache_tensors=embed_kv_cache_tensors,
+            kv_cache_groups=embed_kv_cache_groups,
+        )
+
+        def _reuse_embed_alloc(cfg, device):
+            result: dict[str, torch.Tensor] = {}
+            for kv_tensor in cfg.kv_cache_tensors:
+                for layer_name in kv_tensor.shared_by:
+                    decode_name = embed_to_decode[layer_name]
+                    result[layer_name] = saved_raw[decode_name]
+            return result
+
+        _attn_utils._allocate_kv_cache = _reuse_embed_alloc
+        try:
+            self.embed_runner.initialize_kv_cache(embed_kv_cache_config)
+        finally:
+            _attn_utils._allocate_kv_cache = original_alloc
+
+        # Both runners read block_ids from the single global KV group.
+        self.decode_kv_group_indices = (0,)
+        self.embed_kv_group_indices = (0,)
 
     def profile_run(self) -> None:
         self.decode_runner.profile_run()
@@ -422,25 +640,41 @@ class DualModelRunner:
             ) and embed_exec_output is None
             return None
 
+        embed_output_unresolved: ModelRunnerOutput | AsyncModelRunnerOutput | None = (
+            None
+        )
         if has_embed_work:
             if embed_exec_output is None:
                 with torch.cuda.stream(self.embed_stream):
                     with _nvtx_range("embed_pool"):
                         with _temporary_async_outputs(
-                            self.embed_runner, self.async_outputs
+                            self.embed_runner,
+                            self.async_outputs or self.use_async_scheduling,
                         ):
                             embed_pool_output = self.embed_runner.pool()
-                embed_output = _resolve_model_runner_output(
-                    embed_pool_output,
-                    "embed_output_get",
-                )
+                embed_output_unresolved = embed_pool_output
             else:
-                embed_output = embed_exec_output
-            if embed_output is None:
-                raise RuntimeError("Embed runner failed to produce pooling output.")
+                embed_output_unresolved = embed_exec_output
 
         self.pending_embed_output = None
         self.pending_embed_needs_pool = False
+
+        if self.use_async_scheduling:
+            # Defer the merge: DualAsyncModelRunnerOutput.get_output() runs on
+            # the executor's async output thread and resolves both children
+            # there, overlapping with the engine's next-step CPU work.
+            return DualAsyncModelRunnerOutput(
+                scheduled_req_order=self.pending_req_order,
+                decode_output=decode_output,
+                embed_output=embed_output_unresolved,
+            )
+
+        embed_output = _resolve_model_runner_output(
+            embed_output_unresolved,
+            "embed_output_get",
+        )
+        if has_embed_work and embed_output is None:
+            raise RuntimeError("Embed runner failed to produce pooling output.")
         with _nvtx_range("merge_outputs"):
             return merge_model_runner_outputs(
                 scheduled_req_order=self.pending_req_order,
@@ -449,39 +683,62 @@ class DualModelRunner:
             )
 
     def sample_tokens(self, grammar_output: GrammarOutput | None):
+        async_outputs_for_children = self.async_outputs or self.use_async_scheduling
+        # Green-ctx workaround (mode=both): torch's stream-capture-status check
+        # asserts on a green-ctx-bound ExternalStream during sample_tokens. Run
+        # decode sample on the device's default stream to bypass the bug. The
+        # sampling kernels are small and don't need the green-ctx partition.
+        _gc_info = getattr(self, "_green_ctx_info", None)
+        _use_default_for_sample = bool(_gc_info) and _gc_info.get("mode") == "both"
         with _nvtx_range("decode_sample"):
-            with _temporary_async_outputs(self.decode_runner, self.async_outputs):
-                decode_sample_output = self.decode_runner.sample_tokens(grammar_output)
-        embed_output = self.pending_embed_output
-        embed_pool_output = None
+            with _temporary_async_outputs(
+                self.decode_runner, async_outputs_for_children
+            ):
+                if _use_default_for_sample:
+                    _dev = self.decode_stream.device if hasattr(self.decode_stream, "device") else None
+                    with torch.cuda.stream(torch.cuda.default_stream(_dev)):
+                        decode_sample_output = self.decode_runner.sample_tokens(grammar_output)
+                else:
+                    decode_sample_output = self.decode_runner.sample_tokens(grammar_output)
+        embed_output_unresolved: ModelRunnerOutput | AsyncModelRunnerOutput | None = (
+            self.pending_embed_output
+        )
         if self.pending_embed_needs_pool:
             with torch.cuda.stream(self.embed_stream):
                 with _nvtx_range("embed_pool"):
                     with _temporary_async_outputs(
-                        self.embed_runner, self.async_outputs
+                        self.embed_runner, async_outputs_for_children
                     ):
-                        embed_pool_output = self.embed_runner.pool()
+                        embed_output_unresolved = self.embed_runner.pool()
+
+        scheduled_req_order = self.pending_req_order
+        self.pending_embed_output = None
+        self.pending_embed_needs_pool = False
+        self.pending_req_order = []
+
+        if self.use_async_scheduling:
+            return DualAsyncModelRunnerOutput(
+                scheduled_req_order=scheduled_req_order,
+                decode_output=decode_sample_output,
+                embed_output=embed_output_unresolved,
+            )
+
         decode_output = _resolve_model_runner_output(
             decode_sample_output,
             "decode_output_get",
         )
-        if self.pending_embed_needs_pool:
-            embed_output = _resolve_model_runner_output(
-                embed_pool_output,
-                "embed_output_get",
-            )
-            if embed_output is None:
-                raise RuntimeError("Embed runner failed to produce pooling output.")
+        embed_output = _resolve_model_runner_output(
+            embed_output_unresolved,
+            "embed_output_get",
+        )
+        if self.pending_embed_needs_pool and embed_output is None:
+            raise RuntimeError("Embed runner failed to produce pooling output.")
         with _nvtx_range("merge_outputs"):
-            merged = merge_model_runner_outputs(
-                scheduled_req_order=self.pending_req_order,
+            return merge_model_runner_outputs(
+                scheduled_req_order=scheduled_req_order,
                 decode_output=decode_output,
                 embed_output=embed_output,
             )
-        self.pending_embed_output = None
-        self.pending_embed_needs_pool = False
-        self.pending_req_order = []
-        return merged
 
     def take_draft_token_ids(self):
         return self.decode_runner.take_draft_token_ids()

@@ -325,6 +325,13 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         )
         self.max_cudagraph_size = self.compilation_config.max_cudagraph_capture_size
 
+        # Per-role sm_margin must match the value used at FA call time so that
+        # scheduler_metadata is sized consistently with the persistent grid.
+        # See sm_partition_findings_2026-05-06.md.
+        import os as _os
+        self._sm_margin_decode = int(_os.environ.get("VLLM_FA3_DECODE_SM_MARGIN", "0"))
+        self._sm_margin_embed = int(_os.environ.get("VLLM_FA3_EMBED_SM_MARGIN", "0"))
+
         if self.use_full_cuda_graph and self.aot_schedule:
             # FA3 scheduler_metadata size: 1 + round_up(batch_size, 4) * 4
             # The +1 is for the tile_count_semaphore (synchronization).
@@ -416,6 +423,11 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             else:
                 qkv_dtype = self.kv_cache_dtype
             if aot_schedule:
+                _sm_margin = (self._sm_margin_decode if causal
+                              else self._sm_margin_embed)
+                _extra_kwargs = (
+                    {"sm_margin": _sm_margin} if _sm_margin > 0 else {}
+                )
                 return get_scheduler_metadata(
                     batch_size=batch_size,
                     max_seqlen_q=max_query_len,
@@ -430,6 +442,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
                     causal=causal,
                     window_size=self.aot_sliding_window,
                     num_splits=max_num_splits,
+                    **_extra_kwargs,
                 )
             return None
 
@@ -628,6 +641,20 @@ class FlashAttentionImpl(AttentionImpl):
         )
         self.dcp_combine = dcp_a2a_lse_reduce if dcp_a2a else cp_lse_ag_out_rs
 
+        # SM-margin override (read once at impl init; baked into CUDA graphs).
+        # See sm_partition_findings_2026-05-06.md — leaving SMs free on
+        # compute-bound persistent FA3 kernels lets a parallel stream actually
+        # overlap. Causal = decode-style; non-causal = embed-style prefill.
+        import os as _os
+        self._sm_margin_decode = int(_os.environ.get("VLLM_FA3_DECODE_SM_MARGIN", "0"))
+        self._sm_margin_embed = int(_os.environ.get("VLLM_FA3_EMBED_SM_MARGIN", "0"))
+        if self._sm_margin_decode or self._sm_margin_embed:
+            logger.info_once(
+                "FA3 sm_margin: decode=%d embed=%d",
+                self._sm_margin_decode, self._sm_margin_embed,
+                scope="local",
+            )
+
     def forward(
         self,
         layer: torch.nn.Module,
@@ -740,6 +767,11 @@ class FlashAttentionImpl(AttentionImpl):
                     if self.sliding_window is not None
                     else None
                 )
+                _sm_margin = (self._sm_margin_decode if attn_metadata.causal
+                              else self._sm_margin_embed)
+                _extra_kwargs = (
+                    {"sm_margin": _sm_margin} if _sm_margin > 0 else {}
+                )
                 flash_attn_varlen_func(
                     q=query[:num_actual_tokens],
                     k=key_cache,
@@ -762,6 +794,7 @@ class FlashAttentionImpl(AttentionImpl):
                     v_descale=v_descale,
                     num_splits=attn_metadata.max_num_splits,
                     s_aux=self.sinks,
+                    **_extra_kwargs,
                 )
                 return output
 
