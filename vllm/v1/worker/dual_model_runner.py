@@ -684,21 +684,17 @@ class DualModelRunner:
 
     def sample_tokens(self, grammar_output: GrammarOutput | None):
         async_outputs_for_children = self.async_outputs or self.use_async_scheduling
-        # Green-ctx workaround (mode=both): torch's stream-capture-status check
-        # asserts on a green-ctx-bound ExternalStream during sample_tokens. Run
-        # decode sample on the device's default stream to bypass the bug. The
-        # sampling kernels are small and don't need the green-ctx partition.
-        _gc_info = getattr(self, "_green_ctx_info", None)
-        _use_default_for_sample = bool(_gc_info) and _gc_info.get("mode") == "both"
         with _nvtx_range("decode_sample"):
             with _temporary_async_outputs(
                 self.decode_runner, async_outputs_for_children
             ):
-                if _use_default_for_sample:
-                    _dev = self.decode_stream.device if hasattr(self.decode_stream, "device") else None
-                    with torch.cuda.stream(torch.cuda.default_stream(_dev)):
-                        decode_sample_output = self.decode_runner.sample_tokens(grammar_output)
-                else:
+                # Run sample on the decode stream so the sampler is in-stream
+                # with the model forward (which produced hidden_states on the
+                # decode stream). Without this wrapper sample_tokens would run
+                # on the caller's stream (the engine default stream), which
+                # creates a cross-stream race that fires asynchronously as a
+                # device-side assert under FA3 + green-ctx mode=both.
+                with torch.cuda.stream(self.decode_stream):
                     decode_sample_output = self.decode_runner.sample_tokens(grammar_output)
         embed_output_unresolved: ModelRunnerOutput | AsyncModelRunnerOutput | None = (
             self.pending_embed_output
