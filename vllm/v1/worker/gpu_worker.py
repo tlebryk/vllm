@@ -54,7 +54,7 @@ from vllm.v1.outputs import (
     DraftTokenIds,
     ModelRunnerOutput,
 )
-from vllm.v1.utils import compute_iteration_details, report_usage_stats
+from vllm.v1.utils import report_usage_stats
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm.v1.worker.worker_base import WorkerBase
 from vllm.v1.worker.workspace import init_workspace_manager
@@ -726,31 +726,6 @@ class Worker(WorkerBase):
         """Get encoder timing stats from model runner."""
         return self.model_runner.get_encoder_timing_stats()
 
-    def annotate_profile(self, scheduler_output):
-        # add trace annotation so that we can easily distinguish
-        # context/generation request numbers in each iteration.
-        # A context request is a request that has not yet generated any tokens
-        if not self.profiler:
-            return nullcontext()
-
-        self.profiler.step()
-
-        iteration_details = compute_iteration_details(scheduler_output)
-
-        annotation = "".join(
-            [
-                "execute_context_",
-                str(iteration_details.num_ctx_requests),
-                "(",
-                str(iteration_details.num_ctx_tokens),
-                ")_generation_",
-                str(iteration_details.num_generation_requests),
-                "(",
-                str(iteration_details.num_generation_tokens),
-                ")",
-            ]
-        )
-        return self.profiler.annotate_context_manager(annotation)
 
     @torch.inference_mode()
     def sample_tokens(
@@ -818,20 +793,25 @@ class Worker(WorkerBase):
                 comm_postprocess=comm_postprocess,
             )
 
-        with self.annotate_profile(scheduler_output):
-            output = self.model_runner.execute_model(
-                scheduler_output, intermediate_tensors
-            )
-            if (
-                self.use_v2_model_runner
-                and self.model_runner.is_pooling_model
-                and output is None
-            ):
-                output = self.model_runner.pool()  # type: ignore
-            if isinstance(
-                output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
-            ):
-                return output
+        # Step the torch profiler if active; the per-iteration NVTX label
+        # the upstream `annotate_profile()` used to emit duplicated bars
+        # already produced by execute_model_submit / decode_execute /
+        # embed_execute, and its ctx/gen counts are in the scheduler trace.
+        if self.profiler:
+            self.profiler.step()
+        output = self.model_runner.execute_model(
+            scheduler_output, intermediate_tensors
+        )
+        if (
+            self.use_v2_model_runner
+            and self.model_runner.is_pooling_model
+            and output is None
+        ):
+            output = self.model_runner.pool()  # type: ignore
+        if isinstance(
+            output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
+        ):
+            return output
 
         assert isinstance(output, IntermediateTensors)
         parallel_config = self.vllm_config.parallel_config
