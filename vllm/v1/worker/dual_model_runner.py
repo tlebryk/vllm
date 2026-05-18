@@ -6,6 +6,7 @@ from __future__ import annotations
 import copy
 import inspect
 import os
+import threading
 from contextlib import contextmanager
 from dataclasses import is_dataclass
 from typing import Any
@@ -141,6 +142,53 @@ class DualModelRunner:
                 f"'default_stream', got {stream_mode!r}."
             )
 
+        # libsmctrl TPC masking for the two streams (no-op unless env vars set).
+        # Masks are 64-bit ints (bit set = TPC DISABLED, per libsmctrl convention).
+        # Accept hex (0x...) or decimal. HB_LIBSMCTRL_SO must point to the .so.
+        #
+        # NOTE: libsmctrl masking writes into the per-stream metadata struct, so
+        # it requires a real (non-default) CUstream*. When decode masking is
+        # requested, we replace `decode_stream` with a fresh CUDA stream — the
+        # legacy default stream's handle (NULL) can't be masked.
+        decode_mask_env = os.environ.get("HB_LIBSMCTRL_DECODE_TPC_MASK")
+        embed_mask_env = os.environ.get("HB_LIBSMCTRL_EMBED_TPC_MASK")
+        if decode_mask_env or embed_mask_env:
+            import ctypes as _ct
+            so_path = os.environ.get(
+                "HB_LIBSMCTRL_SO",
+                "/n/home07/tlebryk1/heterobatchvllm/scratch/libsmctrl/libsmctrl.so",
+            )
+            _libsm = _ct.CDLL(so_path)
+            _libsm.libsmctrl_set_stream_mask.argtypes = [
+                _ct.c_void_p, _ct.c_uint64
+            ]
+            _libsm.libsmctrl_set_stream_mask.restype = None
+
+            def _parse(v):
+                return int(v, 16) if v.startswith("0x") else int(v)
+
+            if decode_mask_env:
+                # Replace default stream with a fresh one before masking
+                if self.decode_stream == torch.cuda.default_stream(device):
+                    new_decode = torch.cuda.Stream(device, priority=0)
+                    self.decode_stream = new_decode
+                    print(f"[libsmctrl] decode_stream upgraded "
+                          f"from default to fresh stream (cuda_stream="
+                          f"{self.decode_stream.cuda_stream:#x})")
+                m = _parse(decode_mask_env)
+                _libsm.libsmctrl_set_stream_mask(
+                    _ct.c_void_p(self.decode_stream.cuda_stream),
+                    _ct.c_uint64(m),
+                )
+                print(f"[libsmctrl] decode_stream mask = 0x{m:016x}")
+            if embed_mask_env and self.embed_stream is not self.decode_stream:
+                m = _parse(embed_mask_env)
+                _libsm.libsmctrl_set_stream_mask(
+                    _ct.c_void_p(self.embed_stream.cuda_stream),
+                    _ct.c_uint64(m),
+                )
+                print(f"[libsmctrl] embed_stream  mask = 0x{m:016x}")
+
         # Optional: bind both streams to disjoint CUDA green contexts to give
         # decode/embed hard SM partitions (constrains cuBLAS too, unlike
         # FA3 sm_margin which is FA3-only). Requires --enforce-eager.
@@ -156,12 +204,15 @@ class DualModelRunner:
             self._green_ctx_info = info
 
         execute_order = os.environ.get(
-            "VLLM_DUAL_MODEL_EXECUTE_ORDER", "decode_first"
+            "VLLM_DUAL_MODEL_EXECUTE_ORDER", "embed_concurrent"
         )
-        if execute_order not in ("decode_first", "embed_first"):
+        if execute_order not in (
+            "decode_first", "embed_first", "embed_concurrent"
+        ):
             raise ValueError(
-                "VLLM_DUAL_MODEL_EXECUTE_ORDER must be 'decode_first' or "
-                f"'embed_first', got {execute_order!r}."
+                "VLLM_DUAL_MODEL_EXECUTE_ORDER must be 'decode_first', "
+                "'embed_first', or 'embed_concurrent', got "
+                f"{execute_order!r}."
             )
         self.execute_order = execute_order
         self.async_outputs = os.environ.get(
@@ -618,7 +669,43 @@ class DualModelRunner:
         decode_output = None
         embed_exec_output = None
         embed_output: ModelRunnerOutput | None = None
-        if self.execute_order == "embed_first":
+        # Dispatch strategy is controlled by VLLM_DUAL_MODEL_EXECUTE_ORDER:
+        #   embed_concurrent (default): spawn embed forward on a bg thread,
+        #     run decode forward on the main thread, then join. Both Python
+        #     forward calls overlap on CPU; embed kernels hit the embed
+        #     stream BEFORE decode kernels hit the decode stream. Requires
+        #     thread-local forward_context (see vllm/forward_context.py).
+        #   embed_first: serial on main thread, embed before decode. Safe
+        #     fallback if the thread-local fix is reverted.
+        #   decode_first: defer embed forward to sample_tokens so embed
+        #     dispatch overlaps with decode_sample. Embed kernels arrive
+        #     on-stream LATER than decode kernels — only beneficial when
+        #     decode is the long pole.
+        will_defer_embed = (
+            has_embed_work and has_decode_work
+            and self.execute_order == "decode_first"
+        )
+        will_concurrent_embed = (
+            has_embed_work and has_decode_work
+            and self.execute_order == "embed_concurrent"
+        )
+
+        if will_concurrent_embed:
+            embed_holder: list[Any] = [None]
+
+            def _run_embed_thread() -> None:
+                embed_holder[0] = run_embed()
+
+            embed_thread = threading.Thread(
+                target=_run_embed_thread, daemon=True
+            )
+            with _nvtx_range("embed_thread_start"):
+                embed_thread.start()
+            decode_output = run_decode()
+            with _nvtx_range("embed_thread_join"):
+                embed_thread.join()
+            embed_exec_output = embed_holder[0]
+        elif self.execute_order == "embed_first":
             if has_embed_work:
                 embed_exec_output = run_embed()
             if has_decode_work:
@@ -626,7 +713,7 @@ class DualModelRunner:
         else:
             if has_decode_work:
                 decode_output = run_decode()
-            if has_embed_work:
+            if has_embed_work and not will_defer_embed:
                 embed_exec_output = run_embed()
 
         decode_needs_sample = (
@@ -637,7 +724,11 @@ class DualModelRunner:
             self.pending_embed_needs_pool = (
                 split_outputs.embed.num_scheduled_tokens
                 or split_outputs.embed.finished_req_ids
-            ) and embed_exec_output is None
+            ) and embed_exec_output is None and not will_defer_embed
+            self.pending_embed_split_output = (
+                split_outputs.embed if will_defer_embed else None
+            )
+            self.pending_embed_needs_execute = will_defer_embed
             return None
 
         embed_output_unresolved: ModelRunnerOutput | AsyncModelRunnerOutput | None = (
@@ -684,6 +775,30 @@ class DualModelRunner:
 
     def sample_tokens(self, grammar_output: GrammarOutput | None):
         async_outputs_for_children = self.async_outputs or self.use_async_scheduling
+
+        # If execute_model deferred embed (decode_first mode), start the
+        # embed forward NOW on a background thread, then run decode_sample
+        # on the main thread. The two overlap: embed forward on
+        # self.embed_stream, decode_sample on self.decode_stream.
+        # Safe under thread-local forward_context (see
+        # vllm/forward_context.py) regardless of dispatch order; the
+        # decode_first path keeps embed_dispatch hidden under decode_sample
+        # CPU cost, useful when decode is the long pole.
+        embed_thread = None
+        embed_holder: list[Any] = [None]
+        if getattr(self, "pending_embed_needs_execute", False):
+            deferred_split = self.pending_embed_split_output
+
+            def _run_embed_bg() -> None:
+                with torch.cuda.stream(self.embed_stream):
+                    with _nvtx_range("embed_execute_threaded"):
+                        embed_holder[0] = self.embed_runner.execute_model(
+                            deferred_split
+                        )
+
+            embed_thread = threading.Thread(target=_run_embed_bg, daemon=True)
+            embed_thread.start()
+
         with _nvtx_range("decode_sample"):
             with _temporary_async_outputs(
                 self.decode_runner, async_outputs_for_children
@@ -696,8 +811,18 @@ class DualModelRunner:
                 # device-side assert under FA3 + green-ctx mode=both.
                 with torch.cuda.stream(self.decode_stream):
                     decode_sample_output = self.decode_runner.sample_tokens(grammar_output)
+
+        # Join the background embed thread (was started before decode_sample).
+        # If decode_sample finished first, we wait a bit; if embed finished
+        # first, this returns immediately.
+        if embed_thread is not None:
+            embed_thread.join()
+            self.pending_embed_needs_execute = False
+            self.pending_embed_split_output = None
+
         embed_output_unresolved: ModelRunnerOutput | AsyncModelRunnerOutput | None = (
-            self.pending_embed_output
+            embed_holder[0] if embed_holder[0] is not None
+            else self.pending_embed_output
         )
         if self.pending_embed_needs_pool:
             with torch.cuda.stream(self.embed_stream):

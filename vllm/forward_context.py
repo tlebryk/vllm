@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import threading
 import time
 from collections import defaultdict
 from contextlib import contextmanager
@@ -244,20 +245,32 @@ class ForwardContext:
         )
 
 
-_forward_context: ForwardContext | None = None
+# Thread-local so concurrent forward passes on different threads (e.g. the
+# DualModelRunner's bg embed thread + main decode thread) each get their own
+# context without clobbering. Single-threaded callers see no behavior change.
+_forward_context: threading.local = threading.local()
+
+
+def _get_forward_context_value() -> "ForwardContext | None":
+    return getattr(_forward_context, "value", None)
+
+
+def _set_forward_context_value(value: "ForwardContext | None") -> None:
+    _forward_context.value = value
 
 
 def get_forward_context() -> ForwardContext:
     """Get the current forward context."""
-    assert _forward_context is not None, (
+    ctx = _get_forward_context_value()
+    assert ctx is not None, (
         "Forward context is not set. "
         "Please use `set_forward_context` to set the forward context."
     )
-    return _forward_context
+    return ctx
 
 
 def is_forward_context_available() -> bool:
-    return _forward_context is not None
+    return _get_forward_context_value() is not None
 
 
 def create_forward_context(
@@ -296,13 +309,12 @@ def override_forward_context(forward_context: ForwardContext | None):
     This is used to override the forward context for a specific
     forward pass.
     """
-    global _forward_context
-    prev_context = _forward_context
-    _forward_context = forward_context
+    prev_context = _get_forward_context_value()
+    _set_forward_context_value(forward_context)
     try:
         yield
     finally:
-        _forward_context = prev_context
+        _set_forward_context_value(prev_context)
 
 
 @contextmanager

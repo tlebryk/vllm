@@ -404,29 +404,34 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
-        with engine_core_nvtx_range("engine_core: schedule"):
-            scheduler_output = self.scheduler.schedule()
-        with engine_core_nvtx_range("engine_core: execute_model_submit"):
-            future = self.model_executor.execute_model(
-                scheduler_output, non_block=True
-            )
-        with engine_core_nvtx_range("engine_core: grammar_bitmask"):
-            grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
-        with (
-            self.log_error_detail(scheduler_output),
-            self.log_iteration_details(scheduler_output),
-        ):
-            with engine_core_nvtx_range("engine_core: execute_model_result"):
-                model_output = future.result()
-            if model_output is None:
-                with engine_core_nvtx_range("engine_core: sample_tokens"):
-                    model_output = self.model_executor.sample_tokens(grammar_output)
+        # One step-level NVTX boundary so analyzers can pair step rows
+        # against kernel timestamps. Inside we keep only ranges with real
+        # signal: `schedule` (CPU scheduling cost — load-bearing for gap
+        # attribution) and `execute_and_await` (covers kernel dispatch +
+        # the future-result wait, which is where GPU compute actually shows
+        # up on the timeline). Earlier per-substep ranges were misleading:
+        # with non_block=True the submit returns before kernels run, so a
+        # narrow "execute_model_submit" NVTX bar contained zero of the work
+        # it appeared to measure.
+        with engine_core_nvtx_range("engine_core: step"):
+            with engine_core_nvtx_range("engine_core: schedule"):
+                scheduler_output = self.scheduler.schedule()
+            with engine_core_nvtx_range("engine_core: execute_and_await"):
+                future = self.model_executor.execute_model(
+                    scheduler_output, non_block=True
+                )
+                grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+                with (
+                    self.log_error_detail(scheduler_output),
+                    self.log_iteration_details(scheduler_output),
+                ):
+                    model_output = future.result()
+                    if model_output is None:
+                        model_output = self.model_executor.sample_tokens(grammar_output)
 
-        # Before processing the model output, process any aborts that happened
-        # during the model execution.
-        with engine_core_nvtx_range("engine_core: process_aborts"):
+            # Aborts + scheduler output update are CPU-only and small;
+            # leave them outside execute_and_await but inside `step`.
             self._process_aborts_queue()
-        with engine_core_nvtx_range("engine_core: update_from_output"):
             engine_core_outputs = self.scheduler.update_from_output(
                 scheduler_output, model_output
             )

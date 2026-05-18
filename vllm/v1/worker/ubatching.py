@@ -72,7 +72,7 @@ class UBatchContext:
         return False
 
     def _restore_context(self):
-        forward_context._forward_context = self.forward_context
+        forward_context._set_forward_context_value(self.forward_context)
 
     def update_stream(self, stream):
         self.current_stream = stream
@@ -95,7 +95,9 @@ class UBatchContext:
         # It is critical for correctness that only one thread is running
         # at a time. These asserts just make sure that this is the only
         # thread running before waking the other one up and going to sleep
-        assert forward_context._forward_context == self.forward_context
+        assert (
+            forward_context._get_forward_context_value() == self.forward_context
+        )
         assert current_stream() == self.current_stream
         assert not self.cpu_wait_event.is_set()
 
