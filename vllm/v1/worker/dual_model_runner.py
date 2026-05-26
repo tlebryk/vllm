@@ -6,10 +6,11 @@ from __future__ import annotations
 import copy
 import inspect
 import os
+import queue
 import threading
 from contextlib import contextmanager
 from dataclasses import is_dataclass
-from typing import Any
+from typing import Any, Callable
 
 import torch
 import torch.nn as nn
@@ -101,6 +102,77 @@ class DualAsyncModelRunnerOutput(AsyncModelRunnerOutput):
             )
 
 
+class _PersistentWorker:
+    """Long-lived worker thread that owns a CUDA stream and serializes
+    submitted callables on it.
+
+    Replaces the per-step `threading.Thread(...).start()/join()` pattern used
+    by the embed_concurrent dispatch path. Eliminates the ~1 ms-per-step
+    Python-side thread-spawn cost, and lets decode_sample + embed_pool overlap
+    when each model has its own dedicated worker (each worker runs its
+    callable on its own stream + thread, so the two streams' kernels can
+    actually run in parallel on the GPU).
+
+    Lifecycle:
+      - Spawned in DualModelRunner.__init__ when execute_order ==
+        "persistent_workers".
+      - Daemon thread; .shutdown() on a sentinel value at runner teardown
+        (best-effort -- daemon ensures process exit doesn't hang).
+      - Each submission returns (done_event, result_holder). Caller waits via
+        wait(); exceptions raised on the worker re-raise on the waiter.
+    """
+
+    def __init__(self, name: str, stream: torch.cuda.Stream,
+                 device: torch.device):
+        self.name = name
+        self.stream = stream
+        self.device = device
+        self._queue: "queue.Queue[Any]" = queue.Queue()
+        self._thread = threading.Thread(
+            target=self._loop,
+            name=f"dual_model_{name}_worker",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _loop(self) -> None:
+        # CUDA current-device is thread-local; set once per worker thread so
+        # `torch.cuda.stream(...)` and any tensor allocs land on the right
+        # device.
+        torch.cuda.set_device(self.device)
+        while True:
+            item = self._queue.get()
+            if item is None:
+                return  # shutdown sentinel
+            func, done_event, result_holder = item
+            try:
+                with torch.cuda.stream(self.stream):
+                    result_holder["value"] = func()
+            except BaseException as e:  # noqa: BLE001 -- re-raised on waiter
+                result_holder["exception"] = e
+            finally:
+                done_event.set()
+
+    def submit(self, func: Callable[[], Any]) -> tuple[threading.Event, dict]:
+        done_event = threading.Event()
+        result_holder: dict = {}
+        self._queue.put((func, done_event, result_holder))
+        return done_event, result_holder
+
+    @staticmethod
+    def wait(done_event: threading.Event, result_holder: dict) -> Any:
+        done_event.wait()
+        if "exception" in result_holder:
+            raise result_holder["exception"]
+        return result_holder.get("value")
+
+    def shutdown(self) -> None:
+        self._queue.put(None)
+        # Daemon thread; best-effort join. We don't want shutdown to block
+        # forever if the worker is stuck on a hung kernel.
+        self._thread.join(timeout=2.0)
+
+
 class DualModelRunner:
     """Experimental wrapper that hosts one decode and one embed runner."""
 
@@ -163,9 +235,35 @@ class DualModelRunner:
                 _ct.c_void_p, _ct.c_uint64
             ]
             _libsm.libsmctrl_set_stream_mask.restype = None
+            # 128-bit mask path for GPUs with >64 TPCs (e.g. H200 has 66).
+            # libsmctrl declares this as `void f(void*, unsigned __int128)`. On
+            # SysV x86_64 the __int128 is passed in two consecutive integer
+            # registers (RSI:RDX after the void* in RDI), so we declare two
+            # c_uint64 args at the Python level -- the ABI matches.
+            _libsm.libsmctrl_set_stream_mask_ext.argtypes = [
+                _ct.c_void_p, _ct.c_uint64, _ct.c_uint64
+            ]
+            _libsm.libsmctrl_set_stream_mask_ext.restype = None
+            _UINT64_MAX = (1 << 64) - 1
 
             def _parse(v):
                 return int(v, 16) if v.startswith("0x") else int(v)
+
+            def _apply_mask(label: str, stream_handle: int, m: int) -> None:
+                if m > _UINT64_MAX:
+                    lo = m & _UINT64_MAX
+                    hi = (m >> 64) & _UINT64_MAX
+                    _libsm.libsmctrl_set_stream_mask_ext(
+                        _ct.c_void_p(stream_handle),
+                        _ct.c_uint64(lo), _ct.c_uint64(hi),
+                    )
+                    print(f"[libsmctrl] {label} mask_ext = "
+                          f"0x{hi:016x}{lo:016x}")
+                else:
+                    _libsm.libsmctrl_set_stream_mask(
+                        _ct.c_void_p(stream_handle), _ct.c_uint64(m),
+                    )
+                    print(f"[libsmctrl] {label} mask = 0x{m:016x}")
 
             if decode_mask_env:
                 # Replace default stream with a fresh one before masking
@@ -176,18 +274,12 @@ class DualModelRunner:
                           f"from default to fresh stream (cuda_stream="
                           f"{self.decode_stream.cuda_stream:#x})")
                 m = _parse(decode_mask_env)
-                _libsm.libsmctrl_set_stream_mask(
-                    _ct.c_void_p(self.decode_stream.cuda_stream),
-                    _ct.c_uint64(m),
-                )
-                print(f"[libsmctrl] decode_stream mask = 0x{m:016x}")
+                _apply_mask("decode_stream",
+                            self.decode_stream.cuda_stream, m)
             if embed_mask_env and self.embed_stream is not self.decode_stream:
                 m = _parse(embed_mask_env)
-                _libsm.libsmctrl_set_stream_mask(
-                    _ct.c_void_p(self.embed_stream.cuda_stream),
-                    _ct.c_uint64(m),
-                )
-                print(f"[libsmctrl] embed_stream  mask = 0x{m:016x}")
+                _apply_mask("embed_stream ",
+                            self.embed_stream.cuda_stream, m)
 
         # Optional: bind both streams to disjoint CUDA green contexts to give
         # decode/embed hard SM partitions (constrains cuBLAS too, unlike
@@ -207,14 +299,38 @@ class DualModelRunner:
             "VLLM_DUAL_MODEL_EXECUTE_ORDER", "embed_concurrent"
         )
         if execute_order not in (
-            "decode_first", "embed_first", "embed_concurrent"
+            "decode_first", "embed_first", "embed_concurrent",
+            "persistent_workers",
         ):
             raise ValueError(
                 "VLLM_DUAL_MODEL_EXECUTE_ORDER must be 'decode_first', "
-                "'embed_first', or 'embed_concurrent', got "
-                f"{execute_order!r}."
+                "'embed_first', 'embed_concurrent', or 'persistent_workers', "
+                f"got {execute_order!r}."
             )
         self.execute_order = execute_order
+        # Persistent worker threads (one per model) -- created lazily to keep
+        # the existing execute paths zero-cost when this mode isn't selected.
+        # When enabled, each persistent worker owns its model's CUDA stream
+        # and handles BOTH execute_model and the post-forward step
+        # (decode_sample for the decode worker, embed_pool for the embed
+        # worker). This lets decode_sample + embed_pool overlap on the GPU
+        # (different streams) and eliminates the ~1 ms per-step Python thread
+        # spawn the old embed_concurrent path paid.
+        self._decode_worker: _PersistentWorker | None = None
+        self._embed_worker: _PersistentWorker | None = None
+        if execute_order == "persistent_workers":
+            self._decode_worker = _PersistentWorker(
+                "decode", self.decode_stream, device
+            )
+            # Reuse the same worker for both streams if they alias (default
+            # stream mode) -- no concurrency to gain, but keeps the dispatch
+            # code uniform.
+            if self.embed_stream is self.decode_stream:
+                self._embed_worker = self._decode_worker
+            else:
+                self._embed_worker = _PersistentWorker(
+                    "embed", self.embed_stream, device
+                )
         self.async_outputs = os.environ.get(
             "VLLM_DUAL_MODEL_ASYNC_OUTPUTS", "0"
         ).lower() in ("1", "true", "yes", "on")
@@ -689,8 +805,27 @@ class DualModelRunner:
             has_embed_work and has_decode_work
             and self.execute_order == "embed_concurrent"
         )
+        will_use_persistent = (
+            self.execute_order == "persistent_workers"
+            and self._decode_worker is not None
+        )
 
-        if will_concurrent_embed:
+        if will_use_persistent:
+            # Persistent worker dispatch. Each worker runs forever on its own
+            # thread + CUDA stream; submissions are queued and overlap on the
+            # GPU because the streams are independent. No per-step thread
+            # spawn (the old embed_concurrent path paid ~1 ms here).
+            decode_evt = decode_res = None
+            embed_evt = embed_res = None
+            if has_decode_work:
+                decode_evt, decode_res = self._decode_worker.submit(run_decode)
+            if has_embed_work:
+                embed_evt, embed_res = self._embed_worker.submit(run_embed)
+            if has_decode_work:
+                decode_output = _PersistentWorker.wait(decode_evt, decode_res)
+            if has_embed_work:
+                embed_exec_output = _PersistentWorker.wait(embed_evt, embed_res)
+        elif will_concurrent_embed:
             embed_holder: list[Any] = [None]
 
             def _run_embed_thread() -> None:
@@ -776,6 +911,69 @@ class DualModelRunner:
     def sample_tokens(self, grammar_output: GrammarOutput | None):
         async_outputs_for_children = self.async_outputs or self.use_async_scheduling
 
+        # ---- persistent_workers path ----
+        # Submit decode_sample to the decode worker (its own stream + thread)
+        # and embed_pool to the embed worker (its own stream + thread) in
+        # parallel. Both finish concurrently; main thread waits for both then
+        # merges. This eliminates the ~0.4 ms of serializing embed_pool after
+        # decode_sample that the legacy path paid.
+        if self.execute_order == "persistent_workers" and self._decode_worker is not None:
+            def _do_decode_sample():
+                with _nvtx_range("decode_sample"):
+                    with _temporary_async_outputs(
+                        self.decode_runner, async_outputs_for_children
+                    ):
+                        # Stream context is set by the worker's _loop wrapper
+                        # too, but be explicit here so this closure is correct
+                        # regardless of who invokes it.
+                        with torch.cuda.stream(self.decode_stream):
+                            return self.decode_runner.sample_tokens(grammar_output)
+
+            decode_evt, decode_res = self._decode_worker.submit(_do_decode_sample)
+
+            embed_evt = embed_res = None
+            if self.pending_embed_needs_pool:
+                def _do_embed_pool():
+                    with _nvtx_range("embed_pool"):
+                        with _temporary_async_outputs(
+                            self.embed_runner, async_outputs_for_children
+                        ):
+                            with torch.cuda.stream(self.embed_stream):
+                                return self.embed_runner.pool()
+                embed_evt, embed_res = self._embed_worker.submit(_do_embed_pool)
+
+            decode_sample_output = _PersistentWorker.wait(decode_evt, decode_res)
+            if embed_evt is not None:
+                embed_output_unresolved = _PersistentWorker.wait(embed_evt, embed_res)
+            else:
+                embed_output_unresolved = self.pending_embed_output
+
+            scheduled_req_order = self.pending_req_order
+            self.pending_embed_output = None
+            self.pending_embed_needs_pool = False
+            self.pending_req_order = []
+
+            if self.use_async_scheduling:
+                return DualAsyncModelRunnerOutput(
+                    scheduled_req_order=scheduled_req_order,
+                    decode_output=decode_sample_output,
+                    embed_output=embed_output_unresolved,
+                )
+
+            decode_output = _resolve_model_runner_output(
+                decode_sample_output, "decode_output_get",
+            )
+            embed_output = _resolve_model_runner_output(
+                embed_output_unresolved, "embed_output_get",
+            )
+            with _nvtx_range("merge_outputs"):
+                return merge_model_runner_outputs(
+                    scheduled_req_order=scheduled_req_order,
+                    decode_output=decode_output,
+                    embed_output=embed_output,
+                )
+
+        # ---- legacy paths below (embed_concurrent / decode_first / embed_first) ----
         # If execute_model deferred embed (decode_first mode), start the
         # embed forward NOW on a background thread, then run decode_sample
         # on the main thread. The two overlap: embed forward on
