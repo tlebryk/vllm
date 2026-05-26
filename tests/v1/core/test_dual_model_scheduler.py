@@ -18,7 +18,9 @@ pytestmark = pytest.mark.cpu_test
 def test_dual_model_embed_requests_allocate_and_free_kv(monkeypatch):
     monkeypatch.setattr(current_platform, "device_type", "cuda")
     scheduler = create_scheduler()
-    scheduler.dual_model_config = DualModelConfig(embed_model="embed-model")
+    scheduler.dual_model_config = DualModelConfig(
+        embed_model="embed-model", prefill_exclusion=False
+    )
 
     decode_request = create_requests(num_requests=1, num_tokens=8)[0]
     embed_request = Request(
@@ -59,7 +61,9 @@ def test_dual_model_embed_requests_allocate_and_free_kv(monkeypatch):
 def test_dual_model_scheduler_output_records_schedule_time_counts(monkeypatch):
     monkeypatch.setattr(current_platform, "device_type", "cuda")
     scheduler = create_scheduler(max_num_seqs=4, max_num_batched_tokens=32)
-    scheduler.dual_model_config = DualModelConfig(embed_model="embed-model")
+    scheduler.dual_model_config = DualModelConfig(
+        embed_model="embed-model", prefill_exclusion=False
+    )
 
     decode_request = create_requests(num_requests=1, num_tokens=8)[0]
     embed_request = Request(
@@ -94,7 +98,9 @@ def test_dual_model_scheduler_output_records_schedule_time_counts(monkeypatch):
 def test_dual_model_without_embed_gate_does_not_scan_model_counts(monkeypatch):
     monkeypatch.setattr(current_platform, "device_type", "cuda")
     scheduler = create_scheduler(max_num_seqs=4, max_num_batched_tokens=32)
-    scheduler.dual_model_config = DualModelConfig(embed_model="embed-model")
+    scheduler.dual_model_config = DualModelConfig(
+        embed_model="embed-model", prefill_exclusion=False
+    )
 
     decode_request = create_requests(num_requests=1, num_tokens=8)[0]
     embed_request = Request(
@@ -151,3 +157,88 @@ def test_dual_model_embed_gate_uses_cached_model_counts(monkeypatch):
         decode_requests[0].request_id: 8,
         decode_requests[1].request_id: 8,
     }
+
+
+def test_dual_model_prefill_exclusion_blocks_embed_during_decode_prefill(
+    monkeypatch,
+):
+    """With prefill_exclusion=True (default), an embed waiting request must
+    NOT be admitted in the same step as a decode prefill — the running-phase
+    decode chunk and the embed prefill would otherwise overlap."""
+    monkeypatch.setattr(current_platform, "device_type", "cuda")
+    scheduler = create_scheduler(max_num_seqs=4, max_num_batched_tokens=64)
+    scheduler.dual_model_config = DualModelConfig(embed_model="embed-model")
+
+    decode_request = create_requests(num_requests=1, num_tokens=8)[0]
+    embed_request = Request(
+        request_id="embed-0",
+        prompt_token_ids=[7] * 8,
+        sampling_params=None,
+        pooling_params=PoolingParams(task="embed"),
+    )
+    # Add decode first so it is admitted on step 1; embed should be skipped
+    # because the freshly-admitted decode is mid-prefill this step.
+    scheduler.add_request(decode_request)
+    scheduler.add_request(embed_request)
+
+    output = scheduler.schedule()
+    assert decode_request.request_id in output.num_scheduled_tokens
+    assert embed_request.request_id not in output.num_scheduled_tokens
+    assert output.schedule_end_running_decode_reqs == 1
+    assert output.schedule_end_running_embed_reqs == 0
+
+
+def test_dual_model_prefill_exclusion_blocks_decode_during_embed_prefill(
+    monkeypatch,
+):
+    """Symmetric direction: while an embed is mid-prefill in self.running,
+    a new decode waiting request must NOT be admitted."""
+    monkeypatch.setattr(current_platform, "device_type", "cuda")
+    scheduler = create_scheduler(max_num_seqs=4, max_num_batched_tokens=64)
+    scheduler.dual_model_config = DualModelConfig(embed_model="embed-model")
+
+    embed_request = Request(
+        request_id="embed-0",
+        prompt_token_ids=[7] * 32,
+        sampling_params=None,
+        pooling_params=PoolingParams(task="embed"),
+    )
+    scheduler.add_request(embed_request)
+
+    # Step 1: embed admitted into running, prefill chunk scheduled.
+    step1 = scheduler.schedule()
+    assert embed_request.request_id in step1.num_scheduled_tokens
+    # Force embed to remain mid-prefill: roll back computed tokens so the
+    # next step still sees num_computed_tokens < num_prompt_tokens.
+    embed_request.num_computed_tokens = 0
+
+    # Now add a decode req and re-run schedule. With prefill_exclusion=True
+    # the decode admission gate must keep decode in waiting.
+    decode_request = create_requests(num_requests=1, num_tokens=8)[0]
+    scheduler.add_request(decode_request)
+
+    step2 = scheduler.schedule()
+    assert decode_request.request_id not in step2.num_scheduled_tokens
+
+
+def test_dual_model_prefill_exclusion_disabled_allows_overlap(monkeypatch):
+    """Setting prefill_exclusion=False restores the prior overlap behavior."""
+    monkeypatch.setattr(current_platform, "device_type", "cuda")
+    scheduler = create_scheduler(max_num_seqs=4, max_num_batched_tokens=64)
+    scheduler.dual_model_config = DualModelConfig(
+        embed_model="embed-model", prefill_exclusion=False
+    )
+
+    decode_request = create_requests(num_requests=1, num_tokens=8)[0]
+    embed_request = Request(
+        request_id="embed-0",
+        prompt_token_ids=[7] * 8,
+        sampling_params=None,
+        pooling_params=PoolingParams(task="embed"),
+    )
+    scheduler.add_request(decode_request)
+    scheduler.add_request(embed_request)
+
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens[decode_request.request_id] == 8
+    assert output.num_scheduled_tokens[embed_request.request_id] == 8

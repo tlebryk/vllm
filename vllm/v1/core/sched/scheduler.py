@@ -1239,13 +1239,48 @@ class Scheduler(SchedulerInterface):
         else:
             self._embed_waiting_burst_remaining = 0
 
+    def _any_running_model_in_prefill(self, model_id: str) -> bool:
+        """True if any running request for `model_id` is mid-prefill
+        (num_computed_tokens < num_prompt_tokens). The running-phase loop
+        will schedule a prefill chunk for such requests this step, so this
+        is the precise "prefill kernels active this step" predicate at the
+        start of schedule()."""
+        for req in self.running:
+            if (req.model_id == model_id
+                    and req.num_computed_tokens < req.num_prompt_tokens):
+                return True
+        return False
+
+    def _prefill_exclusion_blocks_embed(self) -> bool:
+        """For symmetric embed/decode prefill exclusion: block new embed
+        admission whenever decode is doing (or about to do) prefill."""
+        dual_cfg = self.dual_model_config
+        if dual_cfg is None or not dual_cfg.prefill_exclusion:
+            return False
+        if self._num_waiting_decode_reqs > 0:
+            return True
+        return self._any_running_model_in_prefill(dual_cfg.decode_model_id)
+
+    def _prefill_exclusion_blocks_decode(self) -> bool:
+        """Symmetric: block new decode admission while any running embed is
+        mid-prefill. Admitting decode here would prefill alongside the
+        in-flight embed prefill."""
+        dual_cfg = self.dual_model_config
+        if dual_cfg is None or not dual_cfg.prefill_exclusion:
+            return False
+        return self._any_running_model_in_prefill(dual_cfg.embed_model_id)
+
     def _should_skip_decode_waiting_request(self, request: Request) -> bool:
         """Skip a decode waiting request if it would push running_decode past
-        max_decode_running_reqs. This caps decode batch to leave KV headroom
-        for embed admission in mixed scheduling."""
+        max_decode_running_reqs, or if the symmetric prefill-exclusion rule
+        is active and an embed is mid-prefill. This caps decode batch to
+        leave KV headroom for embed admission in mixed scheduling and keeps
+        decode-prefill and embed-prefill from overlapping in the same step."""
         dual_cfg = self.dual_model_config
         if dual_cfg is None or request.model_id != dual_cfg.decode_model_id:
             return False
+        if self._prefill_exclusion_blocks_decode():
+            return True
         if dual_cfg.max_decode_running_reqs is None:
             return False
         return self._num_running_decode_reqs >= dual_cfg.max_decode_running_reqs
@@ -1254,6 +1289,9 @@ class Scheduler(SchedulerInterface):
         dual_cfg = self.dual_model_config
         if dual_cfg is None or request.model_id != dual_cfg.embed_model_id:
             return False
+
+        if self._prefill_exclusion_blocks_embed():
+            return True
 
         if not self._embed_waiting_gate_enabled(dual_cfg):
             return False
@@ -2016,6 +2054,8 @@ class Scheduler(SchedulerInterface):
         dual_cfg = self.dual_model_config
         if dual_cfg is None or request.model_id != dual_cfg.decode_model_id:
             return False
+        if self._prefill_exclusion_blocks_decode():
+            return True
         if dual_cfg.max_decode_running_reqs is None:
             return False
         return self._num_running_decode_reqs >= dual_cfg.max_decode_running_reqs
@@ -2025,6 +2065,9 @@ class Scheduler(SchedulerInterface):
         dual_cfg = self.dual_model_config
         if dual_cfg is None or request.model_id != dual_cfg.embed_model_id:
             return False
+
+        if self._prefill_exclusion_blocks_embed():
+            return True
 
         if not self._embed_waiting_gate_enabled(dual_cfg):
             return False
