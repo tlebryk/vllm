@@ -208,7 +208,9 @@ __global__ __launch_bounds__(384, 1) void gpt_oss_router_gemm_kernel(
       init(&bar_act_ready[i], 1);
       init(&bar_data_consumed[i], 32);
     }
-    ptx::fence_proxy_async(ptx::space_shared);
+    // cuda::ptx::fence_proxy_async(space_shared) is CUDA 12.6+; we build
+    // against CUDA 12.4. Drop to the raw PTX it emits (sm_90+).
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
     asm volatile("prefetch.tensormap [%0];"
                  :
                  : "l"(reinterpret_cast<uint64_t>(&weight_map))

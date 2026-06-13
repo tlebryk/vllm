@@ -276,6 +276,15 @@ class DualModelRunner:
                 m = _parse(decode_mask_env)
                 _apply_mask("decode_stream",
                             self.decode_stream.cuda_stream, m)
+                # Route decode-model unquantized linears through a cuBLASLt
+                # GEMM with CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET pinned, so the
+                # Hopper GEMM does not deadlock when the mask exposes <32 TPC.
+                # Gated by HB_DECODE_SM_COUNT_TARGET (no-op when unset/0). The
+                # monkeypatch is decode-stream-gated, so embed is untouched.
+                from vllm.v1.worker.decode_sm_linear_hook import (
+                    register_decode_stream,
+                )
+                register_decode_stream(self.decode_stream.cuda_stream)
             if embed_mask_env and self.embed_stream is not self.decode_stream:
                 m = _parse(embed_mask_env)
                 _apply_mask("embed_stream ",
@@ -286,7 +295,10 @@ class DualModelRunner:
         # FA3 sm_margin which is FA3-only). Requires --enforce-eager.
         if int(os.environ.get("VLLM_DUAL_MODEL_GREEN_CTX_DECODE_SM", "0")) > 0:
             import sys
-            sys.path.insert(0, "/n/home07/tlebryk1/heterobatchvllm/scripts")
+            sys.path.insert(0, os.environ.get(
+                "VLLM_DUAL_MODEL_GREEN_CTX_HELPER_DIR",
+                "/mnt/weka/theo/heterogenious-batching-vllm/scripts",
+            ))
             from green_ctx_helper import maybe_make_streams
             d, e, info = maybe_make_streams(
                 device, self.decode_stream, self.embed_stream
@@ -294,6 +306,14 @@ class DualModelRunner:
             self.decode_stream = d
             self.embed_stream = e
             self._green_ctx_info = info
+
+        # NOTE: tried labeling the streams in nsys-ui via
+        # nvtxNameCudaStreamA/CuStreamA — nsys 2025.6 ignores those events
+        # from the system libnvToolsExt. In nsys-ui, identify streams via
+        # the NVTX ranges that live on them: kernels under `decode_execute`
+        # are the decode stream, kernels under `embed_execute`/`embed_pool`
+        # are the embed stream. You can right-click → Rename a swim lane to
+        # make this persistent for one report.
 
         execute_order = os.environ.get(
             "VLLM_DUAL_MODEL_EXECUTE_ORDER", "embed_concurrent"

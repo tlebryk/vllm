@@ -37,8 +37,17 @@ class PoolingRunner:
         # TODO(woosuk): Make normalization optional.
         last_hidden_states = F.normalize(last_hidden_states, p=2, dim=-1)
 
+        # NOTE: Under full CUDA graphs, input_batch.seq_lens is padded up to
+        # num_reqs_after_padding (the captured request-batch size), while
+        # prompt_len (indexed by idx_mapping) and last_hidden_states (indexed by
+        # logits_indices) only have the real num_reqs entries. Slice seq_lens to
+        # the real request count before comparing so is_valid lines up with the
+        # pooled outputs; otherwise the padded slots leak in and either trigger a
+        # shape mismatch or produce an over-length is_valid mask.
+        num_reqs = input_batch.num_reqs
+        seq_lens = input_batch.seq_lens[:num_reqs]
         prompt_len = req_states.prompt_len.gpu[input_batch.idx_mapping]
-        is_valid = input_batch.seq_lens == prompt_len
+        is_valid = seq_lens == prompt_len
         return last_hidden_states, is_valid
 
     def dummy_pooler_run(self, hidden_states: torch.Tensor) -> None:
