@@ -60,6 +60,16 @@ class UniProcExecutor(Executor):
 
     @cached_property
     def max_concurrent_batches(self) -> int:
+        # HB_DEFER_DECODE_SAMPLE_D2H (default OFF): enable the 2-deep batch queue
+        # + async output thread WITHOUT engine-wide async scheduling, so the
+        # dual-model runner's deferred decode token-id D2H + merge resolve on the
+        # WorkerAsyncOutput thread (overlapping the NEXT step's schedule/dispatch)
+        # while decode and embed keep their separate CUDA streams. When OFF this
+        # is byte-identical (returns 1 unless async_scheduling).
+        if os.environ.get("HB_DEFER_DECODE_SAMPLE_D2H", "0").lower() in (
+            "1", "true", "yes", "on"
+        ):
+            return 2
         return 2 if self.scheduler_config.async_scheduling else 1
 
     def collective_rpc(  # type: ignore[override]

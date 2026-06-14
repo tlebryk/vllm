@@ -33,6 +33,28 @@ from vllm.v1.worker.dual_model_helpers import (
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 
+def _defer_decode_sample_d2h() -> bool:
+    """HB_DEFER_DECODE_SAMPLE_D2H feature flag (default OFF).
+
+    When ON, the decode child runner's sample step runs in async-output mode so
+    its blocking D2H token-id sync (``_to_list`` -> ``transfer_event.synchronize``
+    in gpu_model_runner.py) is replaced by a deferred ``get_output()``. The dual
+    runner then resolves that decode ``get_output()`` AFTER it has dispatched the
+    embed pool onto the (separate) embed stream, so the decode D2H drain overlaps
+    with the embed pool's GPU work instead of stalling the engine hot thread
+    before embed gets a chance to run.
+
+    This is NOT engine-wide async scheduling: the engine scheduler stays
+    synchronous, decode and embed keep their own CUDA streams + persistent
+    workers, and the merged output is still produced in the SAME step (no output
+    lag, no placeholder tokens leaking to the scheduler). When OFF the code path
+    is byte-identical to before.
+    """
+    return os.environ.get("HB_DEFER_DECODE_SAMPLE_D2H", "0").lower() in (
+        "1", "true", "yes", "on"
+    )
+
+
 @contextmanager
 def _nvtx_range(name: str):
     torch.cuda.nvtx.range_push(name)
@@ -929,7 +951,15 @@ class DualModelRunner:
             )
 
     def sample_tokens(self, grammar_output: GrammarOutput | None):
+        defer_d2h = _defer_decode_sample_d2h()
+        # When deferring the decode D2H, the DECODE child runs in async-output
+        # mode so its sample returns an AsyncModelRunnerOutput (no inline
+        # blocking transfer_event.synchronize); we resolve that decode output
+        # LAST, after the embed pool has been dispatched on the embed stream, so
+        # the decode token D2H drain overlaps embed GPU work. The embed child is
+        # left in its normal (possibly sync) mode; only decode is forced async.
         async_outputs_for_children = self.async_outputs or self.use_async_scheduling
+        decode_async_child = async_outputs_for_children or defer_d2h
 
         # ---- persistent_workers path ----
         # Submit decode_sample to the decode worker (its own stream + thread)
@@ -941,7 +971,7 @@ class DualModelRunner:
             def _do_decode_sample():
                 with _nvtx_range("decode_sample"):
                     with _temporary_async_outputs(
-                        self.decode_runner, async_outputs_for_children
+                        self.decode_runner, decode_async_child
                     ):
                         # Stream context is set by the worker's _loop wrapper
                         # too, but be explicit here so this closure is correct
@@ -973,7 +1003,14 @@ class DualModelRunner:
             self.pending_embed_needs_pool = False
             self.pending_req_order = []
 
-            if self.use_async_scheduling:
+            if self.use_async_scheduling or defer_d2h:
+                # Defer decode token-id D2H + merge to get_output(), which the
+                # executor runs on its WorkerAsyncOutput thread (because the
+                # batch queue / non_block=True path is enabled under the flag).
+                # This overlaps step N's D2H drain with step N+1's CPU dispatch
+                # while decode/embed keep their separate streams. NOT engine-wide
+                # async scheduling (scheduler stays sync; the 2-deep batch queue
+                # pairs each output with its own scheduler_output).
                 return DualAsyncModelRunnerOutput(
                     scheduled_req_order=scheduled_req_order,
                     decode_output=decode_sample_output,
@@ -1019,7 +1056,7 @@ class DualModelRunner:
 
         with _nvtx_range("decode_sample"):
             with _temporary_async_outputs(
-                self.decode_runner, async_outputs_for_children
+                self.decode_runner, decode_async_child
             ):
                 # Run sample on the decode stream so the sampler is in-stream
                 # with the model forward (which produced hidden_states on the
@@ -1027,6 +1064,9 @@ class DualModelRunner:
                 # on the caller's stream (the engine default stream), which
                 # creates a cross-stream race that fires asynchronously as a
                 # device-side assert under FA3 + green-ctx mode=both.
+                # With defer_d2h, decode_async_child forces async output here so
+                # the blocking token-id D2H sync is deferred to get_output()
+                # below, AFTER embed_pool is dispatched (overlap, not a stall).
                 with torch.cuda.stream(self.decode_stream):
                     decode_sample_output = self.decode_runner.sample_tokens(grammar_output)
 
@@ -1055,7 +1095,11 @@ class DualModelRunner:
         self.pending_embed_needs_pool = False
         self.pending_req_order = []
 
-        if self.use_async_scheduling:
+        if self.use_async_scheduling or defer_d2h:
+            # Defer decode token-id D2H + merge to get_output() on the executor's
+            # WorkerAsyncOutput thread (batch-queue / non_block path enabled by
+            # the flag). Overlaps step N D2H drain with step N+1 dispatch; streams
+            # stay separate; scheduler stays synchronous.
             return DualAsyncModelRunnerOutput(
                 scheduled_req_order=scheduled_req_order,
                 decode_output=decode_sample_output,
