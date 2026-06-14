@@ -70,6 +70,14 @@ class UniProcExecutor(Executor):
             "1", "true", "yes", "on"
         ):
             return 2
+        # HB_DUAL_GRAPH_BOTH_STREAMS (default OFF): same 2-deep batch queue +
+        # async output thread requirement as the D2H defer flag (it implies the
+        # deferred decode token-id D2H so the back-to-back decode-graph +
+        # embed-graph replays are not interrupted by a blocking sync).
+        if os.environ.get("HB_DUAL_GRAPH_BOTH_STREAMS", "0").lower() in (
+            "1", "true", "yes", "on"
+        ):
+            return 2
         return 2 if self.scheduler_config.async_scheduling else 1
 
     def collective_rpc(  # type: ignore[override]

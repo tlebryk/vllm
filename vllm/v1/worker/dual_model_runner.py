@@ -55,6 +55,36 @@ def _defer_decode_sample_d2h() -> bool:
     )
 
 
+def _dual_graph_both_streams() -> bool:
+    """HB_DUAL_GRAPH_BOTH_STREAMS feature flag (default OFF).
+
+    T1 lever (see project_engine_overlap_blocker). When ON, the dual runner
+    dispatches the decode forward and the embed forward BACK-TO-BACK from a
+    single host thread, each as a single CUDA-graph replay on its own stream,
+    with NO thread spawn / join / cross-stream event between them and NO
+    blocking D2H sync inside the step. The intent: collapse the ~495 per-kernel
+    host launches per decode step into ~1 graph replay so the decode stream's
+    kernels become dense, then immediately enqueue the embed graph on the embed
+    stream so both stream queues stay full and the GPU scheduler can co-issue
+    decode-memory-bound + embed-compute-bound kernels (the 26.5% microbench
+    ceiling).
+
+    Requirements when ON:
+      - Both child models MUST be running FULL CUDA graphs (``--no-enforce-eager
+        --cudagraph-mode FULL``); otherwise each forward is still ~495 host
+        launches and there is no dense window. The flag still runs correctly
+        (it just won't densify), and a warning is logged at first dispatch.
+      - Implies the deferred decode token-id D2H (so the step is not stalled by
+        ``transfer_event.synchronize`` between the two replays). The executor's
+        2-deep batch queue is enabled by the same env in uniproc_executor.
+
+    When OFF the code path is byte-identical to before.
+    """
+    return os.environ.get("HB_DUAL_GRAPH_BOTH_STREAMS", "0").lower() in (
+        "1", "true", "yes", "on"
+    )
+
+
 @contextmanager
 def _nvtx_range(name: str):
     torch.cuda.nvtx.range_push(name)
@@ -406,6 +436,7 @@ class DualModelRunner:
         self.pending_req_order: list[str] = []
         self.decode_kv_group_indices: tuple[int, ...] = ()
         self.embed_kv_group_indices: tuple[int, ...] = ()
+        self._graph_both_warned = False
         self.decode_kv_cache_spec: dict[str, Any] = {}
         self.embed_kv_cache_spec: dict[str, Any] = {}
 
@@ -851,8 +882,26 @@ class DualModelRunner:
             self.execute_order == "persistent_workers"
             and self._decode_worker is not None
         )
+        # T1 graph-both-streams dispatch: back-to-back single-thread replay of
+        # decode forward then embed forward on their own streams, no thread
+        # spawn / join / cross-stream sync. Only meaningful (densifying) under
+        # FULL cudagraphs but always correct. Overrides execute_order.
+        will_graph_both = (
+            _dual_graph_both_streams() and has_decode_work and has_embed_work
+        )
 
-        if will_use_persistent:
+        if will_graph_both:
+            self._warn_if_not_full_graphs()
+            # Single host thread: enqueue decode-graph replay on decode_stream,
+            # then IMMEDIATELY enqueue embed-graph replay on embed_stream. Each
+            # forward is one replay() (FULL graph) so the host enqueues both in
+            # microseconds with no GIL ping-pong and no intervening sync; both
+            # stream queues are full at once for the GPU to co-issue.
+            if has_decode_work:
+                decode_output = run_decode()
+            if has_embed_work:
+                embed_exec_output = run_embed()
+        elif will_use_persistent:
             # Persistent worker dispatch. Each worker runs forever on its own
             # thread + CUDA stream; submissions are queued and overlap on the
             # GPU because the streams are independent. No per-step thread
@@ -951,7 +1000,10 @@ class DualModelRunner:
             )
 
     def sample_tokens(self, grammar_output: GrammarOutput | None):
-        defer_d2h = _defer_decode_sample_d2h()
+        # HB_DUAL_GRAPH_BOTH_STREAMS implies the deferred decode-sample D2H so
+        # the decode-sample + embed-pool replays in this step are not split by a
+        # blocking transfer_event.synchronize.
+        defer_d2h = _defer_decode_sample_d2h() or _dual_graph_both_streams()
         # When deferring the decode D2H, the DECODE child runs in async-output
         # mode so its sample returns an AsyncModelRunnerOutput (no inline
         # blocking transfer_event.synchronize); we resolve that decode output
@@ -967,7 +1019,11 @@ class DualModelRunner:
         # parallel. Both finish concurrently; main thread waits for both then
         # merges. This eliminates the ~0.4 ms of serializing embed_pool after
         # decode_sample that the legacy path paid.
-        if self.execute_order == "persistent_workers" and self._decode_worker is not None:
+        if (
+            self.execute_order == "persistent_workers"
+            and self._decode_worker is not None
+            and not _dual_graph_both_streams()
+        ):
             def _do_decode_sample():
                 with _nvtx_range("decode_sample"):
                     with _temporary_async_outputs(
@@ -1121,6 +1177,40 @@ class DualModelRunner:
                 scheduled_req_order=scheduled_req_order,
                 decode_output=decode_output,
                 embed_output=embed_output,
+            )
+
+    def _warn_if_not_full_graphs(self) -> None:
+        """One-time check that both child runners actually have FULL graphs.
+
+        HB_DUAL_GRAPH_BOTH_STREAMS only densifies the streams if each forward is
+        a single graph replay. If either runner captured no FULL graphs (e.g.
+        ran eager / --enforce-eager), the dispatch is still correct but each
+        forward is ~495 host launches with no dense window for overlap; warn so
+        the measurement isn't misread.
+        """
+        if self._graph_both_warned:
+            return
+        self._graph_both_warned = True
+
+        def _has_full_graphs(runner: GPUModelRunner) -> bool:
+            mgr = getattr(runner, "cudagraph_manager", None)
+            graphs = getattr(mgr, "graphs", None)
+            return bool(graphs)
+
+        decode_ok = _has_full_graphs(self.decode_runner)
+        embed_ok = _has_full_graphs(self.embed_runner)
+        print(
+            "[HB_DUAL_GRAPH_BOTH_STREAMS] active: "
+            f"decode_full_graphs={decode_ok} embed_full_graphs={embed_ok}",
+            flush=True,
+        )
+        if not (decode_ok and embed_ok):
+            print(
+                "[HB_DUAL_GRAPH_BOTH_STREAMS] WARNING: at least one runner has "
+                "no captured FULL cudagraph; its forward is still ~495 host "
+                "launches (no dense window). Run with --no-enforce-eager "
+                "--cudagraph-mode FULL for the intended densification.",
+                flush=True,
             )
 
     def take_draft_token_ids(self):
