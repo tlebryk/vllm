@@ -74,9 +74,16 @@ def _dual_graph_both_streams() -> bool:
         --cudagraph-mode FULL``); otherwise each forward is still ~495 host
         launches and there is no dense window. The flag still runs correctly
         (it just won't densify), and a warning is logged at first dispatch.
-      - Implies the deferred decode token-id D2H (so the step is not stalled by
-        ``transfer_event.synchronize`` between the two replays). The executor's
-        2-deep batch queue is enabled by the same env in uniproc_executor.
+    This flag runs at ``max_concurrent_batches=1`` by default: the back-to-back
+    replay is WITHIN a single engine step, so it does NOT require the executor's
+    2-deep batch queue. At mcb=1 the engine calls ``sample_tokens`` blocking and
+    the decode token-id D2H is resolved inline (the merged ModelRunnerOutput is
+    returned synchronously). The 2-deep batch queue + deferred decode token-id
+    D2H pipeline is an ORTHOGONAL optimization gated separately by
+    ``HB_DEFER_DECODE_SAMPLE_D2H``; set BOTH flags to get the graph replay AND
+    the deferred-D2H pipeline (mcb=2). With only this flag set, the scheduler can
+    pack all running decode seqs into one step (the 2-deep queue would otherwise
+    split them across two in-flight steps).
 
     When OFF the code path is byte-identical to before.
     """
@@ -1000,10 +1007,18 @@ class DualModelRunner:
             )
 
     def sample_tokens(self, grammar_output: GrammarOutput | None):
-        # HB_DUAL_GRAPH_BOTH_STREAMS implies the deferred decode-sample D2H so
-        # the decode-sample + embed-pool replays in this step are not split by a
-        # blocking transfer_event.synchronize.
-        defer_d2h = _defer_decode_sample_d2h() or _dual_graph_both_streams()
+        # The deferred decode-sample D2H (async DualAsyncModelRunnerOutput
+        # return) requires the executor's 2-deep batch queue + async output
+        # thread (mcb=2) to resolve get_output() off the engine hot thread; it
+        # is gated SOLELY by HB_DEFER_DECODE_SAMPLE_D2H. HB_DUAL_GRAPH_BOTH_STREAMS
+        # by itself runs at mcb=1 (see uniproc_executor.max_concurrent_batches):
+        # its win is the WITHIN-step back-to-back graph replay in execute_model,
+        # which is independent of the D2H defer. At mcb=1 there is no async output
+        # thread, so the step path (engine_core.step) calls sample_tokens
+        # BLOCKING and the scheduler needs a resolved ModelRunnerOutput; returning
+        # a DualAsyncModelRunnerOutput would never get resolved. So only defer
+        # (and only then return the async wrapper) when DEFER is explicitly set.
+        defer_d2h = _defer_decode_sample_d2h()
         # When deferring the decode D2H, the DECODE child runs in async-output
         # mode so its sample returns an AsyncModelRunnerOutput (no inline
         # blocking transfer_event.synchronize); we resolve that decode output

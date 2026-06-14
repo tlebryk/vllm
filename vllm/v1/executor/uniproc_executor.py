@@ -70,14 +70,17 @@ class UniProcExecutor(Executor):
             "1", "true", "yes", "on"
         ):
             return 2
-        # HB_DUAL_GRAPH_BOTH_STREAMS (default OFF): same 2-deep batch queue +
-        # async output thread requirement as the D2H defer flag (it implies the
-        # deferred decode token-id D2H so the back-to-back decode-graph +
-        # embed-graph replays are not interrupted by a blocking sync).
-        if os.environ.get("HB_DUAL_GRAPH_BOTH_STREAMS", "0").lower() in (
-            "1", "true", "yes", "on"
-        ):
-            return 2
+        # HB_DUAL_GRAPH_BOTH_STREAMS (default OFF): the back-to-back decode-graph
+        # + embed-graph replay is WITHIN a single engine step (see
+        # dual_model_runner.execute_model `will_graph_both`); it does NOT itself
+        # need the 2-deep batch queue. The 2-deep queue only matters for the
+        # deferred decode token-id D2H pipeline, which is a SEPARATE, orthogonal
+        # optimization gated by HB_DEFER_DECODE_SAMPLE_D2H (handled above). When
+        # only the graph flag is set we therefore keep mcb=1 so the scheduler can
+        # pack all running decode seqs into ONE step (the 2-deep queue otherwise
+        # splits them across two in-flight steps, which breaks single-step
+        # steady-state measurement). Set BOTH flags to get graph replay + the
+        # deferred-D2H pipeline (the DEFER branch above already returns 2).
         return 2 if self.scheduler_config.async_scheduling else 1
 
     def collective_rpc(  # type: ignore[override]
