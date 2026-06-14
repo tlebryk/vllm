@@ -358,7 +358,7 @@ def flash_attn_varlen_func(
             scheduler_metadata,
             num_splits,
             None,  # pack_gqa
-            0,  # sm_margin
+            int(os.environ.get("HB_FA3_SM_MARGIN", "0")),  # sm_margin
             s_aux,  # s_aux
             cp_world_size,
             cp_rank,
