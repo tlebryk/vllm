@@ -331,6 +331,10 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         import os as _os
         self._sm_margin_decode = int(_os.environ.get("VLLM_FA3_DECODE_SM_MARGIN", "0"))
         self._sm_margin_embed = int(_os.environ.get("VLLM_FA3_EMBED_SM_MARGIN", "0"))
+        # Per-MODEL margin captured at BUILD time (dual_model_runner sets
+        # HB_FA3_MODEL_SM_MARGIN per model: decode->margin, embed->0). Overrides the
+        # causal-keyed margin when nonzero. Build is single-threaded, so race-free.
+        self._model_sm_margin = int(_os.environ.get("HB_FA3_MODEL_SM_MARGIN", "0"))
 
         if self.use_full_cuda_graph and self.aot_schedule:
             # FA3 scheduler_metadata size: 1 + round_up(batch_size, 4) * 4
@@ -423,8 +427,8 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             else:
                 qkv_dtype = self.kv_cache_dtype
             if aot_schedule:
-                _sm_margin = (self._sm_margin_decode if causal
-                              else self._sm_margin_embed)
+                _sm_margin = self._model_sm_margin or (
+                    self._sm_margin_decode if causal else self._sm_margin_embed)
                 _extra_kwargs = (
                     {"sm_margin": _sm_margin} if _sm_margin > 0 else {}
                 )
@@ -648,10 +652,12 @@ class FlashAttentionImpl(AttentionImpl):
         import os as _os
         self._sm_margin_decode = int(_os.environ.get("VLLM_FA3_DECODE_SM_MARGIN", "0"))
         self._sm_margin_embed = int(_os.environ.get("VLLM_FA3_EMBED_SM_MARGIN", "0"))
-        if self._sm_margin_decode or self._sm_margin_embed:
+        # Per-MODEL margin captured at BUILD time (see Backend.__init__).
+        self._model_sm_margin = int(_os.environ.get("HB_FA3_MODEL_SM_MARGIN", "0"))
+        if self._sm_margin_decode or self._sm_margin_embed or self._model_sm_margin:
             logger.info_once(
-                "FA3 sm_margin: decode=%d embed=%d",
-                self._sm_margin_decode, self._sm_margin_embed,
+                "FA3 sm_margin: decode=%d embed=%d model=%d",
+                self._sm_margin_decode, self._sm_margin_embed, self._model_sm_margin,
                 scope="local",
             )
 
@@ -767,8 +773,9 @@ class FlashAttentionImpl(AttentionImpl):
                     if self.sliding_window is not None
                     else None
                 )
-                _sm_margin = (self._sm_margin_decode if attn_metadata.causal
-                              else self._sm_margin_embed)
+                _sm_margin = self._model_sm_margin or (
+                    self._sm_margin_decode if attn_metadata.causal
+                    else self._sm_margin_embed)
                 _extra_kwargs = (
                     {"sm_margin": _sm_margin} if _sm_margin > 0 else {}
                 )

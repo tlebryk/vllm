@@ -200,6 +200,7 @@ def flash_attn_varlen_func(
     k_descale=None,
     v_descale=None,
     num_splits: int = 0,
+    sm_margin: int | None = None,  # per-call FA3 SM margin (overrides HB_FA3_SM_MARGIN env)
     # Version selector
     fa_version: int = DEFAULT_FA_VERSION,
     s_aux=None,
@@ -358,7 +359,8 @@ def flash_attn_varlen_func(
             scheduler_metadata,
             num_splits,
             None,  # pack_gqa
-            int(os.environ.get("HB_FA3_SM_MARGIN", "0")),  # sm_margin
+            (sm_margin if sm_margin is not None
+             else int(os.environ.get("HB_FA3_SM_MARGIN", "0"))),  # sm_margin
             s_aux,  # s_aux
             cp_world_size,
             cp_rank,

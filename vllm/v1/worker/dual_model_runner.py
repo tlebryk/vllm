@@ -599,12 +599,27 @@ class DualModelRunner:
         return tuple(tasks)
 
     def load_model(self, *args, **kwargs) -> None:
+        # Per-MODEL FA3 sm_margin: the DECODE model's attention backends capture
+        # HB_FA3_MODEL_SM_MARGIN at build; the EMBED model's are forced to 0 by
+        # temporarily clearing the env during embed build (build is single-threaded
+        # at startup, so this toggle is race-free). This is the ONLY way to margin
+        # decode-flash without touching embed-flash, since BOTH models are causal
+        # (so the causal-keyed VLLM_FA3_DECODE_SM_MARGIN hits both).
+        import os as _os
         self.decode_runner.load_model(*args, **kwargs)
-        self.embed_runner.load_model(
-            *args,
-            prefix=self.EMBED_MODEL_PREFIX,
-            **kwargs,
-        )
+        _save = _os.environ.get("HB_FA3_MODEL_SM_MARGIN")
+        _os.environ["HB_FA3_MODEL_SM_MARGIN"] = "0"
+        try:
+            self.embed_runner.load_model(
+                *args,
+                prefix=self.EMBED_MODEL_PREFIX,
+                **kwargs,
+            )
+        finally:
+            if _save is None:
+                _os.environ.pop("HB_FA3_MODEL_SM_MARGIN", None)
+            else:
+                _os.environ["HB_FA3_MODEL_SM_MARGIN"] = _save
 
         # Tier C: optionally swap embed transformer-block bf16 weights for
         # int8-Δ storage so vLLM's KV-cache profile sees a smaller embed
