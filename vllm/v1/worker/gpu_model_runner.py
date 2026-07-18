@@ -4607,6 +4607,14 @@ class GPUModelRunner(
             and mm_config.is_multimodal_pruning_enabled()
         )
 
+        if self.is_pooling_model:
+            # Slack Serve: opt pooling-model linears into the cuBLASLt
+            # SM-count-target path. The registration is a no-op unless
+            # HB_EMBED_SM_COUNT_TARGET is set to a positive integer.
+            from vllm.v1.worker.embed_sm_linear_hook import register_embed_model
+
+            register_embed_model(self.model)
+
         if (
             is_mixture_of_experts(self.model)
             and self.parallel_config.enable_eplb
