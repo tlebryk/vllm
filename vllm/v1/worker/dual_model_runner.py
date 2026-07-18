@@ -552,13 +552,22 @@ class DualModelRunner:
                 continue
             group_spec = group.kv_cache_spec
             if isinstance(group_spec, UniformTypeKVCacheSpecs):
-                group_spec = UniformTypeKVCacheSpecs(
-                    block_size=group_spec.block_size,
-                    kv_cache_specs={
-                        layer_name: group_spec.kv_cache_specs[layer_name]
-                        for layer_name in runner_group_layers
-                    },
-                )
+                projected_specs = {
+                    layer_name: group_spec.kv_cache_specs[layer_name]
+                    for layer_name in runner_group_layers
+                }
+                # A global group can be uniform-type only because decode and
+                # embed use different cache shapes. Once projected to one
+                # model, it is often homogeneous again; V2 expects that
+                # concrete AttentionSpec rather than the wrapper.
+                specs = list(projected_specs.values())
+                try:
+                    group_spec = specs[0].merge(specs)
+                except AssertionError:
+                    group_spec = UniformTypeKVCacheSpecs(
+                        block_size=group_spec.block_size,
+                        kv_cache_specs=projected_specs,
+                    )
             projected_groups.append(
                 KVCacheGroupSpec(
                     layer_names=runner_group_layers,
@@ -620,6 +629,16 @@ class DualModelRunner:
                 _os.environ.pop("HB_FA3_MODEL_SM_MARGIN", None)
             else:
                 _os.environ["HB_FA3_MODEL_SM_MARGIN"] = _save
+
+        # Optional: cap the embed model's prefill GEMMs to a reduced
+        # CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET so the memory-bound decode
+        # stream keeps a dedicated minority SM share (Track K 2026-07-16:
+        # +6..14.7% vs sequential on isolated GEMM pairs). Gated by
+        # HB_EMBED_SM_COUNT_TARGET (no-op when unset/0). Weight-identity
+        # gated monkeypatch: decode GEMMs are untouched in both eager and
+        # CUDA-graph capture paths.
+        from vllm.v1.worker.embed_sm_linear_hook import register_embed_model
+        register_embed_model(self.embed_runner.model)
 
         # Tier C: optionally swap embed transformer-block bf16 weights for
         # int8-Δ storage so vLLM's KV-cache profile sees a smaller embed

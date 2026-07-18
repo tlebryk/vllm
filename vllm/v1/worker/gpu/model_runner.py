@@ -19,6 +19,7 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
+import os
 import time
 from copy import deepcopy
 from typing import Any, NamedTuple
@@ -303,6 +304,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         if self.is_pooling_model and self.is_last_pp_rank:
             self.pooling_runner = PoolingRunner(self.model)
+
+        # Standalone-engine registration for the embed-SM-cap cuBLASLt hook
+        # (see embed_sm_linear_hook module doc). dual_model_runner registers
+        # its embed sub-runner explicitly; this covers a bare pooling engine
+        # (e.g. scratch/slack_freerun/) with no dual runner to do that.
+        # HB_PREFILL_SM_COUNT_TARGET opts a dedicated decoder-prefill engine
+        # into the same module-gated path.  It is intentionally separate from
+        # ordinary decode engines, whose small-M generation GEMMs stay plain.
+        cap_embed = (self.is_pooling_model
+                     and os.environ.get("HB_EMBED_SM_COUNT_TARGET"))
+        cap_prefill = os.environ.get("HB_PREFILL_SM_COUNT_TARGET")
+        if cap_embed or cap_prefill:
+            from vllm.v1.worker.embed_sm_linear_hook import register_embed_model
+
+            register_embed_model(self.model)
 
     def get_model(self) -> nn.Module:
         return self.model

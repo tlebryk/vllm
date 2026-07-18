@@ -47,7 +47,11 @@ if find_spec("flashinfer"):
         pass
 
 if hasattr(torch.ops._C, "scaled_fp4_quant"):
-    STATIC_FP4_QUANT_OP = torch.ops._C.scaled_fp4_quant.out
+    try:
+        STATIC_FP4_QUANT_OP = torch.ops._C.scaled_fp4_quant.out
+    except AttributeError:
+        # Precompiled _C binaries predate the .out overload; NVFP4 unused here.
+        pass
 
 # Max size of the input tensor per world size per device capability
 # to use flashinfer fused allreduce
