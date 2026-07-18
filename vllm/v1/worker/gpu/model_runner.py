@@ -305,6 +305,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         if self.is_pooling_model and self.is_last_pp_rank:
             self.pooling_runner = PoolingRunner(self.model)
+            # Slack Serve: opt pooling-model linears into the cuBLASLt
+            # SM-count-target path. The registration is a no-op unless
+            # HB_EMBED_SM_COUNT_TARGET is set to a positive integer.
+            from vllm.v1.worker.embed_sm_linear_hook import register_embed_model
+
+            register_embed_model(self.model)
         eplb_models_added |= self.eplb.maybe_register_model(
             self.model,
             self.model_config,
