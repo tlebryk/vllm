@@ -4,10 +4,13 @@ The SM target is a cuBLASLt algorithm-selection hint, not an affinity wall.
 Sizing tensor-dense embedding GEMMs for fewer SMs leaves an execution lane for
 memory-heavy decode kernels on another CUDA stream.
 
-Enable with ``HB_EMBED_SM_COUNT_TARGET``. ``0`` or unset is a no-op.
+Enable pooling models with ``HB_EMBED_SM_COUNT_TARGET``. A dedicated decoder
+prefill engine may opt in with ``HB_PREFILL_SM_COUNT_TARGET``. ``0`` or unset
+is a no-op.
 ``HB_EMBED_SM_TARGET_MIN_M`` controls the minimum flattened token dimension.
-The model-runner integration marks only pooling-model linear modules, so decode
-linears remain on vLLM's ordinary path.
+The model-runner integration marks only pooling-model or explicitly opted-in
+decoder-prefill linear modules, so ordinary decode linears remain on vLLM's
+ordinary path.
 """
 
 from __future__ import annotations
@@ -87,10 +90,15 @@ def register_embed_model(model: torch.nn.Module) -> None:
     capture the default path (or misroute decode's own large-M prefill GEMMs).
     Marking the embed model's modules identifies them unambiguously in eager,
     dynamo-traced, and capture paths. No-op unless
-    ``HB_EMBED_SM_COUNT_TARGET > 0``.
+    ``HB_EMBED_SM_COUNT_TARGET > 0`` or
+    ``HB_PREFILL_SM_COUNT_TARGET > 0``.
     """
     global _SM_TARGET, _MIN_M, _PATCHED
-    target = int(os.environ.get("HB_EMBED_SM_COUNT_TARGET", "0") or "0")
+    target = int(
+        os.environ.get("HB_EMBED_SM_COUNT_TARGET")
+        or os.environ.get("HB_PREFILL_SM_COUNT_TARGET")
+        or "0"
+    )
     if target <= 0:
         return
     n_marked = 0
@@ -116,7 +124,7 @@ def register_embed_model(model: torch.nn.Module) -> None:
 
 
 def _route(orig_apply, self, layer, x, bias):
-    """Route to the SM-capped cuBLASLt linear iff this is an embed-model,
+    """Route to the SM-capped cuBLASLt linear iff this is a registered dense,
     prefill-shaped (large-M), bias-free, half-precision GEMM."""
     if (
         _SM_TARGET > 0
@@ -147,5 +155,5 @@ def _install_patch() -> None:
     UnquantizedLinearMethod.apply = patched_lin
     logger.info(
         "[embed-sm-linear] patched UnquantizedLinearMethod.apply "
-        "(pooling-model-gated cuBLASLt SM_COUNT_TARGET path)."
+        "(marked-model-gated cuBLASLt SM_COUNT_TARGET path)."
     )

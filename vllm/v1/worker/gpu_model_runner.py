@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -4607,10 +4608,10 @@ class GPUModelRunner(
             and mm_config.is_multimodal_pruning_enabled()
         )
 
-        if self.is_pooling_model:
-            # Slack Serve: opt pooling-model linears into the cuBLASLt
-            # SM-count-target path. The registration is a no-op unless
-            # HB_EMBED_SM_COUNT_TARGET is set to a positive integer.
+        if self.is_pooling_model or os.environ.get("HB_PREFILL_SM_COUNT_TARGET"):
+            # Slack Serve: opt pooling-model or dedicated decoder-prefill
+            # linears into the cuBLASLt SM-count-target path. Ordinary decode
+            # engines remain untouched.
             from vllm.v1.worker.embed_sm_linear_hook import register_embed_model
 
             register_embed_model(self.model)
