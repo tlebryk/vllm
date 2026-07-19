@@ -375,6 +375,19 @@ class Scheduler(SchedulerInterface):
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
 
+            # Measurement-only generation boundary used by Slack Serve.
+            # During untimed wave setup, keep decode-ready requests resident
+            # in KV but do not advance them while other requests are still
+            # prefilling. The harness clears this instance attribute once
+            # every request in the admitted wave has emitted its setup token.
+            # Normal serving never sets the attribute and is unchanged.
+            if (
+                getattr(self, "_hb_hold_decode_ready", False)
+                and request.num_computed_tokens >= request.num_prompt_tokens
+            ):
+                req_index += 1
+                continue
+
             if (
                 request.num_output_placeholders > 0
                 # This is (num_computed_tokens + 1) - (num_output_placeholders - 1).

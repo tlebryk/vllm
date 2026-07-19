@@ -306,9 +306,7 @@ class CublasLtMatmul:
         key = (m, n, k, dtype, sm_target, device, native_linear_weight)
         plan = self._plans.get(key)
         if plan is None:
-            plan = self._build_plan(
-                m, n, k, dtype, sm_target, native_linear_weight
-            )
+            plan = self._build_plan(m, n, k, dtype, sm_target, native_linear_weight)
             self._plans[key] = plan
         return plan
 
@@ -421,9 +419,7 @@ class CublasLtMatmul:
         device: torch.device,
         native_linear_weight: bool = False,
     ) -> dict[str, float | int]:
-        plan = self.plan(
-            m, n, k, dtype, sm_target, device, native_linear_weight
-        )
+        plan = self.plan(m, n, k, dtype, sm_target, device, native_linear_weight)
         return {
             "workspace_bytes": plan.workspace_size,
             "waves_count": plan.waves_count,

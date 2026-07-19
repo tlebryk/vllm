@@ -9,6 +9,7 @@ Enable with ``HB_EMBED_SM_COUNT_TARGET``. ``0`` or unset is a no-op.
 The model-runner integration marks only pooling-model linear modules, so decode
 linears remain on vLLM's ordinary path.
 """
+
 from __future__ import annotations
 
 import os
@@ -65,8 +66,7 @@ def _load_lt():
 def _embed_sm_capped_linear(
     x2: torch.Tensor, w: torch.Tensor, sm_target: int
 ) -> torch.Tensor:
-    out = torch.empty((x2.shape[0], w.shape[0]), dtype=x2.dtype,
-                      device=x2.device)
+    out = torch.empty((x2.shape[0], w.shape[0]), dtype=x2.dtype, device=x2.device)
     target = sm_target if _RUNTIME_TARGET is None else _RUNTIME_TARGET
     _load_lt().linear(x2, w, out, target)
     return out
@@ -109,25 +109,29 @@ def register_embed_model(model: torch.nn.Module) -> None:
     logger.info(
         "[embed-sm-linear] marked %d embed linear modules, "
         "SM_COUNT_TARGET=%d, min_M=%d",
-        n_marked, _SM_TARGET, _MIN_M,
+        n_marked,
+        _SM_TARGET,
+        _MIN_M,
     )
 
 
 def _route(orig_apply, self, layer, x, bias):
     """Route to the SM-capped cuBLASLt linear iff this is an embed-model,
     prefill-shaped (large-M), bias-free, half-precision GEMM."""
-    if _SM_TARGET > 0 and bias is None and x.is_cuda and x.dtype in (
-        torch.bfloat16, torch.float16
-    ) and getattr(layer, "_hb_embed_sm_capped", False):
+    if (
+        _SM_TARGET > 0
+        and bias is None
+        and x.is_cuda
+        and x.dtype in (torch.bfloat16, torch.float16)
+        and getattr(layer, "_hb_embed_sm_capped", False)
+    ):
         w = layer.weight
         if w.dim() == 2 and w.is_contiguous():
             m = x.numel() // x.shape[-1] if x.shape[-1] else 0
             if m >= _MIN_M:
                 x2 = x.reshape(m, x.shape[-1])
                 if x2.is_contiguous():
-                    out = torch.ops.hb.embed_sm_capped_linear(
-                        x2, w, _SM_TARGET
-                    )
+                    out = torch.ops.hb.embed_sm_capped_linear(x2, w, _SM_TARGET)
                     return out.view(*x.shape[:-1], w.shape[0])
     return orig_apply(self, layer, x, bias)
 
