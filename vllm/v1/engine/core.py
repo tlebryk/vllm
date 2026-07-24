@@ -56,6 +56,7 @@ from vllm.v1.engine import (
     PauseMode,
     ReconfigureDistributedRequest,
     ReconfigureRankType,
+    StepTicket,
     UtilityOutput,
     UtilityResult,
 )
@@ -375,37 +376,75 @@ class EngineCore:
         )
         self._iteration_index += 1
 
+    def dispatch(self, lane: str = "default") -> StepTicket:
+        inflight_lanes = getattr(self, "_hb_inflight_lanes", set())
+        if lane in inflight_lanes:
+            raise RuntimeError(
+                f"Slack Serve lane already has an in-flight ticket: {lane}"
+            )
+        scheduler_output = self.scheduler.schedule(lane=lane)
+        scheduler_output.execution_lane = lane
+        request_ids = set(scheduler_output.num_scheduled_tokens)
+        if request_ids and hasattr(self.scheduler, "mark_hb_inflight"):
+            self.scheduler.mark_hb_inflight(request_ids)
+        inflight_lanes.add(lane)
+        self._hb_inflight_lanes = inflight_lanes
+        try:
+            future = self.model_executor.execute_model(scheduler_output, non_block=True)
+        except Exception:
+            if hasattr(self.scheduler, "release_hb_inflight"):
+                self.scheduler.release_hb_inflight(request_ids)
+            inflight_lanes.discard(lane)
+            raise
+        grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+
+        return StepTicket(scheduler_output, future, grammar_output)
+
+    def finish(self, ticket: StepTicket):
+        output = ticket.future.result()
+        if output is None:
+            output = self.model_executor.sample_tokens(
+                ticket.grammar_output, lane=ticket.scheduler_output.execution_lane
+            )
+        return output
+
+    def complete(self, ticket: StepTicket, model_output: ModelRunnerOutput):
+        """Publish one finished ticket and make its request ids schedulable."""
+        try:
+            self._process_aborts_queue()
+            return self.scheduler.update_from_output(
+                ticket.scheduler_output, model_output
+            )
+        finally:
+            if hasattr(self.scheduler, "release_hb_inflight"):
+                self.scheduler.release_hb_inflight(
+                    set(ticket.scheduler_output.num_scheduled_tokens)
+                )
+            self._hb_inflight_lanes.discard(ticket.scheduler_output.execution_lane)
+
     def step(self, lane: str = "default") -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output.
 
         Returns tuple of outputs and a flag indicating whether the model
         was executed.
         """
-
-        # Check for any requests remaining in the scheduler - unfinished,
-        # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
-        scheduler_output = self.scheduler.schedule()
-        scheduler_output.execution_lane = lane
-        future = self.model_executor.execute_model(scheduler_output, non_block=True)
-        grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+        ticket = self.dispatch(lane)
+        # Check for any requests remaining in the scheduler - unfinished,
+        # or finished and not yet removed from the batch.
+
         with (
-            self.log_error_detail(scheduler_output),
-            self.log_iteration_details(scheduler_output),
+            self.log_error_detail(ticket.scheduler_output),
+            self.log_iteration_details(ticket.scheduler_output),
         ):
-            model_output = future.result()
-            if model_output is None:
-                model_output = self.model_executor.sample_tokens(grammar_output)
+            model_output = self.finish(ticket)
+        engine_core_outputs = self.complete(ticket, model_output)
 
-        # Before processing the model output, process any aborts that happened
-        # during the model execution.
-        self._process_aborts_queue()
-        engine_core_outputs = self.scheduler.update_from_output(
-            scheduler_output, model_output
+        return (
+            engine_core_outputs,
+            ticket.scheduler_output.total_num_scheduled_tokens > 0,
         )
-
-        return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
     def post_step(self, model_executed: bool) -> None:
         # When using async scheduling we can't get draft token ids in advance,
@@ -1247,8 +1286,9 @@ class EngineCoreProc(EngineCore):
                 return
             output = UtilityOutput(call_id)
             # Lazily look-up utility method so that failure will be handled/returned.
-            get_result = lambda: (method := getattr(self, method_name)) and method(
-                *self._convert_msgspec_args(method, args)
+            get_result = lambda: (
+                (method := getattr(self, method_name))
+                and method(*self._convert_msgspec_args(method, args))
             )
             enqueue_output = lambda out: self.output_queue.put_nowait(
                 (client_idx, EngineCoreOutputs(utility_output=out))

@@ -4,6 +4,8 @@
 import enum
 import time
 from collections.abc import Mapping
+from concurrent.futures import Future
+from dataclasses import dataclass
 from typing import Any, Literal
 
 import msgspec
@@ -14,8 +16,9 @@ from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
+from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.metrics.stats import SchedulerStats
-from vllm.v1.outputs import LogprobsLists, LogprobsTensors
+from vllm.v1.outputs import LogprobsLists, LogprobsTensors, ModelRunnerOutput
 from vllm.v1.serial_utils import UtilityResult
 
 # Type for pause_generation mode parameter.
@@ -247,3 +250,10 @@ class ReconfigureRankType(enum.IntEnum):
 
     KEEP_CURRENT_RANK = -1
     SHUTDOWN_CURRENT_RANK = -2
+
+
+@dataclass
+class StepTicket:
+    scheduler_output: SchedulerOutput
+    future: Future[ModelRunnerOutput | None]
+    grammar_output: GrammarOutput | None

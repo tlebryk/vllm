@@ -228,10 +228,10 @@ class Executor(ABC):
         pass
 
     def sample_tokens(
-        self, grammar_output: GrammarOutput | None, non_block: bool = False
+        self, grammar_output: GrammarOutput | None,  non_block: bool = False, *, lane: str = "default",
     ) -> ModelRunnerOutput | Future[ModelRunnerOutput]:
         output = self.collective_rpc(  # type: ignore[call-overload]
-            "sample_tokens", args=(grammar_output,), non_block=non_block
+            "sample_tokens", args=(grammar_output, lane), non_block=non_block
         )
         return output[0]
 

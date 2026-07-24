@@ -100,6 +100,10 @@ class Scheduler(SchedulerInterface):
             defaultdict(set) if include_finished_set else None
         )
         self.prev_step_scheduled_req_ids: set[str] = set()
+        # Slack Serve P2 only: schedule() advances logical token counts before
+        # the GPU ticket completes. Keep those request ids out of both lanes
+        # until EngineCore finalizes that ticket.
+        self._hb_inflight_req_ids: set[str] = set()
 
         # Scheduling constraints.
         self.max_num_running_reqs = self.scheduler_config.max_num_seqs
@@ -335,7 +339,7 @@ class Scheduler(SchedulerInterface):
                 pass
         return num_new_tokens
 
-    def schedule(self) -> SchedulerOutput:
+    def schedule(self, lane: str = "default") -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -346,6 +350,21 @@ class Scheduler(SchedulerInterface):
         # num_tokens_with_spec. This is general enough to cover
         # chunked prefills, prefix caching, speculative decoding,
         # and the "jump decoding" optimization in the future.
+
+        if lane not in ("default", "prefill", "decode"):
+            raise ValueError(f"Unknown execution lane: {lane!r}")
+
+        # P1 Slack Serve policy. The caller selects a lane; the scheduler
+        # constrains its otherwise normal admission policy to that phase.
+        # A request becomes decode-ready after its prompt KV has been computed.
+        # The default path is intentionally unchanged.
+        def lane_accepts(request: Request) -> bool:
+            if request.request_id in self._hb_inflight_req_ids:
+                return False
+            if lane == "default":
+                return True
+            is_decode_ready = request.num_computed_tokens >= request.num_prompt_tokens
+            return is_decode_ready if lane == "decode" else not is_decode_ready
 
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
@@ -374,6 +393,10 @@ class Scheduler(SchedulerInterface):
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+
+            if not lane_accepts(request):
+                req_index += 1
+                continue
 
             # Measurement-only generation boundary used by Slack Serve.
             # During untimed wave setup, keep decode-ready requests resident
@@ -564,7 +587,11 @@ class Scheduler(SchedulerInterface):
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
         # Next, schedule the WAITING requests.
-        if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
+        if (
+            lane != "decode"
+            and not preempted_reqs
+            and self._pause_state == PauseState.UNPAUSED
+        ):
             step_skipped_waiting = create_request_queue(self.policy)
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
@@ -576,6 +603,11 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+
+                if request_id in self._hb_inflight_req_ids:
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
 
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(
@@ -936,6 +968,15 @@ class Scheduler(SchedulerInterface):
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
         return scheduler_output
+
+    def mark_hb_inflight(self, request_ids: set[str]) -> None:
+        overlap = self._hb_inflight_req_ids.intersection(request_ids)
+        if overlap:
+            raise RuntimeError(f"Slack Serve scheduled in-flight requests: {overlap}")
+        self._hb_inflight_req_ids.update(request_ids)
+
+    def release_hb_inflight(self, request_ids: set[str]) -> None:
+        self._hb_inflight_req_ids.difference_update(request_ids)
 
     def _build_kv_connector_meta(
         self, connector: KVConnectorBase_V1, scheduler_output: SchedulerOutput
