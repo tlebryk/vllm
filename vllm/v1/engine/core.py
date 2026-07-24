@@ -375,7 +375,7 @@ class EngineCore:
         )
         self._iteration_index += 1
 
-    def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
+    def step(self, lane: str = "default") -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output.
 
         Returns tuple of outputs and a flag indicating whether the model
@@ -387,6 +387,7 @@ class EngineCore:
         if not self.scheduler.has_requests():
             return {}, False
         scheduler_output = self.scheduler.schedule()
+        scheduler_output.execution_lane = lane
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (

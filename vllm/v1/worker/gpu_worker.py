@@ -154,6 +154,8 @@ class Worker(WorkerBase):
         # pending non-blocking PP send work from the previous iteration
         self._pp_send_work: list[Handle] = []
 
+
+
     def sleep(self, level: int = 1) -> None:
         from vllm.device_allocator.cumem import CuMemAllocator
 
@@ -312,7 +314,9 @@ class Worker(WorkerBase):
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
             report_usage_stats(self.vllm_config)
-
+        # P0 routes decoder prefill and decode to separate, persistent streams.
+        self.decode_stream = torch.cuda.Stream(device=self.device)
+        self.prefill_stream = torch.cuda.Stream(device=self.device)
     # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool
     # to hijack tensor allocation.
     def load_model(self) -> None:
@@ -767,87 +771,114 @@ class Worker(WorkerBase):
             for handle in self._pp_send_work:
                 handle.wait()
             self._pp_send_work = []
-
-        intermediate_tensors = None
-        forward_pass = scheduler_output.total_num_scheduled_tokens > 0
-        num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
-        all_gather_tensors = {}
-        compilation_config = self.vllm_config.compilation_config
-        parallel_config = self.vllm_config.parallel_config
-
-        if (
-            parallel_config.pipeline_parallel_size > 1
-            and compilation_config.pass_config.enable_sp
-            and forward_pass
-        ):
-            # currently only supported by V1 GPUModelRunner
-            assert not self.use_v2_model_runner
-            num_scheduled_tokens_np = np.array(
-                list(scheduler_output.num_scheduled_tokens.values()),
-                dtype=np.int32,
-            )
-            # TODO(lucas): This is pretty gross; ideally we should only ever call
-            # `_determine_batch_execution_and_padding` once (will get called again
-            # in `execute_model`) but this requires a larger refactor of PP.
-            _, batch_desc, _, _, _ = (
-                self.model_runner._determine_batch_execution_and_padding(
-                    num_tokens=num_scheduled_tokens,
-                    num_reqs=len(num_scheduled_tokens_np),
-                    num_scheduled_tokens_np=num_scheduled_tokens_np,
-                    max_num_scheduled_tokens=num_scheduled_tokens_np.max(),
-                    use_cascade_attn=False,  # TODO(lucas): Handle cascade attention
+        # P0 uses two explicit streams. The ordinary "default" lane keeps the
+        # pre-existing vLLM behavior for callers outside the prototype.
+        lane = scheduler_output.execution_lane
+        if lane == "prefill":
+            stream_context = torch.cuda.stream(self.prefill_stream)
+        elif lane == "decode":
+            stream_context = torch.cuda.stream(self.decode_stream)
+        elif lane == "default":
+            stream_context = nullcontext()
+        else:
+            raise ValueError(f"Unknown execution lane: {lane!r}")
+        with stream_context:
+            # V2 caches main_stream for its async copies. Refresh it while
+            # this lane's stream is current. P0 executes one step at a time;
+            # true simultaneous execution needs separate runner contexts.
+            if os.environ.get("HB_LANE_DEBUG") == "1":
+                print(
+                    "lane=", lane,
+                    "current=", torch.cuda.current_stream(self.device).cuda_stream,
+                    "decode=", self.decode_stream.cuda_stream,
+                    "prefill=", self.prefill_stream.cuda_stream,
+                    flush=True,
                 )
-            )
-            all_gather_tensors = {
-                "residual": not is_residual_scattered_for_sp(
-                    self.vllm_config, batch_desc.num_tokens
-                )
-            }
 
-        if forward_pass and not get_pp_group().is_first_rank:
-            tensor_dict, comm_handles, comm_postprocess = (
-                get_pp_group().irecv_tensor_dict(
-                    all_gather_group=get_tp_group(),
-                    all_gather_tensors=all_gather_tensors,
+            if self.use_v2_model_runner:
+                self.model_runner.__dict__["main_stream"] = torch.cuda.current_stream(
+                    self.device
                 )
-            )
-            assert tensor_dict is not None
-            intermediate_tensors = AsyncIntermediateTensors(
-                tensor_dict,
-                comm_handles=comm_handles,
-                comm_postprocess=comm_postprocess,
-            )
+            intermediate_tensors = None
+            forward_pass = scheduler_output.total_num_scheduled_tokens > 0
+            num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+            all_gather_tensors = {}
+            compilation_config = self.vllm_config.compilation_config
+            parallel_config = self.vllm_config.parallel_config
 
-        with self.annotate_profile(scheduler_output):
-            output = self.model_runner.execute_model(
-                scheduler_output, intermediate_tensors
-            )
             if (
-                self.use_v2_model_runner
-                and self.model_runner.is_pooling_model
-                and output is None
+                parallel_config.pipeline_parallel_size > 1
+                and compilation_config.pass_config.enable_sp
+                and forward_pass
             ):
-                output = self.model_runner.pool()  # type: ignore
-            if isinstance(
-                output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
-            ):
-                return output
+                # currently only supported by V1 GPUModelRunner
+                assert not self.use_v2_model_runner
+                num_scheduled_tokens_np = np.array(
+                    list(scheduler_output.num_scheduled_tokens.values()),
+                    dtype=np.int32,
+                )
+                # TODO(lucas): This is pretty gross; ideally we should only ever call
+                # `_determine_batch_execution_and_padding` once (will get called again
+                # in `execute_model`) but this requires a larger refactor of PP.
+                _, batch_desc, _, _, _ = (
+                    self.model_runner._determine_batch_execution_and_padding(
+                        num_tokens=num_scheduled_tokens,
+                        num_reqs=len(num_scheduled_tokens_np),
+                        num_scheduled_tokens_np=num_scheduled_tokens_np,
+                        max_num_scheduled_tokens=num_scheduled_tokens_np.max(),
+                        use_cascade_attn=False,  # TODO(lucas): Handle cascade attention
+                    )
+                )
+                all_gather_tensors = {
+                    "residual": not is_residual_scattered_for_sp(
+                        self.vllm_config, batch_desc.num_tokens
+                    )
+                }
 
-        assert isinstance(output, IntermediateTensors)
-        parallel_config = self.vllm_config.parallel_config
-        assert (
-            parallel_config.distributed_executor_backend != "external_launcher"
-            and not get_pp_group().is_last_rank
-        )
+            if forward_pass and not get_pp_group().is_first_rank:
+                tensor_dict, comm_handles, comm_postprocess = (
+                    get_pp_group().irecv_tensor_dict(
+                        all_gather_group=get_tp_group(),
+                        all_gather_tensors=all_gather_tensors,
+                    )
+                )
+                assert tensor_dict is not None
+                intermediate_tensors = AsyncIntermediateTensors(
+                    tensor_dict,
+                    comm_handles=comm_handles,
+                    comm_postprocess=comm_postprocess,
+                )
 
-        # launch non-blocking send of intermediate tensors
-        self._pp_send_work = get_pp_group().isend_tensor_dict(
-            output.tensors,
-            all_gather_group=get_tp_group(),
-            all_gather_tensors=all_gather_tensors,
-        )
+            with self.annotate_profile(scheduler_output):
+                output = self.model_runner.execute_model(
+                    scheduler_output, intermediate_tensors
+                )
+                if (
+                    self.use_v2_model_runner
+                    and self.model_runner.is_pooling_model
+                    and output is None
+                ):
+                    output = self.model_runner.pool()  # type: ignore
+                if isinstance(
+                    output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
+                ):
+                    return output
 
-        return None
+            assert isinstance(output, IntermediateTensors)
+            parallel_config = self.vllm_config.parallel_config
+            assert (
+                parallel_config.distributed_executor_backend != "external_launcher"
+                and not get_pp_group().is_last_rank
+            )
+
+            # launch non-blocking send of intermediate tensors
+            self._pp_send_work = get_pp_group().isend_tensor_dict(
+                output.tensors,
+                all_gather_group=get_tp_group(),
+                all_gather_tensors=all_gather_tensors,
+            )
+
+            return None
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         return self.model_runner.take_draft_token_ids()
