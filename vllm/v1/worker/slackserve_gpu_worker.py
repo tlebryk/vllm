@@ -18,7 +18,7 @@ class SlackServeGPUWorker(GPUWorker):
         super().init_device()
         self.decode_stream = torch.cuda.Stream(device=self.device)
         self.prefill_stream = torch.cuda.Stream(device=self.device)
-  
+
     # override factory hook to use new model
     def _create_model_runner(self):
         from vllm.v1.worker.gpu.slackserve_model_runner import (
@@ -26,19 +26,18 @@ class SlackServeGPUWorker(GPUWorker):
         )
         return SlackServeModelRunner(self.vllm_config, self.device)
 
+    def _lane_stream(self, lane: str) -> torch.cuda.Stream:
+        # ``default`` remains a compatibility alias for decode.
+        if lane in ("decode", "default"):
+            return self.decode_stream
+        if lane == "prefill":
+            return self.prefill_stream
+        raise ValueError(f"Unknown execution lane: {lane!r}")
+
     @torch.inference_mode()
     def execute_model(self, scheduler_output):
         lane = scheduler_output.execution_lane
-        if lane == "prefill":
-            stream_context = torch.cuda.stream(self.prefill_stream)
-        elif lane == "decode":
-            stream_context = torch.cuda.stream(self.decode_stream)
-        elif lane == "default":
-            stream_context = torch.cuda.stream(self.decode_stream)
-        else:
-            raise ValueError(f"Unknown execution lane: {lane!r}")
-
-        with stream_context:
+        with torch.cuda.stream(self._lane_stream(lane)):
             if os.environ.get("HB_LANE_DEBUG") == "1":
                 print(
                     "lane=", lane,
@@ -47,16 +46,16 @@ class SlackServeGPUWorker(GPUWorker):
                     "prefill=", self.prefill_stream.cuda_stream,
                     flush=True,
                 )
-            if self.use_v2_model_runner:
-                self.model_runner.__dict__["main_stream"] = torch.cuda.current_stream(
-                    self.device
-                )
             return super().execute_model(scheduler_output)
-        
+
     @torch.inference_mode()
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None", lane="decode"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        return self.model_runner.sample_tokens(grammar_output, lane=lane)
-
-
+        # Sampling, prompt logprobs, the async D2H copy handoff, and
+        # postprocess must all run on the same stream as the lane's forward.
+        # AsyncOutput's stream() helper restores ``main_stream`` as the
+        # ambient stream on exit, so running this on any other stream would
+        # silently launch postprocess unordered w.r.t. the sampler.
+        with torch.cuda.stream(self._lane_stream(lane)):
+            return self.model_runner.sample_tokens(grammar_output, lane=lane)

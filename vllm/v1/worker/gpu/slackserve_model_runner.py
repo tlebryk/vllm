@@ -64,6 +64,12 @@ class SlackServeModelRunner(GPUModelRunner):
                     device=self.device,
                 ),
                 completion_event=torch.cuda.Event(),
+                # Output D2H copies must not share a stream/event across
+                # lanes: two in-flight tickets would re-record one event and
+                # race their copies.
+                copy_stream=torch.cuda.Stream(self.device),
+                copy_event=torch.cuda.Event(),
+                staging_event=torch.cuda.Event(),
             )
             for name in ("prefill", "decode")
         }
@@ -97,12 +103,21 @@ class SlackServeModelRunner(GPUModelRunner):
             lane = "decode"
         context = self.contexts[lane]
         if not dummy_run:
+            # The staged-write scatter kernels read shared, persistent UVA
+            # staging buffers (req_states/block_tables/sampler). Before this
+            # lane's CPU code overwrites that staging memory, the other lane's
+            # already-enqueued scatter kernels must have consumed it.
+            other = self.contexts["decode" if lane == "prefill" else "prefill"]
+            if other.staging_event is not None:
+                other.staging_event.synchronize()
             # Update the request states.
             self.finish_requests(scheduler_output)
             self.free_states(scheduler_output)
             self.add_requests(scheduler_output)
             self.update_requests(scheduler_output)
             self.block_tables.apply_staged_writes()
+            assert context.staging_event is not None
+            context.staging_event.record(torch.cuda.current_stream(self.device))
             if scheduler_output.total_num_scheduled_tokens == 0:
                 # No need to run the model.
                 empty_output = self.kv_connector.no_forward(scheduler_output)
@@ -293,7 +308,17 @@ class SlackServeModelRunner(GPUModelRunner):
     def sample_tokens(
         self, grammar_output: GrammarOutput | None, lane: str = "decode"
     ) -> AsyncOutput | ModelRunnerOutput | None:
+        # ``default`` remains a compatibility alias for decode.
+        if lane == "default":
+            lane = "decode"
         context = self.contexts[lane]
+        # AsyncOutput's stream() helper restores ``main_stream`` as the
+        # ambient stream on exit, and postprocess launches on whatever stream
+        # is then current. Sampling must therefore run on the same stream the
+        # lane's forward used; the Slack Serve worker guarantees this.
+        assert context.main_stream is None or (
+            torch.cuda.current_stream(self.device) == context.main_stream
+        ), "sample_tokens must run on the lane's stream"
         if context.completion_event is not None:
             torch.cuda.current_stream(self.device).wait_event(context.completion_event)
         execute_model_state = context.execute_model_state
@@ -357,8 +382,8 @@ class SlackServeModelRunner(GPUModelRunner):
             sampler_output=sampler_output,
             num_sampled_tokens=num_sampled,
             main_stream=context.main_stream or self.main_stream,
-            copy_stream=self.output_copy_stream,
-            copy_event=self.output_copy_event,
+            copy_stream=context.copy_stream or self.output_copy_stream,
+            copy_event=context.copy_event or self.output_copy_event,
         )
 
         # Postprocess results and update request states.
@@ -407,6 +432,9 @@ class LaneContext:
     main_stream: torch.cuda.Stream | None = None
     attn_scratch: "LaneAttentionScratch | None" = None
     execute_model_state: ExecuteModelState | None = None
+    copy_stream: torch.cuda.Stream | None = None
+    copy_event: torch.cuda.Event | None = None
+    staging_event: torch.cuda.Event | None = None
 
 
 class LaneAttentionScratch:
