@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import torch
 
 from vllm.config import VllmConfig
-from vllm.config.compilation import CUDAGraphMode
+from vllm.config.compilation import CUDAGraphMode, CompilationMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.sequence import IntermediateTensors
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -36,28 +36,44 @@ from vllm.v1.worker.gpu.model_runner import (
 class SlackServeModelRunner(GPUModelRunner):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
-        if os.environ.get("HB_P2_EAGER") == "1":
-            unsupported = (
-                self.lora_config is not None
-                or self.speculative_config is not None
-                or self.supports_mm_inputs
-                or self.use_pp
-                or self.parallel_config.tensor_parallel_size != 1
-                or self.dp_size != 1
-                or self.use_dcp
-                or self.use_async_scheduling
-                or self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+        unsupported = (
+            self.lora_config is not None
+            or self.speculative_config is not None
+            or self.supports_mm_inputs
+            or self.use_pp
+            or self.parallel_config.tensor_parallel_size != 1
+            or self.dp_size != 1
+            or self.use_dcp
+            or self.use_async_scheduling
+        )
+        if unsupported:
+            raise ValueError(
+                "SlackServeModelRunner requires TP=1 text generation without "
+                "LoRA, speculative decoding, MM, PP/DP/DCP, or async scheduling"
             )
-            if unsupported:
-                raise ValueError(
-                    "HB_P2_EAGER requires eager TP=1 text generation without "
-                    "LoRA, speculative decoding, MM, PP/DP/DCP, or async scheduling"
-                )
+        if (
+            os.environ.get("HB_P2_DECODE_GRAPHS_ONLY") == "1"
+            and self.compilation_config.mode != CompilationMode.NONE
+        ):
+            raise ValueError(
+                "decode-only P2 graphs require compilation mode NONE; "
+                "vLLM's compiled callable has shared runtime buffers"
+            )
         # RequestState, sampler, and the logical BlockTables remain the base
-        # runner's single source of truth. Only tensors overwritten while a
-        # forward is prepared are per lane.
+        # runner's single source of truth. Tensors overwritten while a forward
+        # is prepared are per lane. Decode deliberately owns the base runner's
+        # buffers: CUDA graphs are captured against those exact addresses.
+        # Prefill gets separate scratch and always runs eager when
+        # HB_P2_DECODE_GRAPHS_ONLY=1.
         self.contexts = {
-            name: LaneContext(
+            "decode": LaneContext(
+                input_buffers=self.input_buffers,
+                completion_event=torch.cuda.Event(),
+                copy_stream=torch.cuda.Stream(self.device),
+                copy_event=torch.cuda.Event(),
+                staging_event=torch.cuda.Event(),
+            ),
+            "prefill": LaneContext(
                 input_buffers=InputBuffers(
                     max_num_reqs=self.max_num_reqs,
                     max_num_tokens=self.max_num_tokens,
@@ -70,14 +86,17 @@ class SlackServeModelRunner(GPUModelRunner):
                 copy_stream=torch.cuda.Stream(self.device),
                 copy_event=torch.cuda.Event(),
                 staging_event=torch.cuda.Event(),
-            )
-            for name in ("prefill", "decode")
+            ),
         }
 
     def initialize_kv_cache(self, kv_cache_config) -> None:
         super().initialize_kv_cache(kv_cache_config)
-        for context in self.contexts.values():
-            context.attn_scratch = LaneAttentionScratch(self.block_tables)
+        # Decode uses BlockTables' persistent forward buffers, whose addresses
+        # are baked into captured CUDA graphs. Only prefill needs independent
+        # attention scratch.
+        self.contexts["prefill"].attn_scratch = LaneAttentionScratch(
+            self.block_tables
+        )
 
     @contextmanager
     def _use_input_buffers(self, context: "LaneContext"):
@@ -88,6 +107,41 @@ class SlackServeModelRunner(GPUModelRunner):
             yield
         finally:
             self.input_buffers = previous
+
+    @contextmanager
+    def _use_eager_attention_metadata(self, lane: str):
+        """Keep eager prefill from overwriting decode graph metadata.
+
+        FA3's metadata builder owns one persistent scheduler-metadata tensor
+        whenever FULL graphs are enabled. A normal eager build also writes
+        that tensor, so an overlapping prefill can corrupt a decode graph
+        already reading it. Temporarily disabling the builder's full-graph
+        path makes prefill use its own ordinary metadata allocation.
+        """
+        if not (
+            lane == "prefill"
+            and os.environ.get("HB_P2_DECODE_GRAPHS_ONLY") == "1"
+        ):
+            yield
+            return
+
+        builders = []
+        seen: set[int] = set()
+        for group in self.attn_groups:
+            for attention_group in group:
+                builder = attention_group.get_metadata_builder(0)
+                if id(builder) in seen or not hasattr(
+                    builder, "use_full_cuda_graph"
+                ):
+                    continue
+                seen.add(id(builder))
+                builders.append((builder, builder.use_full_cuda_graph))
+                builder.use_full_cuda_graph = False
+        try:
+            yield
+        finally:
+            for builder, previous in builders:
+                builder.use_full_cuda_graph = previous
 
     @torch.inference_mode()
     def execute_model(
@@ -135,6 +189,21 @@ class SlackServeModelRunner(GPUModelRunner):
         num_tokens_across_dp = None
 
         skip_compiled = False
+        if (
+            lane == "prefill"
+            and os.environ.get("HB_P2_DECODE_GRAPHS_ONLY") == "1"
+        ):
+            # A captured graph owns fixed input/attention/output addresses.
+            # Replaying that one graph concurrently from both lanes races
+            # those buffers and causes illegal memory accesses. Keep the
+            # high-frequency decode lane graphed. P2 uses compilation mode
+            # NONE because vLLM's compiled callable owns reusable activation
+            # buffers that are not safe to share across the two streams.
+            batch_desc = BatchExecutionDescriptor(
+                cg_mode=CUDAGraphMode.NONE,
+                num_tokens=num_toks,
+                num_reqs=num_reqs,
+            )
         if self.is_encoder_decoder and scheduler_output.scheduled_encoder_inputs:
             # Encoder-decoder models such as Whisper should run eager/non-compiled
             # when encoder inputs are scheduled, because this step updates
@@ -201,14 +270,15 @@ class SlackServeModelRunner(GPUModelRunner):
                 slot_mappings, self.kv_cache_config
             )
             assert block_tables is not None
-            attn_metadata = self.model_state.prepare_attn(
-                input_batch,
-                batch_desc.cg_mode,
-                block_tables,
-                slot_mappings,
-                self.attn_groups,
-                self.kv_cache_config,
-            )
+            with self._use_eager_attention_metadata(lane):
+                attn_metadata = self.model_state.prepare_attn(
+                    input_batch,
+                    batch_desc.cg_mode,
+                    block_tables,
+                    slot_mappings,
+                    self.attn_groups,
+                    self.kv_cache_config,
+                )
 
         inputs_embeds = None
         if self.supports_mm_inputs and self.is_first_pp_rank:
@@ -306,7 +376,10 @@ class SlackServeModelRunner(GPUModelRunner):
 
     @torch.inference_mode()
     def sample_tokens(
-        self, grammar_output: GrammarOutput | None, lane: str = "decode"
+        self,
+        grammar_output: GrammarOutput | None,
+        lane: str = "decode",
+        return_async: bool = False,
     ) -> AsyncOutput | ModelRunnerOutput | None:
         # ``default`` remains a compatibility alias for decode.
         if lane == "default":
@@ -414,13 +487,22 @@ class SlackServeModelRunner(GPUModelRunner):
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
             self.draft_tokens_handler.set_draft_tokens(input_batch, draft_tokens)
 
-        if self.use_async_scheduling:
+        # Publish lane readiness only after sampling and postprocess have been
+        # enqueued. execute_model recorded this same event after the forward;
+        # re-recording it here makes controller queries cover the full ticket.
+        assert context.completion_event is not None
+        context.completion_event.record(torch.cuda.current_stream(self.device))
+
+        if return_async or self.use_async_scheduling:
             return async_output
         return async_output.get_output()
 
     def _prepare_attn(
         self, state: "LaneContext", input_batch: InputBatch
     ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+        if state is self.contexts["decode"]:
+            # These persistent buffers are the ones captured by CUDA graphs.
+            return self.prepare_attn(input_batch)
         assert state.attn_scratch is not None
         return state.attn_scratch.prepare(input_batch)
 

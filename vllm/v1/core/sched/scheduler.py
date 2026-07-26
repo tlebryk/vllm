@@ -104,6 +104,7 @@ class Scheduler(SchedulerInterface):
         # the GPU ticket completes. Keep those request ids out of both lanes
         # until EngineCore finalizes that ticket.
         self._hb_inflight_req_ids: set[str] = set()
+        self._hb_preemptions_by_lane: dict[str, int] = defaultdict(int)
 
         # Scheduling constraints.
         self.max_num_running_reqs = self.scheduler_config.max_num_seqs
@@ -525,6 +526,7 @@ class Scheduler(SchedulerInterface):
                     else:
                         preempted_req = self.running.pop()
 
+                    self._hb_preemptions_by_lane[lane] += 1
                     self._preempt_request(preempted_req, scheduled_timestamp)
                     preempted_reqs.append(preempted_req)
                     if preempted_req == request:

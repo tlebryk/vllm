@@ -3,8 +3,6 @@
 Keeps lane-specific stream routing out of vLLM's common GPU worker.
 """
 
-import os
-
 import torch
 
 from vllm.v1.core.sched.output import GrammarOutput
@@ -38,15 +36,19 @@ class SlackServeGPUWorker(GPUWorker):
     def execute_model(self, scheduler_output):
         lane = scheduler_output.execution_lane
         with torch.cuda.stream(self._lane_stream(lane)):
-            if os.environ.get("HB_LANE_DEBUG") == "1":
-                print(
-                    "lane=", lane,
-                    "current=", torch.cuda.current_stream(self.device).cuda_stream,
-                    "decode=", self.decode_stream.cuda_stream,
-                    "prefill=", self.prefill_stream.cuda_stream,
-                    flush=True,
+            output = super().execute_model(scheduler_output)
+            if (
+                output is None
+                and scheduler_output.total_num_scheduled_tokens > 0
+            ):
+                # Enqueue sampling while this ticket's lane-local inputs
+                # and request slots are still current. The returned
+                # AsyncOutput is waited by UniProcExecutor off-thread, so
+                # dispatch remains nonblocking and another lane can launch.
+                return self.model_runner.sample_tokens(
+                    None, lane=lane, return_async=True
                 )
-            return super().execute_model(scheduler_output)
+            return output
 
     @torch.inference_mode()
     def sample_tokens(

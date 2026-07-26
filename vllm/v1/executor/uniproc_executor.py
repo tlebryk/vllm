@@ -40,7 +40,8 @@ class UniProcExecutor(Executor):
         self.async_output_thread: ThreadPoolExecutor | None = None
         if self.max_concurrent_batches > 1:
             self.async_output_thread = ThreadPoolExecutor(
-                max_workers=1, thread_name_prefix="WorkerAsyncOutput"
+                max_workers=self.max_concurrent_batches,
+                thread_name_prefix="WorkerAsyncOutput",
             )
 
         is_eep_new_worker = envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH
@@ -60,6 +61,12 @@ class UniProcExecutor(Executor):
 
     @cached_property
     def max_concurrent_batches(self) -> int:
+        # Slack Serve has one in-flight batch per lane even though it keeps
+        # vLLM's ordinary scheduler synchronous. Each lane needs its own
+        # output waiter so a long prefill copy cannot head-of-line block a
+        # completed decode result.
+        if os.environ.get("HB_LANE_ROUTING") == "1":
+            return 2
         return 2 if self.scheduler_config.async_scheduling else 1
 
     def collective_rpc(  # type: ignore[override]
