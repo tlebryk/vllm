@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -4838,6 +4839,14 @@ class GPUModelRunner(
         self.requires_sequential_video_encoding = hasattr(
             self.get_model(), "requires_sequential_video_encoding"
         )  # Temporary hack for dynamic res video w/o support for bs>1 yet
+
+        if self.is_pooling_model or os.environ.get("HB_PREFILL_SM_COUNT_TARGET"):
+            # Slack Serve: opt pooling-model or dedicated decoder-prefill
+            # linears into the cuBLASLt SM-count-target path. Ordinary decode
+            # engines remain untouched.
+            from vllm.v1.worker.embed_sm_linear_hook import register_embed_model
+
+            register_embed_model(self.model)
 
         if (
             is_mixture_of_experts(self.model)

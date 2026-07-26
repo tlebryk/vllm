@@ -283,8 +283,18 @@ class InprocClient(EngineCoreClient):
     def __init__(self, *args, **kwargs):
         self.engine_core = EngineCore(*args, **kwargs)
 
-    def get_output(self) -> EngineCoreOutputs:
-        outputs, model_executed = self.engine_core.step_fn()
+    def get_output(self, lane: str = "default") -> EngineCoreOutputs:
+        # P0 lane routing only supports the ordinary synchronous step. When
+        # async scheduling is enabled, step_fn is step_with_batch_queue(),
+        # which deliberately has no lane argument or lane semantics yet.
+        if self.engine_core.batch_queue is None:
+            outputs, model_executed = self.engine_core.step_fn(lane=lane)
+        else:
+            if lane != "default":
+                raise RuntimeError(
+                    "lane routing requires async_scheduling=False in P0"
+                )
+            outputs, model_executed = self.engine_core.step_fn()
         self.engine_core.post_step(model_executed=model_executed)
         return outputs and outputs.get(0) or EngineCoreOutputs()
 

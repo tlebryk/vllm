@@ -291,7 +291,7 @@ class LLMEngine:
 
         return req_id
 
-    def step(self) -> list[RequestOutput | PoolingRequestOutput]:
+    def step(self, lane: str = "default") -> list[RequestOutput | PoolingRequestOutput]:
         if self.should_execute_dummy_batch:
             self.should_execute_dummy_batch = False
             self.engine_core.execute_dummy_batch()
@@ -299,7 +299,12 @@ class LLMEngine:
 
         # 1) Get EngineCoreOutput from the EngineCore.
         with record_function_or_nullcontext("llm_engine step: get_output"):
-            outputs = self.engine_core.get_output()
+            # Keep every existing client compatible on the ordinary path.
+            # Only the P0 in-process client understands experimental lanes.
+            if lane == "default":
+                outputs = self.engine_core.get_output()
+            else:
+                outputs = self.engine_core.get_output(lane=lane)
 
         # 2) Process EngineCoreOutputs.
         with record_function_or_nullcontext("llm_engine step: process_outputs"):

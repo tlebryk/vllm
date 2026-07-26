@@ -154,6 +154,8 @@ class Worker(WorkerBase):
         # pending non-blocking PP send work from the previous iteration
         self._pp_send_work: list[Handle] = []
 
+
+
     def sleep(self, level: int = 1) -> None:
         from vllm.device_allocator.cumem import CuMemAllocator
 
@@ -291,27 +293,20 @@ class Worker(WorkerBase):
         # Initialize workspace manager
         num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1
         init_workspace_manager(self.device, num_ubatches)
-
-        # Construct the model runner
-        if self.use_v2_model_runner:
-            from vllm.v1.worker.gpu.model_runner import (
-                GPUModelRunner as GPUModelRunnerV2,
-            )
-
-            # HACK(woosuk): This is a temporary fix to avoid type errors.
-            self.model_runner: GPUModelRunner = GPUModelRunnerV2(  # type: ignore
-                self.vllm_config, self.device
-            )
-        else:
-            from vllm.v1.worker.gpu_model_runner import (
-                GPUModelRunner as GPUModelRunnerV1,
-            )
-
-            self.model_runner = GPUModelRunnerV1(self.vllm_config, self.device)
+        self.model_runner = self._create_model_runner()
 
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
             report_usage_stats(self.vllm_config)
+    
+    # factory hook to create model runner, can be overridden by subclasses
+    def _create_model_runner(self):
+        if self.use_v2_model_runner:
+            from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+            return GPUModelRunner(self.vllm_config, self.device)
+
+        from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+        return GPUModelRunner(self.vllm_config, self.device)
 
     # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool
     # to hijack tensor allocation.
