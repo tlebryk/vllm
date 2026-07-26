@@ -217,21 +217,37 @@ class Executor(ABC):
 
     @overload
     def sample_tokens(
-        self, grammar_output: GrammarOutput | None, non_block: Literal[False] = False
+        self,
+        grammar_output: GrammarOutput | None,
+        non_block: Literal[False] = False,
+        *,
+        lane: str | None = None,
     ) -> ModelRunnerOutput:
         pass
 
     @overload
     def sample_tokens(
-        self, grammar_output: GrammarOutput | None, non_block: Literal[True] = True
+        self,
+        grammar_output: GrammarOutput | None,
+        non_block: Literal[True] = True,
+        *,
+        lane: str | None = None,
     ) -> Future[ModelRunnerOutput]:
         pass
 
     def sample_tokens(
-        self, grammar_output: GrammarOutput | None,  non_block: bool = False, *, lane: str = "default",
+        self,
+        grammar_output: GrammarOutput | None,
+        non_block: bool = False,
+        *,
+        lane: str | None = None,
     ) -> ModelRunnerOutput | Future[ModelRunnerOutput]:
+        # Preserve the stock Worker.sample_tokens(grammar_output) RPC exactly.
+        # Only the opt-in Slack Serve worker accepts an explicit second lane
+        # argument.
+        args = (grammar_output,) if lane is None else (grammar_output, lane)
         output = self.collective_rpc(  # type: ignore[call-overload]
-            "sample_tokens", args=(grammar_output, lane), non_block=non_block
+            "sample_tokens", args=args, non_block=non_block
         )
         return output[0]
 
