@@ -74,6 +74,17 @@ class SlackServeModelRunner(GPUModelRunner):
             "decode": int(os.environ.get("HB_P2_FA_SM_MARGIN_DECODE", "0") or "0"),
             "prefill": int(os.environ.get("HB_P2_FA_SM_MARGIN_PREFILL", "0") or "0"),
         }
+        # HB_P2_PREP_STREAM=1: enqueue ticket-head staging scatters and input
+        # preparation on a dedicated stream, and make the lane's execution
+        # stream wait on a prep-done event. Prep kernels then never queue
+        # behind a busy execution stream: the other lanes' staging events
+        # complete promptly (no ticket-head serialization) and a second
+        # same-stream ticket's prep cannot stall decode dispatch.
+        self.prep_stream = (
+            torch.cuda.Stream(self.device)
+            if os.environ.get("HB_P2_PREP_STREAM") == "1"
+            else None
+        )
 
         self.contexts = {
             "decode": LaneContext(
@@ -82,6 +93,7 @@ class SlackServeModelRunner(GPUModelRunner):
                 copy_stream=torch.cuda.Stream(self.device),
                 copy_event=torch.cuda.Event(),
                 staging_event=torch.cuda.Event(),
+                prep_event=torch.cuda.Event(),
             ),
         }
         # One fully private context per prefill lane (HB_P2_PREFILL_LANES=2
@@ -99,6 +111,7 @@ class SlackServeModelRunner(GPUModelRunner):
                 copy_stream=torch.cuda.Stream(self.device),
                 copy_event=torch.cuda.Event(),
                 staging_event=torch.cuda.Event(),
+                prep_event=torch.cuda.Event(),
             )
 
     def initialize_kv_cache(self, kv_cache_config) -> None:
@@ -109,6 +122,17 @@ class SlackServeModelRunner(GPUModelRunner):
         for lane, context in self.contexts.items():
             if lane != "decode":
                 context.attn_scratch = LaneAttentionScratch(self.block_tables)
+
+    def _end_prep(
+        self, context: "LaneContext", exec_stream: torch.cuda.Stream | None
+    ) -> None:
+        """Return to the lane's execution stream, ordered after this prep."""
+        if exec_stream is None:
+            return
+        assert self.prep_stream is not None and context.prep_event is not None
+        context.prep_event.record(self.prep_stream)
+        torch.cuda.set_stream(exec_stream)
+        exec_stream.wait_event(context.prep_event)
 
     @contextmanager
     def _use_input_buffers(self, context: "LaneContext"):
@@ -168,6 +192,14 @@ class SlackServeModelRunner(GPUModelRunner):
         if lane == "default":
             lane = "decode"
         context = self.contexts[lane]
+        # With the prep stream enabled, everything from the staged-write
+        # scatters through input/attention preparation is enqueued on
+        # ``self.prep_stream``; ``_end_prep`` restores the lane's execution
+        # stream and orders it after a prep-done event before the forward.
+        prep_exec_stream = None
+        if self.prep_stream is not None and not dummy_run:
+            prep_exec_stream = torch.cuda.current_stream(self.device)
+            torch.cuda.set_stream(self.prep_stream)
         if not dummy_run:
             # The staged-write scatter kernels read shared, persistent UVA
             # staging buffers (req_states/block_tables/sampler). Before this
@@ -186,6 +218,7 @@ class SlackServeModelRunner(GPUModelRunner):
             context.staging_event.record(torch.cuda.current_stream(self.device))
             if scheduler_output.total_num_scheduled_tokens == 0:
                 # No need to run the model.
+                self._end_prep(context, prep_exec_stream)
                 empty_output = self.kv_connector.no_forward(scheduler_output)
                 return empty_output
 
@@ -241,6 +274,7 @@ class SlackServeModelRunner(GPUModelRunner):
 
         if batch_desc.num_tokens == 0:
             # All DP ranks have zero tokens to run.
+            self._end_prep(context, prep_exec_stream)
             empty_output = self.kv_connector.no_forward(scheduler_output)
             return empty_output
 
@@ -322,6 +356,8 @@ class SlackServeModelRunner(GPUModelRunner):
             model_inputs["input_ids"] = None
             model_inputs["inputs_embeds"] = None
             assert intermediate_tensors is not None
+
+        self._end_prep(context, prep_exec_stream)
 
         # Run model.
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
@@ -533,6 +569,7 @@ class LaneContext:
     copy_stream: torch.cuda.Stream | None = None
     copy_event: torch.cuda.Event | None = None
     staging_event: torch.cuda.Event | None = None
+    prep_event: torch.cuda.Event | None = None
 
 
 class LaneAttentionScratch:
