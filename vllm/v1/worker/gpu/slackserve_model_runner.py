@@ -63,29 +63,47 @@ class SlackServeModelRunner(GPUModelRunner):
         # callable and never touches those buffers. Without this flag the two
         # lanes sharing one compiled callable would race its reused runtime
         # buffers, hence the guard below.
+        # HB_P2_COMPILE_PREFILL=1 is the MIRROR IMAGE: the PREFILL lane invokes
+        # the compiled callable live while the DECODE lane runs the ORIGINAL
+        # eager forward everywhere -- including during decode's FULL cudagraph
+        # capture, so decode graphs are captured over eager exactly as in mode 0
+        # and their captured buffers have nothing to do with inductor's runtime
+        # buffers. Same safety argument, mirrored: exactly one live user of the
+        # compiled callable (prefill), no cross-lane buffer sharing.
         self._compile_decode = os.environ.get("HB_P2_COMPILE_DECODE") == "1"
+        self._compile_prefill = os.environ.get("HB_P2_COMPILE_PREFILL") == "1"
+        if self._compile_decode and self._compile_prefill:
+            raise ValueError(
+                "HB_P2_COMPILE_DECODE and HB_P2_COMPILE_PREFILL are mutually "
+                "exclusive: only one lane may own the single compiled callable."
+            )
+        self._compile_any = self._compile_decode or self._compile_prefill
         if (
             os.environ.get("HB_P2_DECODE_GRAPHS_ONLY") == "1"
             and self.compilation_config.mode != CompilationMode.NONE
-            and not self._compile_decode
+            and not self._compile_any
         ):
             raise ValueError(
                 "decode-only P2 graphs require compilation mode NONE; "
                 "vLLM's compiled callable has shared runtime buffers. "
-                "Set HB_P2_COMPILE_DECODE=1 to compile the decode lane only "
-                "(prefill stays eager via skip_compiled)."
+                "Set HB_P2_COMPILE_DECODE=1 (compile decode, prefill eager) or "
+                "HB_P2_COMPILE_PREFILL=1 (compile prefill, decode eager) to give "
+                "the compiled callable a single lane."
             )
-        if self._compile_decode:
+        if self._compile_any:
+            which = "HB_P2_COMPILE_DECODE" if self._compile_decode else (
+                "HB_P2_COMPILE_PREFILL"
+            )
             if os.environ.get("HB_P2_DECODE_GRAPHS_ONLY") != "1":
                 raise ValueError(
-                    "HB_P2_COMPILE_DECODE=1 requires HB_P2_DECODE_GRAPHS_ONLY=1: "
-                    "the prefill lane must be pinned to eager (cg NONE + "
-                    "skip_compiled) so it cannot enter the compiled callable."
+                    f"{which}=1 requires HB_P2_DECODE_GRAPHS_ONLY=1: the "
+                    "non-compiled lane must be pinned to eager so it cannot "
+                    "enter the compiled callable."
                 )
             if self.compilation_config.mode != CompilationMode.VLLM_COMPILE:
                 raise ValueError(
-                    "HB_P2_COMPILE_DECODE=1 requires compilation mode 3 "
-                    f"(VLLM_COMPILE); got mode={self.compilation_config.mode}."
+                    f"{which}=1 requires compilation mode 3 (VLLM_COMPILE); "
+                    f"got mode={self.compilation_config.mode}."
                 )
         # RequestState, sampler, and the logical BlockTables remain the base
         # runner's single source of truth. Tensors overwritten while a forward
@@ -151,6 +169,28 @@ class SlackServeModelRunner(GPUModelRunner):
         for lane, context in self.contexts.items():
             if lane != "decode":
                 context.attn_scratch = LaneAttentionScratch(self.block_tables)
+
+    def capture_model(self) -> int:
+        if not self._compile_prefill:
+            return super().capture_model()
+        # HB_P2_COMPILE_PREFILL=1: decode graphs must be captured over the
+        # ORIGINAL eager forward (decode never uses the compiled callable).
+        # support_torch_compile's __call__ returns self.forward whenever
+        # do_not_compile is True (decorators.py: `if self.do_not_compile ...`),
+        # so toggling it forces the capture warmup + capture passes eager. The
+        # prefill lane keeps its compiled callable for runtime; it compiles
+        # lazily on the first real prefill forward (absorbed by warmup).
+        prev = getattr(self.model, "do_not_compile", None)
+        if prev is None:
+            raise RuntimeError(
+                "HB_P2_COMPILE_PREFILL: self.model has no do_not_compile "
+                "attribute; expected a support_torch_compile wrapper in mode 3."
+            )
+        self.model.do_not_compile = True
+        try:
+            return super().capture_model()
+        finally:
+            self.model.do_not_compile = prev
 
     def _end_prep(
         self, context: "LaneContext", exec_stream: torch.cuda.Stream | None
@@ -296,6 +336,16 @@ class SlackServeModelRunner(GPUModelRunner):
                 # also keeps prefill on UnquantizedLinearMethod.apply so the
                 # cuBLASLt SM-cap hook still fires for prefill GEMMs.
                 skip_compiled = True
+        if self._compile_prefill and lane == "decode":
+            # HB_P2_COMPILE_PREFILL=1 (mirror image): only the prefill lane owns
+            # the compiled callable. The decode lane runs the ORIGINAL eager
+            # forward everywhere -- its FULL graphs were captured over eager
+            # (see capture_model), so replay touches no inductor buffers. This
+            # skip_compiled=True covers the decode eager-fallback (batch >
+            # capture size) and dummy runs; decode FULL-graph replay does not
+            # consult skip_compiled. Prefill keeps skip_compiled=False and thus
+            # enters the compiled callable.
+            skip_compiled = True
         if self.is_encoder_decoder and scheduler_output.scheduled_encoder_inputs:
             # Encoder-decoder models such as Whisper should run eager/non-compiled
             # when encoder inputs are scheduled, because this step updates
@@ -434,6 +484,14 @@ class SlackServeModelRunner(GPUModelRunner):
                 assert lane == "decode", (
                     f"HB_P2_COMPILE_DECODE: lane={lane!r} would enter the "
                     "compiled callable; only decode may."
+                )
+            if self._compile_prefill and not skip_compiled:
+                # Mirror image: only prefill lanes may enter the compiled
+                # callable. The decode lane must have taken skip_compiled=True
+                # above (and its FULL graphs run via replay, never here).
+                assert lane.startswith("prefill"), (
+                    f"HB_P2_COMPILE_PREFILL: lane={lane!r} would enter the "
+                    "compiled callable; only prefill may."
                 )
             with set_forward_context(
                 attn_metadata,
