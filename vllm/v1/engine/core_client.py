@@ -283,17 +283,14 @@ class InprocClient(EngineCoreClient):
         self.engine_core = EngineCore(*args, **kwargs)
 
     def get_output(self, lane: str = "default") -> EngineCoreOutputs:
-        # P0 lane routing only supports the ordinary synchronous step. When
-        # async scheduling is enabled, step_fn is step_with_batch_queue(),
-        # which deliberately has no lane argument or lane semantics yet.
         if self.engine_core.batch_queue is None:
             outputs, model_executed = self.engine_core.step_fn(lane=lane)
         else:
-            if lane != "default":
+            if lane not in ("default", "decode"):
                 raise RuntimeError(
-                    "lane routing requires async_scheduling=False in P0"
+                    "the asynchronous batch queue only supports the decode lane"
                 )
-            outputs, model_executed = self.engine_core.step_fn()
+            outputs, model_executed = self.engine_core.step_fn(lane=lane)
         self.engine_core.post_step(model_executed=model_executed)
         return outputs and outputs.get(0) or EngineCoreOutputs()
 

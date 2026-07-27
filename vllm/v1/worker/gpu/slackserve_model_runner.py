@@ -1,15 +1,20 @@
 import os
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 
 from vllm.config import VllmConfig
-from vllm.config.compilation import CUDAGraphMode, CompilationMode
+from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.sequence import IntermediateTensors
+from vllm.v1.attention.backends.fa_utils import (
+    flash_attn_scheduler_sm_margin,
+)
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.worker.embed_sm_linear_hook import set_runtime_sm_target
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 
 # add imports
@@ -44,20 +49,11 @@ class SlackServeModelRunner(GPUModelRunner):
             or self.parallel_config.tensor_parallel_size != 1
             or self.dp_size != 1
             or self.use_dcp
-            or self.use_async_scheduling
         )
         if unsupported:
             raise ValueError(
                 "SlackServeModelRunner requires TP=1 text generation without "
-                "LoRA, speculative decoding, MM, PP/DP/DCP, or async scheduling"
-            )
-        if (
-            os.environ.get("HB_P2_DECODE_GRAPHS_ONLY") == "1"
-            and self.compilation_config.mode != CompilationMode.NONE
-        ):
-            raise ValueError(
-                "decode-only P2 graphs require compilation mode NONE; "
-                "vLLM's compiled callable has shared runtime buffers"
+                "LoRA, speculative decoding, MM, or PP/DP/DCP"
             )
         # RequestState, sampler, and the logical BlockTables remain the base
         # runner's single source of truth. Tensors overwritten while a forward
@@ -108,6 +104,12 @@ class SlackServeModelRunner(GPUModelRunner):
         finally:
             self.input_buffers = previous
 
+    def _fine_nvtx(self, name: str):
+        """Return an opt-in fine-grained CPU/GPU launch range."""
+        if os.environ.get("HB_P2_FINE_NVTX") == "1":
+            return torch.cuda.nvtx.range(f"p2/runner_{name}")
+        return nullcontext()
+
     @contextmanager
     def _use_eager_attention_metadata(self, lane: str):
         """Keep eager prefill from overwriting decode graph metadata.
@@ -151,27 +153,63 @@ class SlackServeModelRunner(GPUModelRunner):
         dummy_run: bool = False,
         skip_attn_for_dummy_run: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        prepared = self.prepare_model(
+            scheduler_output,
+            intermediate_tensors=intermediate_tensors,
+            dummy_run=dummy_run,
+            skip_attn_for_dummy_run=skip_attn_for_dummy_run,
+        )
+        if isinstance(prepared, PreparedLaneRun):
+            return self.launch_prepared(prepared)
+        return prepared
+
+    @torch.inference_mode()
+    def prepare_model(
+        self,
+        scheduler_output: SchedulerOutput,
+        intermediate_tensors: IntermediateTensors | None = None,
+        dummy_run: bool = False,
+        skip_attn_for_dummy_run: bool = False,
+    ) -> "PreparedLaneRun | ModelRunnerOutput | IntermediateTensors | None":
+        """Prepare one lane through its model-forward launch boundary.
+
+        The scheduler, shared request state, and KV block metadata remain
+        serialized on the controller thread. The returned object owns every
+        tensor needed to enqueue the actual model forward on a lane launcher.
+        """
         lane = scheduler_output.execution_lane
         # ``default`` remains a compatibility alias for decode.
         if lane == "default":
             lane = "decode"
         context = self.contexts[lane]
+        if lane == "prefill":
+            # Run solo prefill at full speed. The configured cuBLASLt target
+            # is enabled only while decode is concurrently in flight.
+            set_runtime_sm_target(
+                None if scheduler_output.sm_shaping_active else 0
+            )
         if not dummy_run:
             # The staged-write scatter kernels read shared, persistent UVA
             # staging buffers (req_states/block_tables/sampler). Before this
             # lane's CPU code overwrites that staging memory, the other lane's
             # already-enqueued scatter kernels must have consumed it.
             other = self.contexts["decode" if lane == "prefill" else "prefill"]
-            if other.staging_event is not None:
-                other.staging_event.synchronize()
+            with self._fine_nvtx(f"{lane}_staging_wait"):
+                if (
+                    other.staging_event is not None
+                    and not other.staging_event.query()
+                ):
+                    other.staging_event.synchronize()
             # Update the request states.
-            self.finish_requests(scheduler_output)
-            self.free_states(scheduler_output)
-            self.add_requests(scheduler_output)
-            self.update_requests(scheduler_output)
-            self.block_tables.apply_staged_writes()
-            assert context.staging_event is not None
-            context.staging_event.record(torch.cuda.current_stream(self.device))
+            with self._fine_nvtx(f"{lane}_request_updates"):
+                self.finish_requests(scheduler_output)
+                self.free_states(scheduler_output)
+                self.add_requests(scheduler_output)
+                self.update_requests(scheduler_output)
+            with self._fine_nvtx(f"{lane}_apply_staged_writes"):
+                self.block_tables.apply_staged_writes()
+                assert context.staging_event is not None
+                context.staging_event.record(torch.cuda.current_stream(self.device))
             if scheduler_output.total_num_scheduled_tokens == 0:
                 # No need to run the model.
                 empty_output = self.kv_connector.no_forward(scheduler_output)
@@ -196,9 +234,10 @@ class SlackServeModelRunner(GPUModelRunner):
             # A captured graph owns fixed input/attention/output addresses.
             # Replaying that one graph concurrently from both lanes races
             # those buffers and causes illegal memory accesses. Keep the
-            # high-frequency decode lane graphed. P2 uses compilation mode
-            # NONE because vLLM's compiled callable owns reusable activation
-            # buffers that are not safe to share across the two streams.
+            # high-frequency decode lane graphed and compiled. Prefill bypasses
+            # the compiled callable because its reusable activation buffers
+            # belong to the captured decode graph.
+            skip_compiled = True
             batch_desc = BatchExecutionDescriptor(
                 cg_mode=CUDAGraphMode.NONE,
                 num_tokens=num_toks,
@@ -235,9 +274,13 @@ class SlackServeModelRunner(GPUModelRunner):
         if not dummy_run:
             # Common case.
             # Prepare all the inputs and copy to the input buffers.
-            with self._use_input_buffers(context):
+            with (
+                self._fine_nvtx(f"{lane}_prepare_inputs"),
+                self._use_input_buffers(context),
+            ):
                 input_batch = self.prepare_inputs(scheduler_output, batch_desc)
-            block_tables, slot_mappings = self._prepare_attn(context, input_batch)
+            with self._fine_nvtx(f"{lane}_prepare_attn_tables"):
+                block_tables, slot_mappings = self._prepare_attn(context, input_batch)
 
             if self.lora_config:
                 # Activate LoRA adapters.
@@ -270,7 +313,16 @@ class SlackServeModelRunner(GPUModelRunner):
                 slot_mappings, self.kv_cache_config
             )
             assert block_tables is not None
-            with self._use_eager_attention_metadata(lane):
+            fa_sm_margin = (
+                int(os.environ.get("HB_PREFILL_FA_SM_MARGIN", "0") or "0")
+                if lane == "prefill" and scheduler_output.sm_shaping_active
+                else 0
+            )
+            with (
+                self._fine_nvtx(f"{lane}_prepare_attn_metadata"),
+                self._use_eager_attention_metadata(lane),
+                flash_attn_scheduler_sm_margin(fa_sm_margin),
+            ):
                 attn_metadata = self.model_state.prepare_attn(
                     input_batch,
                     batch_desc.cg_mode,
@@ -307,42 +359,73 @@ class SlackServeModelRunner(GPUModelRunner):
             model_inputs["inputs_embeds"] = None
             assert intermediate_tensors is not None
 
-        # Run model.
-        if batch_desc.cg_mode == CUDAGraphMode.FULL:
-            # Use explicit cudagraph replay for FULL mode.
-            # NOTE(woosuk): Here, we don't need to pass the input tensors,
-            # because they are already copied to the CUDA graph input buffers.
-            self.kv_connector.pre_forward(scheduler_output)
-            model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
-            if self.use_aux_hidden_state_outputs:
-                hidden_states, aux_hidden_states = model_output
-            else:
-                hidden_states = model_output
-                aux_hidden_states = None
-        else:
-            # For piecewise and eager mode, just call model().
-            batch_descriptor = BatchDescriptor(
-                num_tokens=input_batch.num_tokens_after_padding,
-                has_lora=self.lora_config is not None,
-            )
+        return PreparedLaneRun(
+            lane=lane,
+            scheduler_output=scheduler_output,
+            context=context,
+            batch_desc=batch_desc,
+            input_batch=input_batch,
+            attn_metadata=attn_metadata,
+            slot_mappings_by_layer=slot_mappings_by_layer,
+            model_inputs=model_inputs,
+            num_tokens_across_dp=num_tokens_across_dp,
+            skip_compiled=skip_compiled,
+            dummy_run=dummy_run,
+        )
 
-            with set_forward_context(
-                attn_metadata,
-                self.vllm_config,
-                num_tokens=input_batch.num_tokens_after_padding,
-                cudagraph_runtime_mode=batch_desc.cg_mode,
-                num_tokens_across_dp=num_tokens_across_dp,
-                batch_descriptor=batch_descriptor,
-                slot_mapping=slot_mappings_by_layer,
-                skip_compiled=skip_compiled,
-            ):
+    @torch.inference_mode()
+    def launch_prepared(
+        self, prepared: "PreparedLaneRun"
+    ) -> ModelRunnerOutput | IntermediateTensors | None:
+        """Enqueue a prepared forward on the launcher's current CUDA stream."""
+        lane = prepared.lane
+        scheduler_output = prepared.scheduler_output
+        context = prepared.context
+        batch_desc = prepared.batch_desc
+        input_batch = prepared.input_batch
+        attn_metadata = prepared.attn_metadata
+        slot_mappings_by_layer = prepared.slot_mappings_by_layer
+        model_inputs = prepared.model_inputs
+        num_tokens_across_dp = prepared.num_tokens_across_dp
+        skip_compiled = prepared.skip_compiled
+
+        # Run model.
+        with self._fine_nvtx(f"{lane}_model_launch"):
+            if batch_desc.cg_mode == CUDAGraphMode.FULL:
+                # Use explicit cudagraph replay for FULL mode.
+                # NOTE(woosuk): Here, we don't need to pass the input tensors,
+                # because they are already copied to the CUDA graph input buffers.
                 self.kv_connector.pre_forward(scheduler_output)
-                model_output = self.model(**model_inputs)
+                model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
                 if self.use_aux_hidden_state_outputs:
                     hidden_states, aux_hidden_states = model_output
                 else:
                     hidden_states = model_output
                     aux_hidden_states = None
+            else:
+                # For piecewise and eager mode, just call model().
+                batch_descriptor = BatchDescriptor(
+                    num_tokens=input_batch.num_tokens_after_padding,
+                    has_lora=self.lora_config is not None,
+                )
+
+                with set_forward_context(
+                    attn_metadata,
+                    self.vllm_config,
+                    num_tokens=input_batch.num_tokens_after_padding,
+                    cudagraph_runtime_mode=batch_desc.cg_mode,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    batch_descriptor=batch_descriptor,
+                    slot_mapping=slot_mappings_by_layer,
+                    skip_compiled=skip_compiled,
+                ):
+                    self.kv_connector.pre_forward(scheduler_output)
+                    model_output = self.model(**model_inputs)
+                    if self.use_aux_hidden_state_outputs:
+                        hidden_states, aux_hidden_states = model_output
+                    else:
+                        hidden_states = model_output
+                        aux_hidden_states = None
 
         kv_connector_output = self.kv_connector.post_forward(scheduler_output)
 
@@ -362,7 +445,7 @@ class SlackServeModelRunner(GPUModelRunner):
         assert context.completion_event is not None
         context.main_stream = torch.cuda.current_stream(self.device)
         context.completion_event.record(context.main_stream)
-        if dummy_run:
+        if prepared.dummy_run:
             self.execute_model_state = execute_model_state
 
         if not self.is_last_pp_rank:
@@ -517,6 +600,21 @@ class LaneContext:
     copy_stream: torch.cuda.Stream | None = None
     copy_event: torch.cuda.Event | None = None
     staging_event: torch.cuda.Event | None = None
+
+
+@dataclass
+class PreparedLaneRun:
+    lane: str
+    scheduler_output: SchedulerOutput
+    context: LaneContext
+    batch_desc: BatchExecutionDescriptor
+    input_batch: InputBatch
+    attn_metadata: dict[str, Any] | None
+    slot_mappings_by_layer: dict[str, torch.Tensor] | None
+    model_inputs: dict[str, Any]
+    num_tokens_across_dp: torch.Tensor | None
+    skip_compiled: bool
+    dummy_run: bool
 
 
 class LaneAttentionScratch:

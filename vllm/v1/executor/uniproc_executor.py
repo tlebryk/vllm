@@ -87,6 +87,18 @@ class UniProcExecutor(Executor):
 
         try:
             result = run_method(self.driver_worker, method, args, kwargs)
+            # The opt-in Slack Serve worker prepares shared scheduler/runner
+            # state synchronously, then returns a lane-launch Future. Preserve
+            # that Future instead of wrapping it in an already-complete one.
+            if isinstance(result, Future):
+                if single_value:
+                    return result
+
+                def get_future_list() -> list[Any]:
+                    return [result.result()]
+
+                assert self.async_output_thread is not None
+                return self.async_output_thread.submit(get_future_list)
             if isinstance(result, AsyncModelRunnerOutput):
                 if (async_thread := self.async_output_thread) is not None:
                     if single_value:

@@ -240,6 +240,9 @@ class SchedulerOutput:
 
     # Execution stream selected by the experimental Slack Serve runner.
     execution_lane: str = "default"
+    # Whether this ticket is expected to overlap another GPU lane and should
+    # use Slack Serve's cooperative SM-shaping controls.
+    sm_shaping_active: bool = False
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

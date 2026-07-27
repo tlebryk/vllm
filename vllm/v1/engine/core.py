@@ -376,7 +376,9 @@ class EngineCore:
         )
         self._iteration_index += 1
 
-    def dispatch(self, lane: str = "default") -> StepTicket:
+    def dispatch(
+        self, lane: str = "default", sm_shaping_active: bool = False
+    ) -> StepTicket:
         inflight_lanes = getattr(self, "_hb_inflight_lanes", set())
         if lane in inflight_lanes:
             raise RuntimeError(
@@ -384,6 +386,7 @@ class EngineCore:
             )
         scheduler_output = self.scheduler.schedule(lane=lane)
         scheduler_output.execution_lane = lane
+        scheduler_output.sm_shaping_active = sm_shaping_active
         request_ids = set(scheduler_output.num_scheduled_tokens)
         if request_ids and hasattr(self.scheduler, "mark_hb_inflight"):
             self.scheduler.mark_hb_inflight(request_ids)
@@ -457,7 +460,7 @@ class EngineCore:
                 self.scheduler.update_draft_token_ids(draft_token_ids)
 
     def step_with_batch_queue(
-        self,
+        self, lane: str = "default", allow_schedule: bool = True
     ) -> tuple[dict[int, EngineCoreOutputs] | None, bool]:
         """Schedule and execute batches with the batch queue.
         Note that if nothing to output in this step, None is returned.
@@ -473,6 +476,11 @@ class EngineCore:
         3. Update the scheduler from the output.
         """
 
+        if lane not in ("default", "decode"):
+            raise ValueError(
+                "the asynchronous batch queue is restricted to the decode lane"
+            )
+
         batch_queue = self.batch_queue
         assert batch_queue is not None
 
@@ -483,8 +491,9 @@ class EngineCore:
 
         model_executed = False
         deferred_scheduler_output = None
-        if self.scheduler.has_requests():
-            scheduler_output = self.scheduler.schedule()
+        if allow_schedule and self.scheduler.has_requests():
+            scheduler_output = self.scheduler.schedule(lane=lane)
+            scheduler_output.execution_lane = lane
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
