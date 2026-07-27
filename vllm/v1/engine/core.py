@@ -648,7 +648,9 @@ class EngineCore:
             result = self._hb_dispatch("decode")
             if result is not None:
                 return result
-            return {}, True
+            # A nonempty ticket was stored in flight; nothing published this
+            # call, so report not-executed (post_step belongs to the publish).
+            return {}, False
         pf_lane = self._hb_free_prefill_lane()
         if pf_lane is not None and self._hb_has_dispatchable_prefill():
             result = self._hb_dispatch(pf_lane)
