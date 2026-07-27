@@ -178,19 +178,26 @@ class SlackServeModelRunner(GPUModelRunner):
         # support_torch_compile's __call__ returns self.forward whenever
         # do_not_compile is True (decorators.py: `if self.do_not_compile ...`),
         # so toggling it forces the capture warmup + capture passes eager. The
-        # prefill lane keeps its compiled callable for runtime; it compiles
-        # lazily on the first real prefill forward (absorbed by warmup).
-        prev = getattr(self.model, "do_not_compile", None)
-        if prev is None:
+        # decorator is applied to the compiled BACKBONE submodule (e.g.
+        # Qwen3Model), not the top-level model, so toggle every submodule that
+        # carries the attribute. The prefill lane keeps its compiled callable
+        # for runtime; it compiles lazily on the first real prefill forward
+        # (absorbed by warmup).
+        toggled: list = []
+        for mod in self.model.modules():
+            if "do_not_compile" in vars(mod):
+                toggled.append((mod, mod.do_not_compile))
+                mod.do_not_compile = True
+        if not toggled:
             raise RuntimeError(
-                "HB_P2_COMPILE_PREFILL: self.model has no do_not_compile "
-                "attribute; expected a support_torch_compile wrapper in mode 3."
+                "HB_P2_COMPILE_PREFILL: no submodule exposes do_not_compile; "
+                "expected a support_torch_compile wrapper in mode 3."
             )
-        self.model.do_not_compile = True
         try:
             return super().capture_model()
         finally:
-            self.model.do_not_compile = prev
+            for mod, prev in toggled:
+                mod.do_not_compile = prev
 
     def _end_prep(
         self, context: "LaneContext", exec_stream: torch.cuda.Stream | None
