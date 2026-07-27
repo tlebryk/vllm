@@ -13,6 +13,25 @@ from vllm.utils.torch_utils import (
     get_accelerator_view_from_cpu_tensor,
 )
 
+# UVA staging buffers are recycled round-robin; without a guard, a host
+# rewrite can race GPU kernels still reading the buffer from an earlier
+# use. Slack Serve's multi-lane controller stretches the enqueue-to-
+# execution window enough to hit this. A caller that has enqueued every
+# consumer of the staged buffers calls fence_uva_pools() once; each pool
+# written since the previous fence then records a per-buffer event on the
+# consuming stream, and the pool host-synchronizes that event before the
+# buffer is rewritten. Code that never fences (the ordinary single-lane
+# runner) behaves exactly as before.
+_dirty_pools: list["UvaBufferPool"] = []
+
+
+def fence_uva_pools(stream: torch.cuda.Stream | None = None) -> None:
+    """Mark staged UVA buffers as consumed by kernels on ``stream``."""
+    global _dirty_pools
+    pools, _dirty_pools = _dirty_pools, []
+    for pool in pools:
+        pool._record_pending(stream)
+
 
 def async_copy_to_gpu(
     x: torch.Tensor | np.ndarray,
@@ -57,10 +76,34 @@ class UvaBufferPool:
         self._uva_bufs = [UvaBuffer(size, dtype) for _ in range(max_concurrency)]
         # Current buffer index
         self._curr = 0
+        # Optional consumption guard (see fence_uva_pools).
+        self._events: list[torch.cuda.Event | None] = [None] * max_concurrency
+        self._event_pending = [False] * max_concurrency
+        self._dirty: set[int] = set()
+
+    def _record_pending(self, stream: torch.cuda.Stream | None) -> None:
+        if stream is None:
+            stream = torch.cuda.current_stream()
+        for index in self._dirty:
+            event = self._events[index]
+            if event is None:
+                event = torch.cuda.Event()
+                self._events[index] = event
+            event.record(stream)
+            self._event_pending[index] = True
+        self._dirty.clear()
 
     def copy_to_uva(self, x: torch.Tensor | np.ndarray | list) -> torch.Tensor:
         # Round robin to the next buffer.
         self._curr = (self._curr + 1) % self.max_concurrency
+        if self._event_pending[self._curr]:
+            # A fenced consumer of this buffer's previous contents may still
+            # be in flight; wait before the host rewrites the memory.
+            self._events[self._curr].synchronize()
+            self._event_pending[self._curr] = False
+        if not self._dirty:
+            _dirty_pools.append(self)
+        self._dirty.add(self._curr)
         buf = self._uva_bufs[self._curr]
         # CPU-to-CPU copy
         dst = buf.cpu if isinstance(x, torch.Tensor) else buf.np

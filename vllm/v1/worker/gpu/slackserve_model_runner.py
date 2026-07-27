@@ -12,6 +12,7 @@ from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.attention.backends.fa_utils import flash_attn_scheduler_sm_margin
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
+from vllm.v1.worker.gpu.buffer_utils import fence_uva_pools
 
 # add imports
 from vllm.v1.worker.gpu.block_table import (
@@ -129,6 +130,9 @@ class SlackServeModelRunner(GPUModelRunner):
         self, context: "LaneContext", exec_stream: torch.cuda.Stream | None
     ) -> None:
         """Return to the lane's execution stream, ordered after this prep."""
+        # Every kernel consuming this ticket's staged UVA buffers is enqueued
+        # on the current stream by now; guard the pools' round-robin reuse.
+        fence_uva_pools(torch.cuda.current_stream(self.device))
         if exec_stream is None:
             return
         assert context.prep_event is not None
