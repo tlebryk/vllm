@@ -10,6 +10,7 @@ from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.sequence import IntermediateTensors
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.attention.backends.fa_utils import flash_attn_scheduler_sm_margin
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 
 # add imports
@@ -66,6 +67,13 @@ class SlackServeModelRunner(GPUModelRunner):
         # Prefill gets separate scratch and always runs eager when
         # HB_P2_DECODE_GRAPHS_ONLY=1.
         from vllm.v1.worker.slackserve_gpu_worker import prefill_lane_names
+
+        # Per-lane FlashAttention-3 tile-scheduler SM margin (SMs left free).
+        # Default 0 preserves today's behavior bit-identically.
+        self.fa_sm_margin = {
+            "decode": int(os.environ.get("HB_P2_FA_SM_MARGIN_DECODE", "0") or "0"),
+            "prefill": int(os.environ.get("HB_P2_FA_SM_MARGIN_PREFILL", "0") or "0"),
+        }
 
         self.contexts = {
             "decode": LaneContext(
@@ -274,7 +282,11 @@ class SlackServeModelRunner(GPUModelRunner):
                 slot_mappings, self.kv_cache_config
             )
             assert block_tables is not None
-            with self._use_eager_attention_metadata(lane):
+            margin = self.fa_sm_margin["decode" if lane == "decode" else "prefill"]
+            with (
+                flash_attn_scheduler_sm_margin(margin),
+                self._use_eager_attention_metadata(lane),
+            ):
                 attn_metadata = self.model_state.prepare_attn(
                     input_batch,
                     batch_desc.cg_mode,

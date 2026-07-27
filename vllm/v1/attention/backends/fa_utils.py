@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any
 
 from vllm.logger import init_logger
@@ -19,7 +22,7 @@ if current_platform.is_cuda():
     from vllm._custom_ops import reshape_and_cache_flash
     from vllm.vllm_flash_attn import (  # type: ignore[attr-defined]
         flash_attn_varlen_func,
-        get_scheduler_metadata,
+        get_scheduler_metadata as _get_scheduler_metadata,
     )
 
 elif current_platform.is_xpu():
@@ -28,7 +31,7 @@ elif current_platform.is_xpu():
 
     reshape_and_cache_flash = ops.reshape_and_cache_flash
     flash_attn_varlen_func = xpu_ops.flash_attn_varlen_func  # type: ignore[assignment]
-    get_scheduler_metadata = xpu_ops.get_scheduler_metadata  # type: ignore[assignment]
+    _get_scheduler_metadata = xpu_ops.get_scheduler_metadata  # type: ignore[assignment]
 elif current_platform.is_rocm():
     try:
         from flash_attn import flash_attn_varlen_func  # type: ignore[no-redef]
@@ -44,13 +47,32 @@ elif current_platform.is_rocm():
             )
 
     # ROCm doesn't use scheduler metadata (FA3 feature), provide stub
-    def get_scheduler_metadata(*args: Any, **kwargs: Any) -> None:  # type: ignore[misc]
+    def _get_scheduler_metadata(*args: Any, **kwargs: Any) -> None:  # type: ignore[misc]
         return None
 
     # ROCm uses the C++ custom op for reshape_and_cache
     from vllm import _custom_ops as ops
 
     reshape_and_cache_flash = ops.reshape_and_cache_flash
+
+
+_scheduler_sm_margin: ContextVar[int] = ContextVar(
+    "flash_attn_scheduler_sm_margin", default=0
+)
+
+
+@contextmanager
+def flash_attn_scheduler_sm_margin(sm_margin: int) -> Iterator[None]:
+    token = _scheduler_sm_margin.set(sm_margin)
+    try:
+        yield
+    finally:
+        _scheduler_sm_margin.reset(token)
+
+
+def get_scheduler_metadata(*args: Any, **kwargs: Any) -> Any:
+    kwargs.setdefault("sm_margin", _scheduler_sm_margin.get())
+    return _get_scheduler_metadata(*args, **kwargs)
 
 
 def get_flash_attn_version(
