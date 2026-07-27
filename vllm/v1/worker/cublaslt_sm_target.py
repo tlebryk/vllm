@@ -276,19 +276,49 @@ class CublasLtMatmul:
                 f"no cuBLASLt algorithm for M={m}, N={n}, K={k}, "
                 f"dtype={dtype}, sm_target={sm_target}"
             )
-        algorithm_index = next(
-            (
-                index
-                for index in range(returned.value)
-                if results[index].state == 0
-                and results[index].workspace_size <= self.workspace_bytes
-            ),
-            None,
-        )
-        if algorithm_index is None:
+        candidates = [
+            index
+            for index in range(returned.value)
+            if results[index].state == 0
+            and results[index].workspace_size <= self.workspace_bytes
+        ]
+        if not candidates:
             raise RuntimeError(
                 f"cuBLASLt returned no successful algorithm within "
                 f"{self.workspace_bytes} workspace bytes"
+            )
+        # The heuristic's first pick can vary with device state at plan-build
+        # time; variant sets ~2x apart in per-kernel speed (and opposite in
+        # decode interference) were observed across identical runs.
+        # HB_LT_ALGO_SELECT pins the choice deterministically:
+        #   first (default) | max_waves | min_waves | rank:<i>
+        policy = os.environ.get("HB_LT_ALGO_SELECT", "first")
+        if policy == "max_waves":
+            algorithm_index = max(
+                candidates, key=lambda i: results[i].waves_count
+            )
+        elif policy == "min_waves":
+            algorithm_index = min(
+                candidates, key=lambda i: results[i].waves_count
+            )
+        elif policy.startswith("rank:"):
+            algorithm_index = candidates[
+                min(int(policy.split(":", 1)[1]), len(candidates) - 1)
+            ]
+        else:
+            algorithm_index = candidates[0]
+        if os.environ.get("HB_LT_LOG_PLANS") == "1":
+            cands = ", ".join(
+                f"[{i}] waves={results[i].waves_count:.2f}"
+                f" ws={results[i].workspace_size}"
+                f" algo={bytes(results[i].algo[:8]).hex()}"
+                for i in candidates
+            )
+            print(
+                f"[lt-plan] M={m} N={n} K={k} dtype={dtype} "
+                f"sm_target={sm_target} policy={policy} "
+                f"chosen={algorithm_index} candidates: {cands}",
+                flush=True,
             )
         return _Plan(
             desc=desc,
