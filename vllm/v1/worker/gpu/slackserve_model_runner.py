@@ -65,6 +65,8 @@ class SlackServeModelRunner(GPUModelRunner):
         # buffers: CUDA graphs are captured against those exact addresses.
         # Prefill gets separate scratch and always runs eager when
         # HB_P2_DECODE_GRAPHS_ONLY=1.
+        from vllm.v1.worker.slackserve_gpu_worker import prefill_lane_names
+
         self.contexts = {
             "decode": LaneContext(
                 input_buffers=self.input_buffers,
@@ -73,30 +75,32 @@ class SlackServeModelRunner(GPUModelRunner):
                 copy_event=torch.cuda.Event(),
                 staging_event=torch.cuda.Event(),
             ),
-            "prefill": LaneContext(
+        }
+        # One fully private context per prefill lane (HB_P2_PREFILL_LANES=2
+        # adds a second). Output D2H copies must not share a stream/event
+        # across lanes: two in-flight tickets would re-record one event and
+        # race their copies. The same holds for input preparation buffers.
+        for lane in prefill_lane_names():
+            self.contexts[lane] = LaneContext(
                 input_buffers=InputBuffers(
                     max_num_reqs=self.max_num_reqs,
                     max_num_tokens=self.max_num_tokens,
                     device=self.device,
                 ),
                 completion_event=torch.cuda.Event(),
-                # Output D2H copies must not share a stream/event across
-                # lanes: two in-flight tickets would re-record one event and
-                # race their copies.
                 copy_stream=torch.cuda.Stream(self.device),
                 copy_event=torch.cuda.Event(),
                 staging_event=torch.cuda.Event(),
-            ),
-        }
+            )
 
     def initialize_kv_cache(self, kv_cache_config) -> None:
         super().initialize_kv_cache(kv_cache_config)
         # Decode uses BlockTables' persistent forward buffers, whose addresses
-        # are baked into captured CUDA graphs. Only prefill needs independent
-        # attention scratch.
-        self.contexts["prefill"].attn_scratch = LaneAttentionScratch(
-            self.block_tables
-        )
+        # are baked into captured CUDA graphs. Only prefill lanes need
+        # independent attention scratch.
+        for lane, context in self.contexts.items():
+            if lane != "decode":
+                context.attn_scratch = LaneAttentionScratch(self.block_tables)
 
     @contextmanager
     def _use_input_buffers(self, context: "LaneContext"):
@@ -119,7 +123,7 @@ class SlackServeModelRunner(GPUModelRunner):
         path makes prefill use its own ordinary metadata allocation.
         """
         if not (
-            lane == "prefill"
+            lane.startswith("prefill")
             and os.environ.get("HB_P2_DECODE_GRAPHS_ONLY") == "1"
         ):
             yield
@@ -159,11 +163,11 @@ class SlackServeModelRunner(GPUModelRunner):
         if not dummy_run:
             # The staged-write scatter kernels read shared, persistent UVA
             # staging buffers (req_states/block_tables/sampler). Before this
-            # lane's CPU code overwrites that staging memory, the other lane's
-            # already-enqueued scatter kernels must have consumed it.
-            other = self.contexts["decode" if lane == "prefill" else "prefill"]
-            if other.staging_event is not None:
-                other.staging_event.synchronize()
+            # lane's CPU code overwrites that staging memory, every other
+            # lane's already-enqueued scatter kernels must have consumed it.
+            for other_lane, other in self.contexts.items():
+                if other_lane != lane and other.staging_event is not None:
+                    other.staging_event.synchronize()
             # Update the request states.
             self.finish_requests(scheduler_output)
             self.free_states(scheduler_output)
@@ -190,7 +194,7 @@ class SlackServeModelRunner(GPUModelRunner):
 
         skip_compiled = False
         if (
-            lane == "prefill"
+            lane.startswith("prefill")
             and os.environ.get("HB_P2_DECODE_GRAPHS_ONLY") == "1"
         ):
             # A captured graph owns fixed input/attention/output addresses.

@@ -352,7 +352,9 @@ class Scheduler(SchedulerInterface):
         # chunked prefills, prefix caching, speculative decoding,
         # and the "jump decoding" optimization in the future.
 
-        if lane not in ("default", "prefill", "decode"):
+        # "prefill1" is the optional second prefill lane (HB_P2_PREFILL_LANES=2);
+        # it admits the same prefill-phase work as "prefill".
+        if lane not in ("default", "prefill", "prefill1", "decode"):
             raise ValueError(f"Unknown execution lane: {lane!r}")
 
         # P1 Slack Serve policy. The caller selects a lane; the scheduler

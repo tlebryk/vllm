@@ -3,6 +3,8 @@
 Keeps lane-specific stream routing out of vLLM's common GPU worker.
 """
 
+import os
+
 import torch
 
 from vllm.v1.core.sched.output import GrammarOutput
@@ -10,12 +12,22 @@ from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 from vllm.v1.worker.gpu_worker import Worker as GPUWorker
 
 
+def prefill_lane_names() -> list[str]:
+    """Prefill lane names for the configured depth (default one lane)."""
+    if os.environ.get("HB_P2_PREFILL_LANES") == "2":
+        return ["prefill", "prefill1"]
+    return ["prefill"]
+
+
 class SlackServeGPUWorker(GPUWorker):
 
     def init_device(self) -> None:
         super().init_device()
         self.decode_stream = torch.cuda.Stream(device=self.device)
-        self.prefill_stream = torch.cuda.Stream(device=self.device)
+        self.lane_streams = {
+            lane: torch.cuda.Stream(device=self.device)
+            for lane in prefill_lane_names()
+        }
 
     # override factory hook to use new model
     def _create_model_runner(self):
@@ -28,9 +40,10 @@ class SlackServeGPUWorker(GPUWorker):
         # ``default`` remains a compatibility alias for decode.
         if lane in ("decode", "default"):
             return self.decode_stream
-        if lane == "prefill":
-            return self.prefill_stream
-        raise ValueError(f"Unknown execution lane: {lane!r}")
+        stream = self.lane_streams.get(lane)
+        if stream is None:
+            raise ValueError(f"Unknown execution lane: {lane!r}")
+        return stream
 
     @torch.inference_mode()
     def execute_model(self, scheduler_output):

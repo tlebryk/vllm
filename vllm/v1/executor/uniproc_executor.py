@@ -66,7 +66,7 @@ class UniProcExecutor(Executor):
         # output waiter so a long prefill copy cannot head-of-line block a
         # completed decode result.
         if os.environ.get("HB_LANE_ROUTING") == "1":
-            return 2
+            return 3 if os.environ.get("HB_P2_PREFILL_LANES") == "2" else 2
         return 2 if self.scheduler_config.async_scheduling else 1
 
     def collective_rpc(  # type: ignore[override]
