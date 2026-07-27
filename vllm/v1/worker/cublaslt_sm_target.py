@@ -89,7 +89,8 @@ class CublasLtMatmul:
         self._handle = ct.c_void_p()
         _check(self._library.cublasLtCreate(ct.byref(self._handle)), "cublasLtCreate")
         self._plans: dict[tuple, _Plan] = {}
-        self._workspaces: dict[torch.device, torch.Tensor] = {}
+        # Keyed by (device, cuda_stream): see _workspace().
+        self._workspaces: dict[tuple, torch.Tensor] = {}
 
     def _configure_signatures(self) -> None:
         pointer = ct.c_void_p
@@ -153,12 +154,17 @@ class CublasLtMatmul:
             function.argtypes = argument_types
 
     def _workspace(self, device: torch.device) -> torch.Tensor:
-        workspace = self._workspaces.get(device)
+        # One workspace PER STREAM: concurrent capped GEMMs on different
+        # CUDA streams (e.g. two Slack Serve prefill lanes) would otherwise
+        # share this scratch and corrupt each other's split-K/reduction
+        # buffers - outputs stay well-formed but numerically garbage.
+        key = (device, torch.cuda.current_stream(device).cuda_stream)
+        workspace = self._workspaces.get(key)
         if workspace is None:
             workspace = torch.empty(
                 self.workspace_bytes, dtype=torch.uint8, device=device
             )
-            self._workspaces[device] = workspace
+            self._workspaces[key] = workspace
         return workspace
 
     def _make_layout(
