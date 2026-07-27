@@ -301,6 +301,27 @@ class CublasLtMatmul:
             algorithm_index = min(
                 candidates, key=lambda i: results[i].waves_count
             )
+        elif policy.startswith("prefer:"):
+            # Preference list of algo-id byte-4 hex values (e.g.
+            # "prefer:d1,18,17"): take the first candidate from the
+            # heuristic order whose algo id matches the earliest-listed
+            # family. Cap-respecting families launch grids <= the SM
+            # target; some heuristic candidates ignore the target and
+            # launch full-GPU grids (132 CTAs on H100), starving the
+            # overlapped decode lane.
+            prefs = policy.split(":", 1)[1].split(",")
+            def _family(i: int) -> str:
+                return f"{results[i].algo[4] & 0xFF:02x}"
+            algorithm_index = None
+            for pref in prefs:
+                for i in candidates:
+                    if _family(i) == pref.strip().lower():
+                        algorithm_index = i
+                        break
+                if algorithm_index is not None:
+                    break
+            if algorithm_index is None:
+                algorithm_index = candidates[0]
         elif policy.startswith("rank:"):
             algorithm_index = candidates[
                 min(int(policy.split(":", 1)[1]), len(candidates) - 1)
