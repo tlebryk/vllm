@@ -7,7 +7,8 @@ import threading
 import time
 from collections import defaultdict, deque
 from collections.abc import Callable, Generator
-from concurrent.futures import Future
+from concurrent.futures import FIRST_COMPLETED, Future
+from concurrent.futures import wait as futures_wait
 from contextlib import ExitStack, contextmanager
 from enum import IntEnum
 from functools import partial
@@ -209,6 +210,14 @@ class EngineCore:
         self.step_fn = (
             self.step if self.batch_queue is None else self.step_with_batch_queue
         )
+        # Slack Serve two-lane serving controller. When HB_P2_SERVE=1 (with the
+        # SlackServe worker + HB_LANE_ROUTING=1), the API server busy loop drives
+        # a per-lane decode/prefill controller instead of the ordinary step. See
+        # step_two_lane below (an incremental port of the validated offline
+        # drain_p2_pd_event_driven controller from slackserve/bench.py).
+        self._hb_serve_ready = False
+        if os.environ.get("HB_P2_SERVE") == "1":
+            self.step_fn = self.step_two_lane
         self.async_scheduling = vllm_config.scheduler_config.async_scheduling
 
         self.aborts_queue = queue.Queue[list[str]]()
@@ -455,6 +464,197 @@ class EngineCore:
             draft_token_ids = self.model_executor.take_draft_token_ids()
             if draft_token_ids is not None:
                 self.scheduler.update_draft_token_ids(draft_token_ids)
+
+    # ------------------------------------------------------------------
+    # Slack Serve two-lane serving controller (HB_P2_SERVE=1)
+    #
+    # Incremental port of drain_p2_pd_event_driven (slackserve/bench.py) into
+    # the EngineCore busy loop so `vllm serve` can drive the P2 candidate. Each
+    # lane owns at most one in-flight ticket; a ticket whose future is ready is
+    # finished + published immediately (decode first) so a completed prefill
+    # never waits behind a decode. Prefill dispatch (~25 ms host prep) happens
+    # only right after a decode dispatch (its cost hides under the fresh decode
+    # step) or when the decode lane is idle, at most one per pass, gated on a
+    # KV-block watermark. An empty ticket latches its lane blocked until a
+    # nonempty completion frees KV. Controller state persists on self across
+    # step calls; requests arrive continuously via the input queue between
+    # passes. All scheduler mutation stays on this (busy-loop) thread.
+    # ------------------------------------------------------------------
+
+    def _hb_serve_init(self) -> None:
+        """Lazily build controller state once the scheduler/KV pool exist."""
+        if self._hb_serve_ready:
+            return
+        prefill_depth = 2 if os.environ.get("HB_P2_PREFILL_LANES") == "2" else 1
+        self._hb_prefill_lanes = ("prefill", "prefill1")[:prefill_depth]
+        self._hb_lanes = ("decode", *self._hb_prefill_lanes)
+        self._hb_tickets: dict[str, StepTicket | None] = {
+            lane: None for lane in self._hb_lanes
+        }
+        self._hb_lane_blocked = {lane: False for lane in self._hb_lanes}
+        block_pool = self.scheduler.kv_cache_manager.block_pool
+        self._hb_block_pool = block_pool
+        kv_watermark = float(
+            os.environ.get("HB_P2_PREFILL_KV_WATERMARK", "0") or "0"
+        )
+        if kv_watermark:
+            self._hb_watermark_unit = int(block_pool.num_gpu_blocks * kv_watermark)
+        else:
+            block_size = self.vllm_config.cache_config.block_size
+            chunk_blocks = -(
+                -self.scheduler.max_num_scheduled_tokens // block_size
+            )
+            self._hb_watermark_unit = chunk_blocks + 256
+        self._hb_watermark_skips = 0
+        self._hb_empty_dispatches = {lane: 0 for lane in self._hb_lanes}
+        self._hb_serve_ready = True
+        logger.info(
+            "[hb-p2-serve] two-lane serving controller active: lanes=%s "
+            "watermark=%.3f watermark_unit_blocks=%d num_gpu_blocks=%d",
+            self._hb_lanes,
+            kv_watermark,
+            self._hb_watermark_unit,
+            block_pool.num_gpu_blocks,
+        )
+
+    def _hb_inflight_prefills(self) -> int:
+        return sum(
+            1 for lane in self._hb_prefill_lanes if self._hb_tickets[lane] is not None
+        )
+
+    def _hb_prefill_headroom_ok(self) -> bool:
+        required = self._hb_watermark_unit * (self._hb_inflight_prefills() + 1)
+        return self._hb_block_pool.get_num_free_blocks() >= required
+
+    def _hb_has_dispatchable_prefill(self) -> bool:
+        """True if any not-in-flight request still has prompt KV to compute."""
+        inflight = self.scheduler._hb_inflight_req_ids
+        return any(
+            r.request_id not in inflight for r in self.scheduler.waiting
+        ) or any(
+            r.request_id not in inflight
+            and r.num_computed_tokens < r.num_prompt_tokens
+            for r in self.scheduler.running
+        )
+
+    def _hb_has_dispatchable_decode(self) -> bool:
+        """True if any not-in-flight request is decode-ready (prompt KV done)."""
+        inflight = self.scheduler._hb_inflight_req_ids
+        return any(
+            r.request_id not in inflight
+            and r.num_computed_tokens >= r.num_prompt_tokens
+            for r in self.scheduler.running
+        )
+
+    def _hb_free_prefill_lane(self) -> str | None:
+        for lane in self._hb_prefill_lanes:
+            if self._hb_tickets[lane] is None and not self._hb_lane_blocked[lane]:
+                return lane
+        return None
+
+    @staticmethod
+    def _hb_ticket_tokens(ticket: StepTicket) -> int:
+        return ticket.scheduler_output.total_num_scheduled_tokens
+
+    def _hb_complete(
+        self, lane: str, ticket: StepTicket
+    ) -> tuple[dict[int, EngineCoreOutputs], bool]:
+        """Finish + publish one ready ticket; unblock lanes on real work."""
+        model_output = self.finish(ticket)
+        engine_core_outputs = self.complete(ticket, model_output)
+        executed = self._hb_ticket_tokens(ticket) > 0
+        if executed:
+            for name in self._hb_lane_blocked:
+                self._hb_lane_blocked[name] = False
+        return engine_core_outputs, executed
+
+    def _hb_dispatch(
+        self, lane: str
+    ) -> tuple[dict[int, EngineCoreOutputs], bool] | None:
+        """Dispatch one lane. Returns published outputs if the ticket was empty
+        (completed inline and its lane latched blocked); else None with the
+        nonempty ticket stored in flight."""
+        ticket = self.dispatch(lane)
+        if self._hb_ticket_tokens(ticket) > 0:
+            self._hb_tickets[lane] = ticket
+            return None
+        self._hb_empty_dispatches[lane] += 1
+        self._hb_lane_blocked[lane] = True
+        return self._hb_complete(lane, ticket)
+
+    def step_two_lane(
+        self, lane: str = "default"
+    ) -> tuple[dict[int, EngineCoreOutputs], bool]:
+        """One incremental pass of the two-lane controller for the busy loop.
+
+        Returns (engine_core_outputs, model_executed) exactly like step(); at
+        most one ticket is published per call so the busy loop keeps draining
+        the input queue (admitting new requests) between publishes.
+        """
+        self._hb_serve_init()
+        tickets = self._hb_tickets
+
+        # (a) Publish any ready ticket, decode first.
+        for cur in self._hb_lanes:
+            ticket = tickets[cur]
+            if ticket is not None and ticket.future.done():
+                tickets[cur] = None
+                return self._hb_complete(cur, ticket)
+
+        # (b) Dispatch decode when decode-ready work exists.
+        decode_dispatched_now = False
+        if (
+            tickets["decode"] is None
+            and not self._hb_lane_blocked["decode"]
+            and self._hb_has_dispatchable_decode()
+        ):
+            result = self._hb_dispatch("decode")
+            decode_dispatched_now = True
+            if result is not None:  # empty decode ticket completed inline
+                return result
+
+        # (c) Dispatch prefill only right behind a decode dispatch (host prep
+        #     hides under the fresh decode step) or with an idle decode lane;
+        #     at most one per pass; KV-watermark gated.
+        pf_lane = self._hb_free_prefill_lane()
+        if (
+            pf_lane is not None
+            and (decode_dispatched_now or tickets["decode"] is None)
+            and self._hb_has_dispatchable_prefill()
+        ):
+            if self._hb_prefill_headroom_ok():
+                result = self._hb_dispatch(pf_lane)
+                if result is not None:
+                    return result
+            else:
+                self._hb_watermark_skips += 1
+
+        # (d) Tickets in flight but nothing publishable yet: wait briefly on the
+        #     first completion, then return so input keeps getting admitted.
+        inflight = [t for t in tickets.values() if t is not None]
+        if inflight:
+            futures_wait(
+                [t.future for t in inflight],
+                return_when=FIRST_COMPLETED,
+                timeout=0.05,
+            )
+            return {}, False
+
+        # (e) Nothing in flight. Flush finished-but-unpublished request ids
+        #     (they need one more scheduler pass to reach the worker), then any
+        #     dispatchable work; otherwise fall through so the busy loop blocks
+        #     on the input queue.
+        if self.scheduler.has_finished_requests():
+            result = self._hb_dispatch("decode")
+            if result is not None:
+                return result
+            return {}, True
+        pf_lane = self._hb_free_prefill_lane()
+        if pf_lane is not None and self._hb_has_dispatchable_prefill():
+            result = self._hb_dispatch(pf_lane)
+            if result is not None:
+                return result
+        return {}, False
 
     def step_with_batch_queue(
         self,
