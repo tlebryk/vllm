@@ -309,19 +309,18 @@ class CublasLtMatmul:
             # target; some heuristic candidates ignore the target and
             # launch full-GPU grids (132 CTAs on H100), starving the
             # overlapped decode lane.
-            prefs = policy.split(":", 1)[1].split(",")
-            def _family(i: int) -> str:
-                return f"{results[i].algo[4] & 0xFF:02x}"
-            algorithm_index = None
-            for pref in prefs:
-                for i in candidates:
-                    if _family(i) == pref.strip().lower():
-                        algorithm_index = i
-                        break
-                if algorithm_index is not None:
-                    break
-            if algorithm_index is None:
-                algorithm_index = candidates[0]
+            allowed = {
+                pref.strip().lower()
+                for pref in policy.split(":", 1)[1].split(",")
+            }
+            algorithm_index = next(
+                (
+                    i
+                    for i in candidates
+                    if f"{results[i].algo[4] & 0xFF:02x}" in allowed
+                ),
+                candidates[0],
+            )
         elif policy.startswith("rank:"):
             algorithm_index = candidates[
                 min(int(policy.split(":", 1)[1]), len(candidates) - 1)
