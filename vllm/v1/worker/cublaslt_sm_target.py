@@ -311,7 +311,7 @@ class CublasLtMatmul:
             cands = ", ".join(
                 f"[{i}] waves={results[i].waves_count:.2f}"
                 f" ws={results[i].workspace_size}"
-                f" algo={bytes(results[i].algo[:8]).hex()}"
+                f" algo={bytes(b & 0xFF for b in results[i].algo[:8]).hex()}"
                 for i in candidates
             )
             print(
