@@ -24,10 +24,18 @@ class SlackServeGPUWorker(GPUWorker):
     def init_device(self) -> None:
         super().init_device()
         self.decode_stream = torch.cuda.Stream(device=self.device)
-        self.lane_streams = {
-            lane: torch.cuda.Stream(device=self.device)
-            for lane in prefill_lane_names()
-        }
+        # HB_P2_PREFILL_SHARED_STREAM=1 maps every prefill lane onto ONE
+        # CUDA stream: the extra lane then only provides a second in-flight
+        # ticket context (host prep pipelined behind the running ticket)
+        # while the GPU executes prefill tickets strictly in order - no
+        # added SM contention, and same-request KV ordering comes free.
+        shared = os.environ.get("HB_P2_PREFILL_SHARED_STREAM") == "1"
+        self.lane_streams = {}
+        for index, lane in enumerate(prefill_lane_names()):
+            if shared and index > 0:
+                self.lane_streams[lane] = self.lane_streams["prefill"]
+            else:
+                self.lane_streams[lane] = torch.cuda.Stream(device=self.device)
 
     # override factory hook to use new model
     def _create_model_runner(self):
