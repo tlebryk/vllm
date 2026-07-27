@@ -53,14 +53,40 @@ class SlackServeModelRunner(GPUModelRunner):
                 "SlackServeModelRunner requires TP=1 text generation without "
                 "LoRA, speculative decoding, MM, PP/DP/DCP, or async scheduling"
             )
+        # HB_P2_COMPILE_DECODE=1 opts the DECODE lane into vLLM's inductor
+        # (VLLM_COMPILE) compiled callable while the prefill lane(s) stay on the
+        # ORIGINAL eager forward. Safe by construction: the decode lane only ever
+        # *replays* a FULL cudagraph captured over the compiled forward (its
+        # inductor-planned intermediate buffers live at fixed, decode-private
+        # addresses), and the prefill lane is forced onto self.forward via
+        # skip_compiled=True (see execute_model) so it never invokes the compiled
+        # callable and never touches those buffers. Without this flag the two
+        # lanes sharing one compiled callable would race its reused runtime
+        # buffers, hence the guard below.
+        self._compile_decode = os.environ.get("HB_P2_COMPILE_DECODE") == "1"
         if (
             os.environ.get("HB_P2_DECODE_GRAPHS_ONLY") == "1"
             and self.compilation_config.mode != CompilationMode.NONE
+            and not self._compile_decode
         ):
             raise ValueError(
                 "decode-only P2 graphs require compilation mode NONE; "
-                "vLLM's compiled callable has shared runtime buffers"
+                "vLLM's compiled callable has shared runtime buffers. "
+                "Set HB_P2_COMPILE_DECODE=1 to compile the decode lane only "
+                "(prefill stays eager via skip_compiled)."
             )
+        if self._compile_decode:
+            if os.environ.get("HB_P2_DECODE_GRAPHS_ONLY") != "1":
+                raise ValueError(
+                    "HB_P2_COMPILE_DECODE=1 requires HB_P2_DECODE_GRAPHS_ONLY=1: "
+                    "the prefill lane must be pinned to eager (cg NONE + "
+                    "skip_compiled) so it cannot enter the compiled callable."
+                )
+            if self.compilation_config.mode != CompilationMode.VLLM_COMPILE:
+                raise ValueError(
+                    "HB_P2_COMPILE_DECODE=1 requires compilation mode 3 "
+                    f"(VLLM_COMPILE); got mode={self.compilation_config.mode}."
+                )
         # RequestState, sampler, and the logical BlockTables remain the base
         # runner's single source of truth. Tensors overwritten while a forward
         # is prepared are per lane. Decode deliberately owns the base runner's
@@ -259,6 +285,17 @@ class SlackServeModelRunner(GPUModelRunner):
                 num_tokens=num_toks,
                 num_reqs=num_reqs,
             )
+            if self._compile_decode:
+                # HB_P2_COMPILE_DECODE=1: the decode lane owns the inductor
+                # compiled callable. Force the prefill lane onto the ORIGINAL
+                # eager forward (support_torch_compile's __call__ returns
+                # self.forward as soon as skip_compiled is set, BEFORE the
+                # compiled branch). This is the structural guarantee that the
+                # prefill lane cannot enter the compiled callable and therefore
+                # cannot touch the decode graph's inductor-planned buffers. It
+                # also keeps prefill on UnquantizedLinearMethod.apply so the
+                # cuBLASLt SM-cap hook still fires for prefill GEMMs.
+                skip_compiled = True
         if self.is_encoder_decoder and scheduler_output.scheduled_encoder_inputs:
             # Encoder-decoder models such as Whisper should run eager/non-compiled
             # when encoder inputs are scheduled, because this step updates
@@ -388,6 +425,16 @@ class SlackServeModelRunner(GPUModelRunner):
                 has_lora=self.lora_config is not None,
             )
 
+            if self._compile_decode and not skip_compiled:
+                # Reaching the compiled callable (skip_compiled False) is only
+                # legal for the decode lane. Any prefill lane must have taken
+                # the skip_compiled=True branch above; assert it here so a
+                # regression that let prefill share the compiled buffers fails
+                # loudly instead of racing them.
+                assert lane == "decode", (
+                    f"HB_P2_COMPILE_DECODE: lane={lane!r} would enter the "
+                    "compiled callable; only decode may."
+                )
             with set_forward_context(
                 attn_metadata,
                 self.vllm_config,
