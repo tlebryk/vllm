@@ -246,18 +246,49 @@ class ForwardContext:
 
 _forward_context: ForwardContext | None = None
 
+# HB Slack Serve: with HB_FORWARD_CONTEXT_THREADLOCAL=1 the forward context is
+# stored per-thread instead of in this bare module global. vLLM's default is a
+# single engine stepping on one thread, for which the two are identical; the
+# global only races when two in-process engines step on two OS threads (e.g.
+# the PDE embed sidecar beside the two-lane LLM controller), where one
+# thread's context-manager exit resets the global mid-forward on the other,
+# tripping "Forward context is not set". Opt-in and env-gated so every stock
+# and single-engine path stays bit-identical (flag read once at import; the
+# PDE process sets it before importing vllm). This is the thread-local fix
+# RERANK.md sec 7.3 identified as the correct one.
+import os as _os
+import threading as _threading
 
-def get_forward_context() -> ForwardContext:
-    """Get the current forward context."""
-    assert _forward_context is not None, (
-        "Forward context is not set. "
-        "Please use `set_forward_context` to set the forward context."
-    )
+_HB_FC_TLS = _os.environ.get("HB_FORWARD_CONTEXT_THREADLOCAL") == "1"
+_hb_fc_local = _threading.local()
+
+
+def _hb_get_forward_context() -> "ForwardContext | None":
+    if _HB_FC_TLS:
+        return getattr(_hb_fc_local, "ctx", None)
     return _forward_context
 
 
+def _hb_set_forward_context(value: "ForwardContext | None") -> None:
+    global _forward_context
+    if _HB_FC_TLS:
+        _hb_fc_local.ctx = value
+    else:
+        _forward_context = value
+
+
+def get_forward_context() -> ForwardContext:
+    """Get the current forward context."""
+    ctx = _hb_get_forward_context()
+    assert ctx is not None, (
+        "Forward context is not set. "
+        "Please use `set_forward_context` to set the forward context."
+    )
+    return ctx
+
+
 def is_forward_context_available() -> bool:
-    return _forward_context is not None
+    return _hb_get_forward_context() is not None
 
 
 def create_forward_context(
@@ -296,13 +327,12 @@ def override_forward_context(forward_context: ForwardContext | None):
     This is used to override the forward context for a specific
     forward pass.
     """
-    global _forward_context
-    prev_context = _forward_context
-    _forward_context = forward_context
+    prev_context = _hb_get_forward_context()
+    _hb_set_forward_context(forward_context)
     try:
         yield
     finally:
-        _forward_context = prev_context
+        _hb_set_forward_context(prev_context)
 
 
 @contextmanager
