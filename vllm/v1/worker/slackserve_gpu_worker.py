@@ -36,6 +36,24 @@ class SlackServeGPUWorker(GPUWorker):
                 self.lane_streams[lane] = self.lane_streams["prefill"]
             else:
                 self.lane_streams[lane] = torch.cuda.Stream(device=self.device)
+        # Embed sidecar shares the prefill lane's stream; prefill-lane
+        # launches and embed micro-steps are host-serialized by one FIFO
+        # mutex (no kernel interleaving on the dense stream, no
+        # forward-context race, launch-ahead comes free from the stream
+        # FIFO). Runs on the executor thread — the controller never blocks.
+        self._hb_dense_lock = None
+        self._hb_record_prefill_tail = None
+        if os.environ.get("HB_P2_EMBED_SIDECAR") == "1":
+            from vllm.v1.engine.hb_embed_sidecar import (
+                prefill_launch_lock_acquire,
+                prefill_launch_lock_release,
+                record_prefill_tail,
+            )
+            self._hb_dense_lock = (
+                prefill_launch_lock_acquire,
+                prefill_launch_lock_release,
+            )
+            self._hb_record_prefill_tail = record_prefill_tail
 
     # override factory hook to use new model
     def _create_model_runner(self):
@@ -56,20 +74,37 @@ class SlackServeGPUWorker(GPUWorker):
     @torch.inference_mode()
     def execute_model(self, scheduler_output):
         lane = scheduler_output.execution_lane
-        with torch.cuda.stream(self._lane_stream(lane)):
-            output = super().execute_model(scheduler_output)
-            if (
-                output is None
-                and scheduler_output.total_num_scheduled_tokens > 0
-            ):
-                # Enqueue sampling while this ticket's lane-local inputs
-                # and request slots are still current. The returned
-                # AsyncOutput is waited by UniProcExecutor off-thread, so
-                # dispatch remains nonblocking and another lane can launch.
-                return self.model_runner.sample_tokens(
-                    None, lane=lane, return_async=True
-                )
-            return output
+        locked = (
+            self._hb_dense_lock is not None
+            and lane not in ("decode", "default")
+        )
+        if locked:
+            # NVTX spans the lock acquire too, so a trace shows prefill's
+            # wait behind an embed unit as the gap from range-start to the
+            # first prefill kernel.
+            torch.cuda.nvtx.range_push("dense/prefill")
+            self._hb_dense_lock[0]()
+        try:
+            with torch.cuda.stream(self._lane_stream(lane)):
+                output = super().execute_model(scheduler_output)
+                if (
+                    output is None
+                    and scheduler_output.total_num_scheduled_tokens > 0
+                ):
+                    # Enqueue sampling while this ticket's lane-local inputs
+                    # and request slots are still current. The returned
+                    # AsyncOutput is waited by UniProcExecutor off-thread, so
+                    # dispatch remains nonblocking and another lane can launch.
+                    output = self.model_runner.sample_tokens(
+                        None, lane=lane, return_async=True
+                    )
+                if locked:
+                    self._hb_record_prefill_tail(self._lane_stream(lane))
+                return output
+        finally:
+            if locked:
+                self._hb_dense_lock[1]()
+                torch.cuda.nvtx.range_pop()
 
     @torch.inference_mode()
     def sample_tokens(
@@ -80,5 +115,18 @@ class SlackServeGPUWorker(GPUWorker):
         # AsyncOutput's stream() helper restores ``main_stream`` as the
         # ambient stream on exit, so running this on any other stream would
         # silently launch postprocess unordered w.r.t. the sampler.
-        with torch.cuda.stream(self._lane_stream(lane)):
-            return self.model_runner.sample_tokens(grammar_output, lane=lane)
+        locked = (
+            self._hb_dense_lock is not None
+            and lane not in ("decode", "default")
+        )
+        if locked:
+            self._hb_dense_lock[0]()
+        try:
+            with torch.cuda.stream(self._lane_stream(lane)):
+                output = self.model_runner.sample_tokens(grammar_output, lane=lane)
+                if locked:
+                    self._hb_record_prefill_tail(self._lane_stream(lane))
+                return output
+        finally:
+            if locked:
+                self._hb_dense_lock[1]()

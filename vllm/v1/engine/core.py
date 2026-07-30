@@ -218,6 +218,9 @@ class EngineCore:
         self._hb_serve_ready = False
         if os.environ.get("HB_P2_SERVE") == "1":
             self.step_fn = self.step_two_lane
+        # Slack Serve two-model SERVE sidecar (Thread C). Built eagerly below
+        # (default-off unless HB_P2_EMBED_SIDECAR=1).
+        self._hb_embed_sidecar = None
         self.async_scheduling = vllm_config.scheduler_config.async_scheduling
 
         self.aborts_queue = queue.Queue[list[str]]()
@@ -232,6 +235,20 @@ class EngineCore:
         # Enable environment variable cache (e.g. assume no more
         # environment variable overrides after this point)
         enable_envs_cache()
+
+        # Slack Serve two-model SERVE sidecar: build the in-process embedding
+        # engine ONCE, here, before the busy loop starts (no live LLM forward
+        # to race, and the ~60s load stays out of served-request TTFT). Its
+        # build() temporarily disables the envs cache to force an in-process
+        # core. Default-off; requires the two-lane serve controller.
+        if (
+            os.environ.get("HB_P2_EMBED_SIDECAR") == "1"
+            and os.environ.get("HB_P2_SERVE") == "1"
+        ):
+            from vllm.v1.engine.hb_embed_sidecar import HbEmbedSidecar
+
+            self._hb_embed_sidecar = HbEmbedSidecar(self)
+            self._hb_embed_sidecar.build()
 
     @instrument(span_name="Prepare model")
     def _initialize_kv_caches(self, vllm_config: VllmConfig) -> KVCacheConfig:
@@ -507,6 +524,13 @@ class EngineCore:
             self._hb_watermark_unit = chunk_blocks + 256
         self._hb_watermark_skips = 0
         self._hb_empty_dispatches = {lane: 0 for lane in self._hb_lanes}
+        # Three-stream token accounting (HB_TOKLOG): timestamped cumulative
+        # prefill/decode tokens per published ticket, for interior-window
+        # rate comparison (decode+prefill+embed measured separately).
+        self._hb_tok = {"prefill": 0, "decode": 0}
+        toklog = os.environ.get("HB_TOKLOG")
+        self._hb_toklog = open(f"{toklog}.llm.jsonl", "a") if toklog else None
+        self._hb_toklog_n = 0
         self._hb_serve_ready = True
         logger.info(
             "[hb-p2-serve] two-lane serving controller active: lanes=%s "
@@ -562,10 +586,22 @@ class EngineCore:
         """Finish + publish one ready ticket; unblock lanes on real work."""
         model_output = self.finish(ticket)
         engine_core_outputs = self.complete(ticket, model_output)
-        executed = self._hb_ticket_tokens(ticket) > 0
+        tokens = self._hb_ticket_tokens(ticket)
+        executed = tokens > 0
         if executed:
             for name in self._hb_lane_blocked:
                 self._hb_lane_blocked[name] = False
+            if self._hb_toklog is not None:
+                key = "decode" if lane == "decode" else "prefill"
+                self._hb_tok[key] += tokens
+                self._hb_toklog.write(
+                    f'{{"t": {time.monotonic()}, "prefill_tokens_cum": '
+                    f'{self._hb_tok["prefill"]}, "decode_tokens_cum": '
+                    f'{self._hb_tok["decode"]}}}\n'
+                )
+                self._hb_toklog_n += 1
+                if self._hb_toklog_n % 20 == 0:
+                    self._hb_toklog.flush()
         return engine_core_outputs, executed
 
     def _hb_dispatch(
@@ -573,7 +609,12 @@ class EngineCore:
     ) -> tuple[dict[int, EngineCoreOutputs], bool] | None:
         """Dispatch one lane. Returns published outputs if the ticket was empty
         (completed inline and its lane latched blocked); else None with the
-        nonempty ticket stored in flight."""
+        nonempty ticket stored in flight.
+
+        Embed sidecar note: prefill x embed exclusion lives entirely in the
+        shared-dense-stream launch mutex (hb_embed_sidecar.DENSE_LAUNCH_LOCK,
+        taken by SlackServeGPUWorker.execute_model on the executor thread) —
+        the controller never blocks on embed."""
         ticket = self.dispatch(lane)
         if self._hb_ticket_tokens(ticket) > 0:
             self._hb_tickets[lane] = ticket
@@ -593,6 +634,50 @@ class EngineCore:
         """
         self._hb_serve_init()
         tickets = self._hb_tickets
+
+        # Embed sidecar: start its drain THREAD lazily once real load exists
+        # (maybe_start gates on unfinished-request count). The thread runs the
+        # embed engine concurrently on the SHARED dense stream; prefill x
+        # embed launch exclusion is the worker-side mutex, never this loop.
+        sc = self._hb_embed_sidecar
+        if sc is not None:
+            sc.maybe_start()
+            # post_prefill phase gate: latch once ALL prompt KV is computed
+            # (no waiting requests, no mid-prompt running requests, no
+            # in-flight prefill ticket). Latched — finite-N inf benchmark is
+            # monotone; a latch avoids flapping on stray publishes.
+            if (
+                sc.phase == "post_prefill"
+                and not sc.prefill_exhausted
+                and sc._started
+                and self._hb_inflight_prefills() == 0
+                and not self._hb_has_dispatchable_prefill()
+            ):
+                sc.prefill_exhausted = True
+                logger.info("[hb-p2-serve] prefill exhausted -> embed released")
+
+        # HB_NSYS_CAPTURE=1 (nsys --capture-range=cudaProfilerApi): profile
+        # exactly the measured region — start at first real load, stop once
+        # the engine goes idle after having been busy (and, when the sidecar
+        # is present, its drain has finished). Startup/warmup and post-bench
+        # idle are excluded regardless of startup-time jitter.
+        if os.environ.get("HB_NSYS_CAPTURE") == "1":
+            import torch
+            busy = self.scheduler.get_num_unfinished_requests() > 0
+            state = getattr(self, "_hb_nsys_state", "armed")
+            if state == "armed" and self.scheduler.get_num_unfinished_requests() >= 8:
+                torch.cuda.profiler.start()
+                self._hb_nsys_state = "running"
+                logger.info("[hb-nsys] capture START (load detected)")
+            elif (
+                state == "running"
+                and not busy
+                and all(t is None for t in tickets.values())
+                and (sc is None or sc._done)
+            ):
+                torch.cuda.profiler.stop()
+                self._hb_nsys_state = "done"
+                logger.info("[hb-nsys] capture STOP (idle after drain)")
 
         # (a) Publish any ready ticket, decode first.
         for cur in self._hb_lanes:
