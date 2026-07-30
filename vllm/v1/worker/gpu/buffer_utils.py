@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import threading
 from collections.abc import Iterable, Sequence
 from functools import partial
 
@@ -23,6 +24,21 @@ from vllm.utils.torch_utils import (
 # buffer is rewritten. Code that never fences (the ordinary single-lane
 # runner) behaves exactly as before.
 _dirty_pools: list["UvaBufferPool"] = []
+
+# Threads that never participate in fencing (e.g. the Slack Serve embed
+# sidecar's drain thread, whose engine's pools would otherwise be fenced by
+# the LLM runner on the wrong thread/stream — a cross-engine iterate/mutate
+# race) opt out of registration entirely: their pools then behave exactly
+# like the ordinary unfenced single-lane runner.
+_fencing_optout = threading.local()
+
+
+def set_uva_fencing_enabled(enabled: bool) -> None:
+    _fencing_optout.disabled = not enabled
+
+
+def _uva_fencing_enabled() -> bool:
+    return not getattr(_fencing_optout, "disabled", False)
 
 
 def fence_uva_pools(stream: torch.cuda.Stream | None = None) -> None:
@@ -101,9 +117,10 @@ class UvaBufferPool:
             # be in flight; wait before the host rewrites the memory.
             self._events[self._curr].synchronize()
             self._event_pending[self._curr] = False
-        if not self._dirty:
-            _dirty_pools.append(self)
-        self._dirty.add(self._curr)
+        if _uva_fencing_enabled():
+            if not self._dirty:
+                _dirty_pools.append(self)
+            self._dirty.add(self._curr)
         buf = self._uva_bufs[self._curr]
         # CPU-to-CPU copy
         dst = buf.cpu if isinstance(x, torch.Tensor) else buf.np
