@@ -25,13 +25,10 @@ The mutex is the whole mechanism. It simultaneously guarantees:
     kernels are still executing, so the dense stream never idles between
     units — the stream FIFO is the scheduler.
 
-There is NO dispatch policy: no yield-first, no staleness guard, no idle
-watching, no per-step stream drain, no ticket-lifetime gate. The previous
-gate design blocked the controller busy loop ~48 ms per collision (~60% of
-embed steps; 3.0/6.1/12.0 s cumulative at inf N=512/1024/2048 — jobs
-275296/275300/275304), which was the dominant share of the sidecar's
-makespan dilation. Here the only contention is a lock handoff on the
-executor thread of a ~30%-occupied prefill lane.
+There is NO overlap dispatch policy: no yield-first, staleness guard, stream
+drain, or ticket gate. Optional idle uncapping only changes embed's SM target
+after LLM work ends. During overlap, the only contention is a lock handoff on
+the executor thread.
 
 Embed's pooling execute has an inline GPU sync (readback), so the embed
 thread holds the mutex for its full micro-step; budget 4096 keeps that unit
@@ -177,6 +174,10 @@ class HbEmbedSidecar:
             "/mnt/weka/theo/heterogenious-batching-vllm/data/prompts/embed_rag.jsonl",
         )
         self.embed_sm_target = int(os.environ.get("HB_P2_EMBED_SM_TARGET", "96"))
+        # Protect live LLM work, but do not cap an embed-only tail.
+        self.embed_uncap_when_llm_idle = (
+            os.environ.get("HB_P2_EMBED_UNCAP_IDLE", "0") == "1"
+        )
         # Async scheduling pipelines the embed engine's own steps: one
         # get_output() = launch step k+1, then harvest step k (whose forward
         # and D2H already overlapped via AsyncPoolingOutput's copy stream).
@@ -215,6 +216,7 @@ class HbEmbedSidecar:
         self.step_records: list[dict[str, Any]] = []
         self.drain_start = 0.0
         self.drain_end = 0.0
+        self.idle_uncapped_steps = 0
 
     # -- build (eager, at EngineCore init) ---------------------------------
     def build(self) -> None:
@@ -385,7 +387,13 @@ class HbEmbedSidecar:
                     DENSE_LAUNCH_LOCK.release()
                     time.sleep(0.001)
                     continue
-                set_runtime_sm_target(self.embed_sm_target)
+                idle_uncapped = (
+                    self.embed_uncap_when_llm_idle
+                    and self.host_core.scheduler.get_num_unfinished_requests() == 0
+                )
+                set_runtime_sm_target(0 if idle_uncapped else self.embed_sm_target)
+                if idle_uncapped:
+                    self.idle_uncapped_steps += 1
                 step_start = time.perf_counter()
                 pooled_before = len(self.pooled)
                 torch.cuda.nvtx.range_push("dense/embed")
@@ -466,11 +474,13 @@ class HbEmbedSidecar:
         logger.info(
             "[hb-embed-sidecar] HB_SIDECAR_DONE pooled=%d expected=%d drained_frac=%.3f "
             "wall_ms=%.1f steps=%d embed_tokens=%d budget=%d "
+            "idle_uncapped_steps=%d "
             "lock{prefill_wait_ms=%.1f prefill_waits=%d prefill_max_ms=%.1f "
             "embed_wait_ms=%.1f embed_waits=%d embed_max_ms=%.1f} "
             "norm_samples=%s nan=%d",
             len(self.pooled), self.prompt_count, frac, wall_ms,
             len(self.step_records), total_tokens, self.embed_budget,
+            self.idle_uncapped_steps,
             LOCK_STATS["prefill_wait_ms"], LOCK_STATS["prefill_waits"],
             LOCK_STATS["prefill_max_wait_ms"],
             LOCK_STATS["embed_wait_ms"], LOCK_STATS["embed_waits"],
