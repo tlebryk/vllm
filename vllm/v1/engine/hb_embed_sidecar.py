@@ -238,7 +238,13 @@ class HbEmbedSidecar:
         popped = {k: os.environ.pop(k) for k in pop_keys if k in os.environ}
         saved_mp = os.environ.get("VLLM_ENABLE_V1_MULTIPROCESSING")
         os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
-        os.environ["HB_EMBED_SM_COUNT_TARGET"] = str(max(self.embed_sm_target, 1))
+        # Clamp to >=1 so the Lt hook installs even when the starting target
+        # is low (runtime switching needs it). Explicit 0 = hook fully off:
+        # smctrl mask arms want plain torch kernels for embed GEMMs.
+        if self.embed_sm_target > 0:
+            os.environ["HB_EMBED_SM_COUNT_TARGET"] = str(self.embed_sm_target)
+        else:
+            os.environ.pop("HB_EMBED_SM_COUNT_TARGET", None)
         # Isolate the embed torch.compile cache: Qwen3-Embedding-4B and the
         # serve LLM Qwen3-4B are the SAME qwen3 arch and otherwise share vLLM's
         # compile cache; the embed build's (1, embed_budget) shape range then
@@ -292,7 +298,9 @@ class HbEmbedSidecar:
                 f"[hb-embed-sidecar] embed engine is not in-process: {core_name}"
             )
         self.marked_linears = _count_marked_linears(self.engine)
-        if self.marked_linears <= 0:
+        if self.marked_linears <= 0 and self.embed_sm_target > 0:
+            # With an explicit target of 0 the Lt hook is intentionally off
+            # (smctrl mask arms use plain torch kernels for embed GEMMs).
             raise RuntimeError("[hb-embed-sidecar] SM hook marked no embed linears")
 
         # Flush any UVA pools the embed build/warmup registered on THIS
@@ -392,6 +400,12 @@ class HbEmbedSidecar:
                     and self.host_core.scheduler.get_num_unfinished_requests() == 0
                 )
                 set_runtime_sm_target(0 if idle_uncapped else self.embed_sm_target)
+                # smctrl arms: mirror the Lt uncap on the stream TPC mask so
+                # an embed-only tail gets the whole GPU back (no-op unless
+                # HB_SMCTRL_* is configured).
+                from vllm.v1.worker.hb_smctrl import apply_prefill_uncap
+
+                apply_prefill_uncap(dense_stream, idle_uncapped)
                 if idle_uncapped:
                     self.idle_uncapped_steps += 1
                 step_start = time.perf_counter()

@@ -41,6 +41,17 @@ class SlackServeGPUWorker(GPUWorker):
         # mutex (no kernel interleaving on the dense stream, no
         # forward-context race, launch-ahead comes free from the stream
         # FIFO). Runs on the executor thread — the controller never blocks.
+        # Optional libsmctrl TPC placement masks (HB_SMCTRL_*). The embed
+        # sidecar shares the prefill lane's stream, so the prefill mask
+        # covers embed launches too.
+        if os.environ.get("HB_SMCTRL_LIB"):
+            from vllm.v1.worker.hb_smctrl import apply_env_masks
+            apply_env_masks(
+                {
+                    "prefill": self.lane_streams["prefill"],
+                    "decode": self.decode_stream,
+                }
+            )
         self._hb_dense_lock = None
         self._hb_record_prefill_tail = None
         if os.environ.get("HB_P2_EMBED_SIDECAR") == "1":
