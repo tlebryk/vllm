@@ -1,6 +1,7 @@
+import json
 import os
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 
 import torch
 
@@ -8,6 +9,7 @@ from vllm.config import VllmConfig
 from vllm.config.compilation import CompilationMode, CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.sequence import IntermediateTensors
+from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.fa_utils import flash_attn_scheduler_sm_margin
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.outputs import ModelRunnerOutput
@@ -34,6 +36,20 @@ from vllm.v1.worker.gpu.model_runner import (
     pp_receive,
 )
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner as ClassicGPUModelRunner
+
+
+@dataclass
+class _MineDraftHandoff:
+    wave: int
+    request_ids: list[str]
+    target_token_ids: torch.Tensor
+    target_positions: torch.Tensor
+    target_hidden_states: torch.Tensor
+    next_token_ids: torch.Tensor
+    token_indices_to_sample: torch.Tensor | None
+    sampling_metadata: object
+    common_attn_metadata: CommonAttentionMetadata
+    num_rejected_tokens_gpu: torch.Tensor | None
 
 
 class SlackServeSpecModelRunner(ClassicGPUModelRunner):
@@ -67,18 +83,459 @@ class SlackServeSpecModelRunner(ClassicGPUModelRunner):
         self._hb_draft_stream = torch.cuda.Stream(device=device)
         self._hb_target_ready = torch.cuda.Event()
         self._hb_draft_done = torch.cuda.Event()
+        self._hb_minedraft = os.environ.get("HB_MINEDRAFT_SERIAL") == "1"
+        self._hb_minedraft_step = 0
+        self._hb_pending_handoff: _MineDraftHandoff | None = None
+        self._hb_return_req_ids: list[str] | None = None
+        self._hb_released_req_ids: list[str] = []
+        self._hb_step_log = None
+        if self._hb_minedraft:
+            if self.use_async_scheduling:
+                raise ValueError(
+                    "HB_MINEDRAFT_SERIAL does not support async scheduling"
+                )
+            if spec_config.disable_padded_drafter_batch:
+                raise ValueError(
+                    "HB_MINEDRAFT_SERIAL requires the padded draft-model path"
+                )
+            log_path = os.environ.get("HB_MINEDRAFT_STEP_LOG")
+            if not log_path:
+                raise ValueError(
+                    "HB_MINEDRAFT_SERIAL=1 requires HB_MINEDRAFT_STEP_LOG"
+                )
+            # The runner owns this process-lifetime line-buffered trace.
+            self._hb_step_log = open(log_path, "a", buffering=1)  # noqa: SIM115
+
+    def _write_minedraft_step(self, record: dict) -> None:
+        if self._hb_step_log is not None:
+            self._hb_step_log.write(json.dumps(record, sort_keys=True) + "\n")
+
+    def _release_minedraft_handoff(
+        self,
+        handoff: _MineDraftHandoff,
+        scheduler_output: SchedulerOutput,
+        reason: str,
+    ) -> None:
+        self._hb_released_req_ids.extend(handoff.request_ids)
+        self._write_minedraft_step(
+            {
+                "record_type": "handoff_release",
+                "phase": scheduler_output.minedraft_phase,
+                "reason": reason,
+                "wave": handoff.wave,
+                "request_ids": handoff.request_ids,
+                "finished_request_ids": sorted(
+                    set(handoff.request_ids).intersection(
+                        scheduler_output.finished_req_ids or ()
+                    )
+                ),
+                "preempted_request_ids": sorted(
+                    set(handoff.request_ids).intersection(
+                        scheduler_output.preempted_req_ids or ()
+                    )
+                ),
+            }
+        )
+
+    def take_minedraft_released_req_ids(self) -> list[str]:
+        released, self._hb_released_req_ids = self._hb_released_req_ids, []
+        return released
+
+    @staticmethod
+    def _clone_common_attn_metadata(
+        metadata: CommonAttentionMetadata,
+    ) -> CommonAttentionMetadata:
+        values = {}
+        for field in fields(metadata):
+            value = getattr(metadata, field.name)
+            if torch.is_tensor(value):
+                value = value.clone()
+            elif hasattr(value, "copy") and value is not None:
+                value = value.copy()
+            values[field.name] = value
+        return CommonAttentionMetadata(**values)
+
+    def _prepare_minedraft_handoff(
+        self,
+        scheduler_output,
+        sampled_token_ids,
+        sampling_metadata,
+        hidden_states,
+        spec_decode_metadata,
+        common_attn_metadata,
+    ) -> _MineDraftHandoff:
+        assert torch.is_tensor(sampled_token_ids)
+        if not sampling_metadata.all_greedy:
+            raise ValueError("HB_MINEDRAFT_SERIAL currently requires greedy sampling")
+        if self.supports_mm_inputs:
+            raise ValueError("HB_MINEDRAFT_SERIAL does not support multimodal inputs")
+
+        next_token_ids, valid_sampled_tokens_count = (
+            self.drafter.prepare_next_token_ids_padded(
+                common_attn_metadata,
+                sampled_token_ids,
+                self.requests,
+                self.input_batch,
+                self.discard_request_mask.gpu,
+            )
+        )
+        if spec_decode_metadata is None:
+            token_indices_to_sample = None
+            num_rejected_tokens_gpu = None
+            draft_attn_metadata = common_attn_metadata
+        else:
+            (
+                draft_attn_metadata,
+                token_indices_to_sample,
+                num_rejected_tokens_gpu,
+            ) = self.drafter.prepare_inputs_padded(
+                common_attn_metadata,
+                spec_decode_metadata,
+                valid_sampled_tokens_count,
+            )
+
+        num_tokens = draft_attn_metadata.num_actual_tokens
+        wave = scheduler_output.minedraft_verify_wave
+        assert wave is not None
+        request_ids = self.input_batch.req_ids.copy()
+        assigned_ids = set(scheduler_output.minedraft_verify_req_ids)
+        assigned_ids.update(scheduler_output.minedraft_prefill_req_ids)
+        if set(request_ids) != assigned_ids:
+            raise RuntimeError(
+                "MineDraft handoff rows do not match the scheduler wave: "
+                f"runner={request_ids}, scheduler={sorted(assigned_ids)}"
+            )
+        wrong_wave = [
+            req_id
+            for req_id in request_ids
+            if req_id
+            not in scheduler_output.minedraft_group_members.get(wave, ())
+        ]
+        if wrong_wave:
+            raise RuntimeError(
+                f"MineDraft handoff includes rows outside wave {wave}: {wrong_wave}"
+            )
+        return _MineDraftHandoff(
+            wave=wave,
+            request_ids=request_ids,
+            target_token_ids=self.input_ids.gpu[:num_tokens].clone(),
+            target_positions=self._get_positions(num_tokens).clone(),
+            # DraftModelProposer does not consume target hidden states, but its
+            # shared interface requires the argument.
+            target_hidden_states=hidden_states[:0],
+            next_token_ids=next_token_ids.clone(),
+            token_indices_to_sample=(
+                token_indices_to_sample.clone()
+                if token_indices_to_sample is not None
+                else None
+            ),
+            sampling_metadata=sampling_metadata,
+            common_attn_metadata=self._clone_common_attn_metadata(
+                draft_attn_metadata
+            ),
+            num_rejected_tokens_gpu=(
+                num_rejected_tokens_gpu.clone()
+                if num_rejected_tokens_gpu is not None
+                else None
+            ),
+        )
+
+    def _launch_minedraft_handoff(
+        self, handoff: _MineDraftHandoff
+    ) -> torch.Tensor:
+        return self.drafter.propose(
+            target_token_ids=handoff.target_token_ids,
+            target_positions=handoff.target_positions,
+            target_hidden_states=handoff.target_hidden_states,
+            next_token_ids=handoff.next_token_ids,
+            token_indices_to_sample=handoff.token_indices_to_sample,
+            sampling_metadata=handoff.sampling_metadata,
+            common_attn_metadata=handoff.common_attn_metadata,
+            mm_embed_inputs=None,
+            num_rejected_tokens_gpu=handoff.num_rejected_tokens_gpu,
+            slot_mappings=None,
+        )
 
     @torch.inference_mode()
     def propose_draft_token_ids(self, *args, **kwargs):
+        scheduler_output = args[0]
         target_stream = torch.cuda.current_stream(self.device)
         self._hb_target_ready.record(target_stream)
         with torch.cuda.stream(self._hb_draft_stream):
             self._hb_draft_stream.wait_event(self._hb_target_ready)
             with torch.cuda.nvtx.range("slackserve_spec/draft"):
-                draft_token_ids = super().propose_draft_token_ids(*args, **kwargs)
+                verify_ids = scheduler_output.minedraft_verify_req_ids
+                group_members = scheduler_output.minedraft_group_members
+                pending = self._hb_pending_handoff
+                if pending is not None:
+                    pending_ids = set(pending.request_ids)
+                    pinned_ids = set(scheduler_output.minedraft_pinned_req_ids)
+                    if not pending_ids.issubset(pinned_ids):
+                        raise RuntimeError(
+                            "MineDraft retained handoff lost KV ownership: "
+                            f"{sorted(pending_ids - pinned_ids)}"
+                        )
+                    preempted = pending_ids.intersection(
+                        scheduler_output.preempted_req_ids or ()
+                    )
+                    if preempted:
+                        raise RuntimeError(
+                            "MineDraft retained handoff was preempted: "
+                            f"{sorted(preempted)}"
+                        )
+                if not self._hb_minedraft or not verify_ids:
+                    # Priming barrier: target/drafter prefill and initial
+                    # proposals run together for every newly admitted row.
+                    self._hb_return_req_ids = None
+                    draft_token_ids = super().propose_draft_token_ids(
+                        *args, **kwargs
+                    )
+                    if scheduler_output.minedraft_phase in (
+                        "bootstrap",
+                        "refill_priming",
+                    ):
+                        prefill_ids = scheduler_output.minedraft_prefill_req_ids
+                        self._write_minedraft_step(
+                            {
+                                "record_type": "priming_stage",
+                                "phase": scheduler_output.minedraft_phase,
+                                "request_ids": self.input_batch.req_ids.copy(),
+                                "prefill_request_ids": (
+                                    scheduler_output.minedraft_prefill_req_ids
+                                ),
+                                "group_members": (
+                                    scheduler_output.minedraft_group_members
+                                ),
+                                "target_tokens_scheduled": sum(
+                                    scheduler_output.num_scheduled_tokens[req_id]
+                                    for req_id in prefill_ids
+                                ),
+                                "spec_tokens_verified": sum(
+                                    len(
+                                        scheduler_output.scheduled_spec_decode_tokens.get(
+                                            req_id, ()
+                                        )
+                                    )
+                                    for req_id in prefill_ids
+                                ),
+                                "logical_draft_tokens_proposed": (
+                                    len(prefill_ids) * self.num_spec_tokens
+                                ),
+                                "logical_draft_tokens_executed": (
+                                    len(prefill_ids) * self.num_spec_tokens
+                                ),
+                                "physical_draft_tokens_proposed": int(
+                                    draft_token_ids.numel()
+                                ),
+                                "pinned_request_ids": (
+                                    scheduler_output.minedraft_pinned_req_ids
+                                ),
+                            }
+                        )
+                else:
+                    current = self._prepare_minedraft_handoff(
+                        scheduler_output=scheduler_output,
+                        sampled_token_ids=args[1],
+                        sampling_metadata=args[2],
+                        hidden_states=args[3],
+                        spec_decode_metadata=args[6],
+                        common_attn_metadata=args[7],
+                    )
+                    tail_fallback = (
+                        not group_members.get(0) or not group_members.get(1)
+                    )
+                    if tail_fallback:
+                        # A single surviving wave has no independent target
+                        # partner. Fall back to correct stock ordering instead
+                        # of verifying without its next proposal.
+                        catchup_token_ids = None
+                        catchup_ids: list[str] = []
+                        if pending is not None:
+                            visible_ids = {
+                                req_id
+                                for req_ids in group_members.values()
+                                for req_id in req_ids
+                            }
+                            live_pending_ids = set(pending.request_ids).intersection(
+                                visible_ids
+                            )
+                            if live_pending_ids:
+                                # Advance the retained wave's draft KV before
+                                # producing a fresh same-wave tail proposal.
+                                catchup_token_ids = self._launch_minedraft_handoff(
+                                    pending
+                                )
+                                catchup_ids = pending.request_ids.copy()
+                                reason = "tail_catchup"
+                            else:
+                                reason = "cancelled_tail_dead"
+                            self._release_minedraft_handoff(
+                                pending, scheduler_output, reason
+                            )
+                        self._hb_pending_handoff = None
+                        draft_token_ids = self._launch_minedraft_handoff(current)
+                        self._hb_return_req_ids = current.request_ids.copy()
+                        self._write_minedraft_step(
+                            {
+                                "record_type": "physical_stage",
+                                "phase": "tail",
+                                "step": self._hb_minedraft_step,
+                                "overlap": False,
+                                "physical_order": (
+                                    ["target_verify", "draft_catchup", "draft"]
+                                    if catchup_ids
+                                    else ["target_verify", "draft"]
+                                ),
+                                "verify_wave": current.wave,
+                                "draft_wave": current.wave,
+                                "verify_request_ids": current.request_ids,
+                                "draft_request_ids": current.request_ids,
+                                "catchup_draft_request_ids": catchup_ids,
+                                "prepared_next_draft_request_ids": [],
+                                "verify_request_count": len(current.request_ids),
+                                "draft_request_count": len(current.request_ids),
+                                "target_tokens_scheduled": sum(
+                                    scheduler_output.num_scheduled_tokens[req_id]
+                                    for req_id in verify_ids
+                                ),
+                                "spec_tokens_verified": sum(
+                                    len(
+                                        scheduler_output.scheduled_spec_decode_tokens.get(
+                                            req_id, ()
+                                        )
+                                    )
+                                    for req_id in verify_ids
+                                ),
+                                "logical_draft_tokens_proposed": (
+                                    len(current.request_ids) * self.num_spec_tokens
+                                ),
+                                "logical_draft_tokens_executed": (
+                                    (len(current.request_ids) + len(catchup_ids))
+                                    * self.num_spec_tokens
+                                ),
+                                "physical_draft_tokens_proposed": int(
+                                    draft_token_ids.numel()
+                                )
+                                + (
+                                    int(catchup_token_ids.numel())
+                                    if catchup_token_ids is not None
+                                    else 0
+                                ),
+                                "prefill_request_ids": [],
+                                "group_members": group_members,
+                                "tail_fallback": True,
+                                "pinned_request_ids": (
+                                    scheduler_output.minedraft_pinned_req_ids
+                                ),
+                            }
+                        )
+                        self._hb_minedraft_step += 1
+                    else:
+                        self._hb_pending_handoff = current
+                    if not tail_fallback and pending is None:
+                        # First verify wave fills the delayed-proposal slot.
+                        self._hb_return_req_ids = []
+                        draft_token_ids = torch.empty(
+                            (0, self.num_spec_tokens),
+                            dtype=torch.int32,
+                            device=self.device,
+                        )
+                        self._write_minedraft_step(
+                            {
+                                "record_type": "pipeline_fill",
+                                "phase": scheduler_output.minedraft_phase,
+                                "verify_wave": current.wave,
+                                "verify_request_ids": current.request_ids,
+                                "prepared_draft_request_ids": current.request_ids,
+                                "target_tokens_scheduled": sum(
+                                    scheduler_output.num_scheduled_tokens[req_id]
+                                    for req_id in verify_ids
+                                ),
+                                "spec_tokens_verified": sum(
+                                    len(
+                                        scheduler_output.scheduled_spec_decode_tokens.get(
+                                            req_id, ()
+                                        )
+                                    )
+                                    for req_id in verify_ids
+                                ),
+                                "logical_draft_tokens_prepared": (
+                                    len(current.request_ids) * self.num_spec_tokens
+                                ),
+                                "group_members": group_members,
+                                "pinned_request_ids": (
+                                    scheduler_output.minedraft_pinned_req_ids
+                                ),
+                            }
+                        )
+                    elif not tail_fallback:
+                        draft_token_ids = self._launch_minedraft_handoff(pending)
+                        self._release_minedraft_handoff(
+                            pending, scheduler_output, "launched"
+                        )
+                        self._hb_return_req_ids = pending.request_ids.copy()
+                        if pending.wave == current.wave:
+                            raise RuntimeError(
+                                "MineDraft steady-state draft and verify waves match"
+                            )
+                        if set(pending.request_ids) & set(verify_ids):
+                            raise RuntimeError(
+                                "MineDraft steady-state draft and verify IDs overlap"
+                            )
+                        self._write_minedraft_step(
+                            {
+                                "record_type": "physical_stage",
+                                "phase": scheduler_output.minedraft_phase,
+                                "step": self._hb_minedraft_step,
+                                "overlap": False,
+                                "physical_order": ["target_verify", "draft"],
+                                "verify_wave": current.wave,
+                                "draft_wave": pending.wave,
+                                "verify_request_ids": current.request_ids,
+                                "draft_request_ids": pending.request_ids,
+                                "prepared_next_draft_request_ids": current.request_ids,
+                                "verify_request_count": len(current.request_ids),
+                                "draft_request_count": len(pending.request_ids),
+                                "target_tokens_scheduled": sum(
+                                    scheduler_output.num_scheduled_tokens[req_id]
+                                    for req_id in verify_ids
+                                ),
+                                "spec_tokens_verified": sum(
+                                    len(
+                                        scheduler_output.scheduled_spec_decode_tokens.get(
+                                            req_id, ()
+                                        )
+                                    )
+                                    for req_id in verify_ids
+                                ),
+                                "logical_draft_tokens_proposed": (
+                                    len(pending.request_ids) * self.num_spec_tokens
+                                ),
+                                "logical_draft_tokens_executed": (
+                                    len(pending.request_ids) * self.num_spec_tokens
+                                ),
+                                "physical_draft_tokens_proposed": int(
+                                    draft_token_ids.numel()
+                                ),
+                                "prefill_request_ids": (
+                                    scheduler_output.minedraft_prefill_req_ids
+                                ),
+                                "group_members": group_members,
+                                "tail_fallback": tail_fallback,
+                                "pinned_request_ids": (
+                                    scheduler_output.minedraft_pinned_req_ids
+                                ),
+                            }
+                        )
+                        self._hb_minedraft_step += 1
             self._hb_draft_done.record(self._hb_draft_stream)
         target_stream.wait_event(self._hb_draft_done)
         return draft_token_ids
+
+    def _copy_draft_token_ids_to_cpu(self, scheduler_output, zeros_only=False):
+        super()._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only)
+        if self._hb_minedraft and self._hb_return_req_ids is not None:
+            self._draft_token_req_ids = self._hb_return_req_ids.copy()
 
 class SlackServeModelRunner(GPUModelRunner):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):

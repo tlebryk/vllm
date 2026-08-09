@@ -253,6 +253,10 @@ class ModelRunnerOutput:
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
 
+    # MineDraft POC acknowledgement. These request IDs retained their KV
+    # ownership until the delayed proposal was launched or safely cancelled.
+    minedraft_released_req_ids: list[str] = field(default_factory=list)
+
 
 # ModelRunnerOutput wrapper for async scheduling.
 class AsyncModelRunnerOutput(ABC):

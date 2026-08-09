@@ -80,6 +80,13 @@ class SlackServeGPUWorker(GPUWorker):
                     "HB_SPEC_SERVE is the serialized Phase-A profile and is "
                     "mutually exclusive with HB_P2_SERVE"
                 )
+            if (
+                os.environ.get("HB_MINEDRAFT_SERIAL") == "1"
+                and not os.environ.get("HB_MINEDRAFT_STEP_LOG")
+            ):
+                raise ValueError(
+                    "HB_MINEDRAFT_SERIAL requires HB_MINEDRAFT_STEP_LOG"
+                )
             return SlackServeSpecModelRunner(self.vllm_config, self.device)
         return SlackServeModelRunner(self.vllm_config, self.device)
 
@@ -92,6 +99,18 @@ class SlackServeGPUWorker(GPUWorker):
             raise ValueError(f"Unknown execution lane: {lane!r}")
         return stream
 
+    def _attach_minedraft_release(
+        self, output: ModelRunnerOutput | AsyncModelRunnerOutput | None
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+        if output is None or os.environ.get("HB_MINEDRAFT_SERIAL") != "1":
+            return output
+        if not isinstance(output, ModelRunnerOutput):
+            raise RuntimeError("MineDraft requires synchronous ModelRunnerOutput")
+        output.minedraft_released_req_ids = (
+            self.model_runner.take_minedraft_released_req_ids()
+        )
+        return output
+
     @torch.inference_mode()
     def execute_model(self, scheduler_output):
         lane = scheduler_output.execution_lane
@@ -101,7 +120,8 @@ class SlackServeGPUWorker(GPUWorker):
             # execute -> EngineCore grammar -> sample lifecycle; the modular
             # P2 runner below instead samples lane-locally.
             with torch.cuda.stream(self._lane_stream("decode")):
-                return super().execute_model(scheduler_output)
+                output = super().execute_model(scheduler_output)
+                return self._attach_minedraft_release(output)
         locked = (
             self._hb_dense_lock is not None
             and lane not in ("decode", "default")
@@ -145,7 +165,10 @@ class SlackServeGPUWorker(GPUWorker):
         # silently launch postprocess unordered w.r.t. the sampler.
         if os.environ.get("HB_SPEC_SERVE") == "1":
             with torch.cuda.stream(self._lane_stream("decode")):
-                return super().sample_tokens(grammar_output)
+                output = super().sample_tokens(grammar_output)
+                attached = self._attach_minedraft_release(output)
+                assert attached is not None
+                return attached
         locked = (
             self._hb_dense_lock is not None
             and lane not in ("decode", "default")

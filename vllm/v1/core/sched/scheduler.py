@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -105,6 +106,32 @@ class Scheduler(SchedulerInterface):
         # until EngineCore finalizes that ticket.
         self._hb_inflight_req_ids: set[str] = set()
         self._hb_preemptions_by_lane: dict[str, int] = defaultdict(int)
+        self._hb_minedraft_enabled = os.environ.get("HB_MINEDRAFT_SERIAL") == "1"
+        self._hb_minedraft_wave = 0
+        self._hb_minedraft_groups: dict[str, int] = {}
+        self._hb_minedraft_pinned_req_ids: set[str] = set()
+        self._hb_minedraft_seen_req_ids: set[str] = set()
+        self._hb_minedraft_bootstrapped = False
+        self._hb_minedraft_prefix = os.environ.get("HB_MINEDRAFT_REQUEST_PREFIX", "")
+        self._hb_minedraft_batch_size = int(
+            os.environ.get("HB_MINEDRAFT_BATCH_SIZE", "16")
+        )
+        self._hb_minedraft_total_requests = int(
+            os.environ.get("HB_MINEDRAFT_TOTAL_REQUESTS", "128")
+        )
+        if self._hb_minedraft_enabled:
+            if not self._hb_minedraft_prefix:
+                raise ValueError(
+                    "HB_MINEDRAFT_SERIAL requires HB_MINEDRAFT_REQUEST_PREFIX"
+                )
+            if self._hb_minedraft_batch_size <= 0:
+                raise ValueError("HB_MINEDRAFT_BATCH_SIZE must be positive")
+            if self._hb_minedraft_batch_size % 2:
+                raise ValueError("HB_MINEDRAFT_BATCH_SIZE must be even")
+            if self._hb_minedraft_total_requests < self._hb_minedraft_batch_size:
+                raise ValueError(
+                    "HB_MINEDRAFT_TOTAL_REQUESTS must cover the bootstrap batch"
+                )
 
         # Scheduling constraints.
         self.max_num_running_reqs = self.scheduler_config.max_num_seqs
@@ -357,6 +384,95 @@ class Scheduler(SchedulerInterface):
         if lane not in ("default", "prefill", "prefill1", "decode"):
             raise ValueError(f"Unknown execution lane: {lane!r}")
 
+        minedraft_wave: int | None = None
+        minedraft_groups: dict[int, list[str]] = {}
+        minedraft_priming = False
+        minedraft_waiting_for_cohort = False
+        minedraft_refill_expected = False
+        if self._hb_minedraft_enabled:
+            if lane != "default":
+                raise ValueError("HB_MINEDRAFT_SERIAL only supports the default lane")
+
+            def is_minedraft_request(request: Request) -> bool:
+                return request.request_id.startswith(self._hb_minedraft_prefix)
+
+            main_requests = [
+                request
+                for request in self.requests.values()
+                if is_minedraft_request(request) and not request.is_finished()
+            ]
+            self._hb_minedraft_seen_req_ids.update(
+                request.request_id for request in main_requests
+            )
+            main_waiting_ids = {
+                request.request_id
+                for request in itertools.chain(self.waiting, self.skipped_waiting)
+                if is_minedraft_request(request)
+            }
+
+            # MineDraft assigns a request to one stable sub-batch for its whole
+            # decode lifetime. Assign newly decode-ready requests to the
+            # smaller live group; ties alternate deterministically.
+            live_ids = {request.request_id for request in main_requests}
+            for req_id in tuple(self._hb_minedraft_groups):
+                if req_id not in live_ids:
+                    del self._hb_minedraft_groups[req_id]
+            group_sizes = [0, 0]
+            for req_id, group in self._hb_minedraft_groups.items():
+                request = self.requests.get(req_id)
+                if request is not None and not request.is_finished():
+                    group_sizes[group] += 1
+            for request in self.running:
+                if (
+                    is_minedraft_request(request)
+                    and not request.is_finished()
+                    and request.num_computed_tokens >= request.num_prompt_tokens
+                    and request.request_id not in self._hb_minedraft_groups
+                ):
+                    group = 0 if group_sizes[0] <= group_sizes[1] else 1
+                    self._hb_minedraft_groups[request.request_id] = group
+                    group_sizes[group] += 1
+
+            minedraft_groups = {
+                group: [
+                    request.request_id
+                    for request in self.running
+                    if is_minedraft_request(request)
+                    and self._hb_minedraft_groups.get(request.request_id) == group
+                    and request.num_computed_tokens >= request.num_prompt_tokens
+                ]
+                for group in (0, 1)
+            }
+            partial_main = any(
+                is_minedraft_request(request)
+                and request.num_computed_tokens < request.num_prompt_tokens
+                for request in self.running
+            )
+            active_main = len(main_requests)
+            cohort_size = self._hb_minedraft_batch_size
+            expect_more = (
+                len(self._hb_minedraft_seen_req_ids)
+                < self._hb_minedraft_total_requests
+            )
+            minedraft_waiting_for_cohort = active_main < cohort_size and (
+                not self._hb_minedraft_bootstrapped or expect_more
+            )
+            minedraft_priming = (
+                not minedraft_waiting_for_cohort
+                and (bool(main_waiting_ids) or partial_main)
+            )
+            minedraft_refill_expected = (
+                self._hb_minedraft_bootstrapped and minedraft_priming
+            )
+            minedraft_wave = self._hb_minedraft_wave
+            if (
+                not minedraft_groups[minedraft_wave]
+                and minedraft_groups[1 - minedraft_wave]
+            ):
+                # Drain the surviving tail instead of inserting empty steps.
+                minedraft_wave = 1 - minedraft_wave
+                self._hb_minedraft_wave = minedraft_wave
+
         # P1 Slack Serve policy. The caller selects a lane; the scheduler
         # constrains its otherwise normal admission policy to that phase.
         # A request becomes decode-ready after its prompt KV has been computed.
@@ -365,7 +481,21 @@ class Scheduler(SchedulerInterface):
             if request.request_id in self._hb_inflight_req_ids:
                 return False
             if lane == "default":
-                return True
+                if not self._hb_minedraft_enabled:
+                    return True
+                if not is_minedraft_request(request):
+                    return True
+                is_decode_ready = (
+                    request.num_computed_tokens >= request.num_prompt_tokens
+                )
+                if minedraft_waiting_for_cohort:
+                    return False
+                if not is_decode_ready:
+                    return True
+                if minedraft_priming:
+                    return False
+                assert minedraft_wave is not None
+                return self._hb_minedraft_groups[request.request_id] == minedraft_wave
             is_decode_ready = request.num_computed_tokens >= request.num_prompt_tokens
             return is_decode_ready if lane == "decode" else not is_decode_ready
 
@@ -953,6 +1083,105 @@ class Scheduler(SchedulerInterface):
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
         )
+        if self._hb_minedraft_enabled:
+            assert minedraft_wave is not None
+            scheduled_ids = set(num_scheduled_tokens)
+            verify_req_ids = [
+                req_id
+                for req_id in minedraft_groups[minedraft_wave]
+                if req_id in scheduled_ids
+            ]
+            verify_set = set(verify_req_ids)
+            prefill_req_ids = [
+                req_id
+                for req_id in num_scheduled_tokens
+                if req_id not in verify_set
+                and req_id.startswith(self._hb_minedraft_prefix)
+            ]
+            if verify_req_ids and prefill_req_ids:
+                raise RuntimeError(
+                    "MineDraft priming barrier scheduled prefill and decode together"
+                )
+            # Priming rows get an immediate drafter prefill/initial proposal,
+            # then join the smaller stable decode group. They are never mixed
+            # into a retained decode-wave handoff.
+            assigned_sizes = [
+                sum(group == candidate for group in self._hb_minedraft_groups.values())
+                for candidate in (0, 1)
+            ]
+            for req_id in prefill_req_ids:
+                if req_id in self._hb_minedraft_groups:
+                    continue
+                group = 0 if assigned_sizes[0] <= assigned_sizes[1] else 1
+                self._hb_minedraft_groups[req_id] = group
+                assigned_sizes[group] += 1
+            minedraft_groups = {
+                group: [
+                    request.request_id
+                    # Newly admitted prefills have not moved to ``running``
+                    # until _update_after_schedule. MineDraft's batch-flag
+                    # assignment is admission-time, so report mapped active
+                    # requests directly instead of observing the old queue.
+                    for request in self.requests.values()
+                    if request.request_id.startswith(self._hb_minedraft_prefix)
+                    and not request.is_finished()
+                    and self._hb_minedraft_groups.get(request.request_id) == group
+                ]
+                for group in (0, 1)
+            }
+            scheduler_output.minedraft_verify_wave = minedraft_wave
+            scheduler_output.minedraft_verify_req_ids = verify_req_ids
+            scheduler_output.minedraft_prefill_req_ids = prefill_req_ids
+            scheduler_output.minedraft_group_members = minedraft_groups
+            if prefill_req_ids:
+                scheduler_output.minedraft_phase = (
+                    "refill_priming"
+                    if self._hb_minedraft_bootstrapped
+                    else "bootstrap"
+                )
+                if (
+                    not self._hb_minedraft_bootstrapped
+                    and len(minedraft_groups[0])
+                    == len(minedraft_groups[1])
+                    == self._hb_minedraft_batch_size // 2
+                ):
+                    self._hb_minedraft_bootstrapped = True
+            elif verify_req_ids:
+                scheduler_output.minedraft_phase = (
+                    "steady"
+                    if minedraft_groups[0] and minedraft_groups[1]
+                    else "tail"
+                )
+            else:
+                scheduler_output.minedraft_phase = (
+                    "cohort_wait" if minedraft_waiting_for_cohort else "idle"
+                )
+            if (
+                (minedraft_refill_expected or not self._hb_minedraft_bootstrapped)
+                and minedraft_priming
+                and not prefill_req_ids
+            ):
+                raise RuntimeError(
+                    "MineDraft priming admitted zero main-request tokens; "
+                    "the fixed C=16 POC requires a KV-safe refill"
+                )
+            main_preemptions = {
+                req_id
+                for req_id in scheduler_output.preempted_req_ids or ()
+                if req_id.startswith(self._hb_minedraft_prefix)
+            }
+            if main_preemptions:
+                raise RuntimeError(
+                    "MineDraft fixed-queue POC does not permit preemption: "
+                    f"{sorted(main_preemptions)}"
+                )
+            if scheduler_output.minedraft_phase == "steady":
+                self._hb_minedraft_pinned_req_ids.update(verify_req_ids)
+            scheduler_output.minedraft_pinned_req_ids = sorted(
+                self._hb_minedraft_pinned_req_ids
+            )
+            if verify_req_ids:
+                self._hb_minedraft_wave = 1 - minedraft_wave
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store
@@ -1346,6 +1575,22 @@ class Scheduler(SchedulerInterface):
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
+
+        released_req_ids = set(model_runner_output.minedraft_released_req_ids)
+        if released_req_ids:
+            unexpected = released_req_ids.difference(
+                self._hb_minedraft_pinned_req_ids
+            )
+            if unexpected:
+                raise RuntimeError(
+                    "MineDraft released requests without retained KV ownership: "
+                    f"{sorted(unexpected)}"
+                )
+            self._hb_minedraft_pinned_req_ids.difference_update(released_req_ids)
+            for req_id in released_req_ids:
+                request = self.requests.get(req_id)
+                if request is not None and request.is_finished():
+                    self._free_blocks(request)
 
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
@@ -1866,6 +2111,8 @@ class Scheduler(SchedulerInterface):
             self.finished_req_ids_dict[request.client_index].add(request_id)
 
         delay_free_blocks |= connector_delay_free_blocks
+        if request_id in self._hb_minedraft_pinned_req_ids:
+            delay_free_blocks = True
         if not delay_free_blocks:
             self._free_blocks(request)
 

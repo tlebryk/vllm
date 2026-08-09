@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING
 
@@ -240,6 +240,16 @@ class SchedulerOutput:
 
     # Execution stream selected by the experimental Slack Serve runner.
     execution_lane: str = "default"
+
+    # Sequential MineDraft POC metadata. The scheduler advances only this
+    # stable request wave; the runner uses these fields for a correctness
+    # trace. They are inert outside HB_MINEDRAFT_SERIAL=1.
+    minedraft_verify_wave: int | None = None
+    minedraft_verify_req_ids: list[str] = field(default_factory=list)
+    minedraft_prefill_req_ids: list[str] = field(default_factory=list)
+    minedraft_group_members: dict[int, list[str]] = field(default_factory=dict)
+    minedraft_phase: str | None = None
+    minedraft_pinned_req_ids: list[str] = field(default_factory=list)
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
