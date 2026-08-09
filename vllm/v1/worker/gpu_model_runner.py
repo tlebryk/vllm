@@ -6153,8 +6153,15 @@ class GPUModelRunner(
         if self.speculative_config and (
             self.speculative_config.use_eagle()
             or self.speculative_config.uses_extract_hidden_states()
+            or (
+                self.speculative_config.uses_draft_model()
+                and os.environ.get("HB_SPEC_DRAFTER_GRAPHS") == "1"
+            )
         ):
-            assert isinstance(self.drafter, EagleProposer | ExtractHiddenStatesProposer)
+            assert isinstance(
+                self.drafter,
+                EagleProposer | ExtractHiddenStatesProposer | DraftModelProposer,
+            )
             self.drafter.initialize_cudagraph_keys(cudagraph_mode)
 
     def calculate_reorder_batch_threshold(self) -> None:

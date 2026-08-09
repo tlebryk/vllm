@@ -5,14 +5,13 @@ from dataclasses import dataclass
 import torch
 
 from vllm.config import VllmConfig
-from vllm.config.compilation import CUDAGraphMode, CompilationMode
+from vllm.config.compilation import CompilationMode, CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.sequence import IntermediateTensors
+from vllm.v1.attention.backends.fa_utils import flash_attn_scheduler_sm_margin
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.outputs import ModelRunnerOutput
-from vllm.v1.attention.backends.fa_utils import flash_attn_scheduler_sm_margin
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
-from vllm.v1.worker.gpu.buffer_utils import fence_uva_pools
 
 # add imports
 from vllm.v1.worker.gpu.block_table import (
@@ -20,6 +19,7 @@ from vllm.v1.worker.gpu.block_table import (
     _compute_slot_mappings_kernel,
     _gather_block_tables_kernel,
 )
+from vllm.v1.worker.gpu.buffer_utils import fence_uva_pools
 from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
     get_uniform_token_count,
@@ -33,7 +33,52 @@ from vllm.v1.worker.gpu.model_runner import (
     pp_broadcast,
     pp_receive,
 )
+from vllm.v1.worker.gpu_model_runner import GPUModelRunner as ClassicGPUModelRunner
 
+
+class SlackServeSpecModelRunner(ClassicGPUModelRunner):
+    """Correctness-first stock draft-model runner on two ordered streams.
+
+    This keeps the classic V1 speculative-decoding implementation intact and
+    only moves its complete draft proposal onto a dedicated stream.  The two
+    events deliberately serialize target -> draft -> next target; pipelined
+    overlap needs a private proposal handoff and is a later stage.
+    """
+
+    def __init__(self, vllm_config: VllmConfig, device: torch.device):
+        super().__init__(vllm_config, device)
+        spec_config = self.speculative_config
+        unsupported = (
+            spec_config is None
+            or not spec_config.uses_draft_model()
+            or self.lora_config is not None
+            or self.supports_mm_inputs
+            or self.parallel_config.pipeline_parallel_size != 1
+            or self.parallel_config.tensor_parallel_size != 1
+            or self.parallel_config.data_parallel_size != 1
+            or self.parallel_config.decode_context_parallel_size != 1
+            or self.scheduler_config.async_scheduling
+        )
+        if unsupported:
+            raise ValueError(
+                "HB_SPEC_SERVE requires TP/PP/DP/DCP=1 text generation with "
+                "a draft_model spec config, no LoRA/MM, and async scheduling off"
+            )
+        self._hb_draft_stream = torch.cuda.Stream(device=device)
+        self._hb_target_ready = torch.cuda.Event()
+        self._hb_draft_done = torch.cuda.Event()
+
+    @torch.inference_mode()
+    def propose_draft_token_ids(self, *args, **kwargs):
+        target_stream = torch.cuda.current_stream(self.device)
+        self._hb_target_ready.record(target_stream)
+        with torch.cuda.stream(self._hb_draft_stream):
+            self._hb_draft_stream.wait_event(self._hb_target_ready)
+            with torch.cuda.nvtx.range("slackserve_spec/draft"):
+                draft_token_ids = super().propose_draft_token_ids(*args, **kwargs)
+            self._hb_draft_done.record(self._hb_draft_stream)
+        target_stream.wait_event(self._hb_draft_done)
+        return draft_token_ids
 
 class SlackServeModelRunner(GPUModelRunner):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):

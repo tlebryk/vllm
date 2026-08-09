@@ -429,9 +429,15 @@ class EngineCore:
     def finish(self, ticket: StepTicket):
         output = ticket.future.result()
         if output is None:
-            output = self.model_executor.sample_tokens(
-                ticket.grammar_output, lane=ticket.scheduler_output.execution_lane
-            )
+            # The stock worker accepts only ``grammar_output``.  Lane-aware
+            # sampling is required only by the non-default P2 lanes.
+            lane = ticket.scheduler_output.execution_lane
+            if lane == "default":
+                output = self.model_executor.sample_tokens(ticket.grammar_output)
+            else:
+                output = self.model_executor.sample_tokens(
+                    ticket.grammar_output, lane=lane
+                )
         return output
 
     def complete(self, ticket: StepTicket, model_output: ModelRunnerOutput):

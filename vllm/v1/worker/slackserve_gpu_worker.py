@@ -70,7 +70,17 @@ class SlackServeGPUWorker(GPUWorker):
     def _create_model_runner(self):
         from vllm.v1.worker.gpu.slackserve_model_runner import (
             SlackServeModelRunner,
+            SlackServeSpecModelRunner,
         )
+        if os.environ.get("HB_SPEC_SERVE") == "1":
+            if self.vllm_config.speculative_config is None:
+                raise ValueError("HB_SPEC_SERVE=1 requires --speculative-config")
+            if os.environ.get("HB_P2_SERVE") == "1":
+                raise ValueError(
+                    "HB_SPEC_SERVE is the serialized Phase-A profile and is "
+                    "mutually exclusive with HB_P2_SERVE"
+                )
+            return SlackServeSpecModelRunner(self.vllm_config, self.device)
         return SlackServeModelRunner(self.vllm_config, self.device)
 
     def _lane_stream(self, lane: str) -> torch.cuda.Stream:
@@ -85,6 +95,13 @@ class SlackServeGPUWorker(GPUWorker):
     @torch.inference_mode()
     def execute_model(self, scheduler_output):
         lane = scheduler_output.execution_lane
+        if os.environ.get("HB_SPEC_SERVE") == "1":
+            # The Phase-A profile uses the classic model runner so draft_model
+            # speculation stays on stock vLLM machinery. Preserve its normal
+            # execute -> EngineCore grammar -> sample lifecycle; the modular
+            # P2 runner below instead samples lane-locally.
+            with torch.cuda.stream(self._lane_stream("decode")):
+                return super().execute_model(scheduler_output)
         locked = (
             self._hb_dense_lock is not None
             and lane not in ("decode", "default")
@@ -126,6 +143,9 @@ class SlackServeGPUWorker(GPUWorker):
         # AsyncOutput's stream() helper restores ``main_stream`` as the
         # ambient stream on exit, so running this on any other stream would
         # silently launch postprocess unordered w.r.t. the sampler.
+        if os.environ.get("HB_SPEC_SERVE") == "1":
+            with torch.cuda.stream(self._lane_stream("decode")):
+                return super().sample_tokens(grammar_output)
         locked = (
             self._hb_dense_lock is not None
             and lane not in ("decode", "default")
