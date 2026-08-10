@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import dataclasses
+import os
 import weakref
 from collections import Counter
 from collections.abc import Callable
@@ -27,6 +28,37 @@ from vllm.platforms import current_platform
 from vllm.utils.torch_utils import current_stream, weak_ref_tensors
 
 logger = init_logger(__name__)
+
+
+_separate_drafter_graph_pool: Any | None = None
+
+
+def _get_graph_pool(runtime_mode: CUDAGraphMode, vllm_config: VllmConfig) -> Any:
+    """Return the graph pool selected for this static-graph wrapper.
+
+    Slack Serve can replay the target FULL graph concurrently with the draft
+    model's PIECEWISE graphs. Those graph families must not overlay allocations
+    in vLLM's normal global pool. Draft PIECEWISE partitions still share one
+    pool because they execute serially within one model forward and rely on
+    that sharing for memory reuse.
+    """
+    speculative_config = vllm_config.speculative_config
+    is_draft_model = (
+        speculative_config is not None
+        and vllm_config.model_config is speculative_config.draft_model_config
+    )
+    if not (
+        runtime_mode == CUDAGraphMode.PIECEWISE
+        and is_draft_model
+        and os.environ.get("HB_MINEDRAFT_EXPERIMENTAL_GRAPH_OVERLAP") == "1"
+        and os.environ.get("HB_SPEC_SEPARATE_DRAFTER_GRAPH_POOL") == "1"
+    ):
+        return current_platform.get_global_graph_pool()
+
+    global _separate_drafter_graph_pool
+    if _separate_drafter_graph_pool is None:
+        _separate_drafter_graph_pool = current_platform.graph_pool_handle()
+    return _separate_drafter_graph_pool
 
 
 @dataclasses.dataclass(frozen=True)
@@ -129,6 +161,7 @@ class CUDAGraphEntry:
     batch_descriptor: BatchDescriptor
     cudagraph: torch.cuda.CUDAGraph | None = None
     output: Any | None = None
+    capture_stream_id: int | None = None
 
     # for cudagraph debugging, track the input addresses
     # during capture, and check if they are the same during replay
@@ -193,10 +226,7 @@ class CUDAGraphWrapper:
         # assert runtime_mode is not NONE(no cudagraph), otherwise, we don't
         # need to initialize a CUDAGraphWrapper.
         assert self.runtime_mode != CUDAGraphMode.NONE
-        # TODO: in the future, if we want to use multiple
-        # streams, it might not be safe to share a global pool.
-        # only investigate this when we use multiple streams
-        self.graph_pool = current_platform.get_global_graph_pool()
+        self.graph_pool = _get_graph_pool(runtime_mode, vllm_config)
 
         if cudagraph_options is None:
             cudagraph_options = CUDAGraphOptions()
@@ -278,6 +308,8 @@ class CUDAGraphWrapper:
             ]
             entry.input_addresses = input_addresses
             cudagraph = torch.cuda.CUDAGraph()
+            capture_stream = current_stream()
+            entry.capture_stream_id = capture_stream.cuda_stream
 
             with ExitStack() as stack:
                 if self.cudagraph_options.gc_disable:
@@ -305,7 +337,7 @@ class CUDAGraphWrapper:
                 with torch.cuda.graph(
                     cudagraph,
                     pool=self.graph_pool,
-                    stream=current_stream(),
+                    stream=capture_stream,
                 ):
                     # `output` is managed by pytorch's cudagraph pool
                     output = self.runnable(*args, **kwargs)
@@ -351,3 +383,46 @@ class CUDAGraphWrapper:
         get_offloader().sync_prev_onload()
         entry.cudagraph.replay()
         return entry.output
+
+
+def get_drafter_graph_pool_wrapper_counts(
+    vllm_config: VllmConfig,
+) -> tuple[int, int]:
+    """Return (draft PIECEWISE wrappers, wrappers on the private pool)."""
+    speculative_config = vllm_config.speculative_config
+    if speculative_config is None:
+        return 0, 0
+    draft_model_config = speculative_config.draft_model_config
+    wrappers = [
+        instance
+        for instance in list(CUDAGraphWrapper._all_instances)
+        if instance.runtime_mode == CUDAGraphMode.PIECEWISE
+        and instance.vllm_config.model_config is draft_model_config
+    ]
+    private = (
+        sum(
+            instance.graph_pool is _separate_drafter_graph_pool
+            for instance in wrappers
+        )
+        if _separate_drafter_graph_pool is not None
+        else 0
+    )
+    return len(wrappers), private
+
+
+def get_drafter_graph_capture_stream_ids(
+    vllm_config: VllmConfig,
+) -> tuple[int, ...]:
+    """Return capture stream IDs of live draft PIECEWISE graph entries."""
+    speculative_config = vllm_config.speculative_config
+    if speculative_config is None:
+        return ()
+    draft_model_config = speculative_config.draft_model_config
+    return tuple(
+        entry.capture_stream_id
+        for instance in list(CUDAGraphWrapper._all_instances)
+        if instance.runtime_mode == CUDAGraphMode.PIECEWISE
+        and instance.vllm_config.model_config is draft_model_config
+        for entry in instance.concrete_cudagraph_entries.values()
+        if entry.cudagraph is not None and entry.capture_stream_id is not None
+    )

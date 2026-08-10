@@ -8,6 +8,7 @@ import torch
 from vllm.config import VllmConfig
 from vllm.config.compilation import CompilationMode, CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
+from vllm.logger import init_logger
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.fa_utils import flash_attn_scheduler_sm_margin
@@ -37,6 +38,8 @@ from vllm.v1.worker.gpu.model_runner import (
 )
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner as ClassicGPUModelRunner
 
+logger = init_logger(__name__)
+
 
 @dataclass
 class _MineDraftHandoff:
@@ -52,14 +55,22 @@ class _MineDraftHandoff:
     num_rejected_tokens_gpu: torch.Tensor | None
 
 
-class SlackServeSpecModelRunner(ClassicGPUModelRunner):
-    """Correctness-first stock draft-model runner on two ordered streams.
+@dataclass
+class _MineDraftOverlapLaunch:
+    handoff: _MineDraftHandoff
+    draft_token_ids: torch.Tensor | None
+    epoch: torch.cuda.Event | None
+    draft_start: torch.cuda.Event | None
+    draft_end: torch.cuda.Event | None
+    target_start: torch.cuda.Event | None
+    target_body_end: torch.cuda.Event | None
+    target_step_end: torch.cuda.Event | None
+    draft_stream_id: int
+    target_stream_id: int
 
-    This keeps the classic V1 speculative-decoding implementation intact and
-    only moves its complete draft proposal onto a dedicated stream.  The two
-    events deliberately serialize target -> draft -> next target; pipelined
-    overlap needs a private proposal handoff and is a later stage.
-    """
+
+class SlackServeSpecModelRunner(ClassicGPUModelRunner):
+    """Stock spec decoding plus isolated serialized/overlapped POC modes."""
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
@@ -83,32 +94,199 @@ class SlackServeSpecModelRunner(ClassicGPUModelRunner):
         self._hb_draft_stream = torch.cuda.Stream(device=device)
         self._hb_target_ready = torch.cuda.Event()
         self._hb_draft_done = torch.cuda.Event()
-        self._hb_minedraft = os.environ.get("HB_MINEDRAFT_SERIAL") == "1"
+        self._hb_overlap_target_launch = torch.cuda.Event()
+        self._hb_minedraft_serial = os.environ.get("HB_MINEDRAFT_SERIAL") == "1"
+        self._hb_minedraft_overlap = os.environ.get("HB_MINEDRAFT_OVERLAP") == "1"
+        self._hb_minedraft_experimental_graph_overlap = (
+            os.environ.get("HB_MINEDRAFT_EXPERIMENTAL_GRAPH_OVERLAP") == "1"
+        )
+        self._hb_draft_graph_capture_active = False
+        self._hb_draft_graph_capture_context_count = 0
+        if self._hb_minedraft_serial and self._hb_minedraft_overlap:
+            raise ValueError(
+                "HB_MINEDRAFT_SERIAL and HB_MINEDRAFT_OVERLAP are mutually exclusive"
+            )
+        graph_enabled_overlap = (
+            self._hb_minedraft_overlap
+            and os.environ.get("HB_SPEC_DRAFTER_GRAPHS") == "1"
+        )
+        if (
+            graph_enabled_overlap
+            and not self._hb_minedraft_experimental_graph_overlap
+        ):
+            raise ValueError(
+                "graph-enabled HB_MINEDRAFT_OVERLAP is unsafe and requires "
+                "explicit HB_MINEDRAFT_EXPERIMENTAL_GRAPH_OVERLAP=1"
+            )
+        if self._hb_minedraft_experimental_graph_overlap and not graph_enabled_overlap:
+            raise ValueError(
+                "HB_MINEDRAFT_EXPERIMENTAL_GRAPH_OVERLAP requires graph-enabled "
+                "HB_MINEDRAFT_OVERLAP"
+            )
+        if graph_enabled_overlap:
+            if os.environ.get("HB_SPEC_SEPARATE_DRAFTER_GRAPH_POOL") != "1":
+                raise ValueError(
+                    "graph-enabled HB_MINEDRAFT_OVERLAP requires "
+                    "HB_SPEC_SEPARATE_DRAFTER_GRAPH_POOL=1"
+                )
+            if os.environ.get("VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS") != "1":
+                raise ValueError(
+                    "graph-enabled HB_MINEDRAFT_OVERLAP requires "
+                    "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1"
+                )
+        self._hb_minedraft = (
+            self._hb_minedraft_serial or self._hb_minedraft_overlap
+        )
         self._hb_minedraft_step = 0
+        self._hb_minedraft_online_timing = (
+            os.environ.get("HB_MINEDRAFT_ONLINE_TIMING") == "1"
+        )
         self._hb_pending_handoff: _MineDraftHandoff | None = None
+        self._hb_overlap_ready_handoff: _MineDraftHandoff | None = None
+        self._hb_overlap_launch: _MineDraftOverlapLaunch | None = None
+        self._hb_nsys_window_open = False
+        self._hb_nsys_window_close_pending = False
+        self._hb_nsys_profile = (
+            os.environ.get("HB_MINEDRAFT_NSYS_PROFILE") == "1"
+        )
+        self._hb_nsys_window_start = int(
+            os.environ.get("HB_MINEDRAFT_NSYS_WINDOW_START", "64")
+        )
+        self._hb_nsys_window_stages = int(
+            os.environ.get("HB_MINEDRAFT_NSYS_WINDOW_STAGES", "32")
+        )
         self._hb_return_req_ids: list[str] | None = None
         self._hb_released_req_ids: list[str] = []
         self._hb_step_log = None
         if self._hb_minedraft:
             if self.use_async_scheduling:
                 raise ValueError(
-                    "HB_MINEDRAFT_SERIAL does not support async scheduling"
+                    "MineDraft POC does not support async scheduling"
                 )
             if spec_config.disable_padded_drafter_batch:
                 raise ValueError(
-                    "HB_MINEDRAFT_SERIAL requires the padded draft-model path"
+                    "MineDraft POC requires the padded draft-model path"
                 )
             log_path = os.environ.get("HB_MINEDRAFT_STEP_LOG")
             if not log_path:
                 raise ValueError(
-                    "HB_MINEDRAFT_SERIAL=1 requires HB_MINEDRAFT_STEP_LOG"
+                    "MineDraft POC requires HB_MINEDRAFT_STEP_LOG"
                 )
             # The runner owns this process-lifetime line-buffered trace.
             self._hb_step_log = open(log_path, "a", buffering=1)  # noqa: SIM115
 
+    def capture_model(self) -> int:
+        graph_memory = super().capture_model()
+        if self._hb_minedraft_overlap and os.environ.get(
+            "HB_SPEC_DRAFTER_GRAPHS"
+        ) == "1":
+            from vllm.compilation.cuda_graph import (
+                get_drafter_graph_capture_stream_ids,
+                get_drafter_graph_pool_wrapper_counts,
+            )
+
+            total, private = get_drafter_graph_pool_wrapper_counts(self.vllm_config)
+            if total == 0 or private != total:
+                raise RuntimeError(
+                    "draft graph-pool isolation failed: "
+                    f"piecewise_wrappers={total}, private_pool_wrappers={private}"
+                )
+            capture_stream_ids = get_drafter_graph_capture_stream_ids(
+                self.vllm_config
+            )
+            expected_stream_id = self._hb_draft_stream.cuda_stream
+            if (
+                not capture_stream_ids
+                or set(capture_stream_ids) != {expected_stream_id}
+                or self._hb_draft_graph_capture_context_count == 0
+            ):
+                raise RuntimeError(
+                    "draft graph capture-stream isolation failed: "
+                    f"expected={expected_stream_id}, actual={capture_stream_ids}, "
+                    f"contexts={self._hb_draft_graph_capture_context_count}"
+                )
+            logger.info(
+                "Draft graph-pool isolation verified: "
+                "piecewise_wrappers=%d, private_pool_wrappers=%d, "
+                "capture_stream=%d, capture_contexts=%d",
+                total,
+                private,
+                expected_stream_id,
+                self._hb_draft_graph_capture_context_count,
+            )
+            self._write_minedraft_step(
+                {
+                    "record_type": "graph_pool_startup",
+                    "draft_piecewise_wrapper_count": total,
+                    "private_pool_wrapper_count": private,
+                    "draft_graph_capture_stream_id": expected_stream_id,
+                    "draft_graph_capture_entry_count": len(capture_stream_ids),
+                    "draft_graph_capture_context_count": (
+                        self._hb_draft_graph_capture_context_count
+                    ),
+                    "experimental_graph_overlap": True,
+                }
+            )
+        return graph_memory
+
+    def _warmup_and_capture(
+        self,
+        desc: BatchDescriptor,
+        cudagraph_runtime_mode: CUDAGraphMode,
+        profile_seq_lens: int | None = None,
+        allow_microbatching: bool = False,
+        num_warmups: int | None = None,
+    ):
+        isolate_draft_capture = (
+            self._hb_minedraft_experimental_graph_overlap
+            and cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE
+        )
+        if self._hb_draft_graph_capture_active:
+            raise RuntimeError("nested draft graph-capture stream context")
+        self._hb_draft_graph_capture_active = isolate_draft_capture
+        try:
+            return super()._warmup_and_capture(
+                desc,
+                cudagraph_runtime_mode,
+                profile_seq_lens,
+                allow_microbatching,
+                num_warmups,
+            )
+        finally:
+            self._hb_draft_graph_capture_active = False
+
+    @contextmanager
+    def _draft_model_capture_context(self):
+        if not self._hb_draft_graph_capture_active:
+            yield
+            return
+
+        outer_stream = torch.cuda.current_stream(self.device)
+        if outer_stream == self._hb_draft_stream:
+            raise RuntimeError("draft graph capture did not receive a private stream")
+        self._hb_draft_stream.wait_stream(outer_stream)
+        try:
+            with torch.cuda.stream(self._hb_draft_stream):
+                yield
+        finally:
+            outer_stream.wait_stream(self._hb_draft_stream)
+        self._hb_draft_graph_capture_context_count += 1
+
     def _write_minedraft_step(self, record: dict) -> None:
         if self._hb_step_log is not None:
             self._hb_step_log.write(json.dumps(record, sort_keys=True) + "\n")
+
+    def _advance_minedraft_step(self) -> None:
+        self._hb_minedraft_step += 1
+        if (
+            self._hb_nsys_window_open
+            and self._hb_minedraft_step
+            == self._hb_nsys_window_start + self._hb_nsys_window_stages
+        ):
+            # The step advances inside the nested slackserve_spec/draft NVTX
+            # range. Close the outer capture window only after that context
+            # has popped its own range, preserving the per-thread NVTX stack.
+            self._hb_nsys_window_close_pending = True
 
     def _release_minedraft_handoff(
         self,
@@ -166,9 +344,9 @@ class SlackServeSpecModelRunner(ClassicGPUModelRunner):
     ) -> _MineDraftHandoff:
         assert torch.is_tensor(sampled_token_ids)
         if not sampling_metadata.all_greedy:
-            raise ValueError("HB_MINEDRAFT_SERIAL currently requires greedy sampling")
+            raise ValueError("MineDraft POC currently requires greedy sampling")
         if self.supports_mm_inputs:
-            raise ValueError("HB_MINEDRAFT_SERIAL does not support multimodal inputs")
+            raise ValueError("MineDraft POC does not support multimodal inputs")
 
         next_token_ids, valid_sampled_tokens_count = (
             self.drafter.prepare_next_token_ids_padded(
@@ -256,10 +434,140 @@ class SlackServeSpecModelRunner(ClassicGPUModelRunner):
             slot_mappings=None,
         )
 
+    def _validate_minedraft_pending(
+        self,
+        pending: _MineDraftHandoff,
+        scheduler_output: SchedulerOutput,
+    ) -> None:
+        pending_ids = set(pending.request_ids)
+        pinned_ids = set(scheduler_output.minedraft_pinned_req_ids)
+        if not pending_ids.issubset(pinned_ids):
+            raise RuntimeError(
+                "MineDraft retained handoff lost KV ownership: "
+                f"{sorted(pending_ids - pinned_ids)}"
+            )
+        preempted = pending_ids.intersection(
+            scheduler_output.preempted_req_ids or ()
+        )
+        if preempted:
+            raise RuntimeError(
+                "MineDraft retained handoff was preempted: "
+                f"{sorted(preempted)}"
+            )
+
+    @torch.inference_mode()
+    def execute_model(self, scheduler_output, intermediate_tensors=None):
+        if not self._hb_minedraft_overlap:
+            return super().execute_model(scheduler_output, intermediate_tensors)
+
+        pending = self._hb_pending_handoff
+        verify_ids = scheduler_output.minedraft_verify_req_ids
+        group_members = scheduler_output.minedraft_group_members
+        can_overlap = (
+            pending is not None
+            and bool(verify_ids)
+            and bool(group_members.get(0))
+            and bool(group_members.get(1))
+        )
+        if can_overlap:
+            assert pending is not None
+            if (
+                self._hb_overlap_ready_handoff is not None
+                or self._hb_overlap_launch is not None
+            ):
+                raise RuntimeError("MineDraft overlap stage was not consumed")
+            if scheduler_output.minedraft_prefill_req_ids:
+                raise RuntimeError(
+                    "MineDraft overlap attempted to mix prefill with decode"
+                )
+            self._validate_minedraft_pending(pending, scheduler_output)
+            if pending.wave == scheduler_output.minedraft_verify_wave:
+                raise RuntimeError(
+                    "MineDraft overlap draft and verify waves match"
+                )
+            if set(pending.request_ids).intersection(verify_ids):
+                raise RuntimeError(
+                    "MineDraft overlap draft and verify request IDs overlap"
+                )
+            # Defer the launch until _model_forward, after target input prep,
+            # so the two model intervals begin next to one another.
+            self._hb_overlap_ready_handoff = pending
+
+        return super().execute_model(scheduler_output, intermediate_tensors)
+
+    def _model_forward(self, *args, **kwargs):
+        pending = self._hb_overlap_ready_handoff
+        if pending is None:
+            return super()._model_forward(*args, **kwargs)
+        self._hb_overlap_ready_handoff = None
+        if (
+            not self._hb_nsys_window_open
+            and self._hb_minedraft_step == self._hb_nsys_window_start
+        ):
+            if self._hb_nsys_profile:
+                torch.cuda.cudart().cudaProfilerStart()
+            torch.cuda.nvtx.range_push("minedraft_overlap/window")
+            self._hb_nsys_window_open = True
+        target_stream = torch.cuda.current_stream(self.device)
+        # Elapsed-time events and queries perturb this short steady-state path.
+        # The performance arm uses only one persistent untimed launch event;
+        # nsys is the source of detailed timings.
+        epoch = draft_start = draft_end = None
+        target_start = target_body_end = target_step_end = None
+        target_launch = self._hb_overlap_target_launch
+        if self._hb_minedraft_online_timing:
+            epoch = torch.cuda.Event(enable_timing=True)
+            draft_start = torch.cuda.Event(enable_timing=True)
+            draft_end = torch.cuda.Event(enable_timing=True)
+            target_start = torch.cuda.Event(enable_timing=True)
+            target_body_end = torch.cuda.Event(enable_timing=True)
+            target_step_end = torch.cuda.Event(enable_timing=True)
+            epoch.record(target_stream)
+            target_launch = target_start
+        target_launch.record(target_stream)
+        with torch.cuda.nvtx.range("minedraft_overlap/target_verify"):
+            output = super()._model_forward(*args, **kwargs)
+        if target_body_end is not None:
+            target_body_end.record(target_stream)
+        # Submit the short target graph first. Submitting all three eager K=3
+        # draft forwards first caused CUDA to drain almost the entire draft
+        # queue before beginning the target graph, despite distinct streams.
+        with torch.cuda.stream(self._hb_draft_stream):
+            self._hb_draft_stream.wait_event(target_launch)
+            if draft_start is not None:
+                draft_start.record(self._hb_draft_stream)
+            with torch.cuda.nvtx.range(
+                f"minedraft_overlap/draft_wave_{pending.wave}"
+            ):
+                draft_token_ids = self._launch_minedraft_handoff(pending)
+            if draft_end is not None:
+                draft_end.record(self._hb_draft_stream)
+        self._hb_overlap_launch = _MineDraftOverlapLaunch(
+            handoff=pending,
+            draft_token_ids=draft_token_ids,
+            epoch=epoch,
+            draft_start=draft_start,
+            draft_end=draft_end,
+            target_start=target_start,
+            target_body_end=target_body_end,
+            target_step_end=target_step_end,
+            draft_stream_id=self._hb_draft_stream.cuda_stream,
+            target_stream_id=target_stream.cuda_stream,
+        )
+        return output
+
     @torch.inference_mode()
     def propose_draft_token_ids(self, *args, **kwargs):
         scheduler_output = args[0]
         target_stream = torch.cuda.current_stream(self.device)
+        overlap_launch = self._hb_overlap_launch
+        if overlap_launch is not None and self._hb_minedraft_online_timing:
+            # Includes target transformer body, LM-head logits, and sampling.
+            # Record before any wait on the opposite-wave draft.
+            assert overlap_launch.target_step_end is not None
+            overlap_launch.target_step_end.record(target_stream)
+        # sample_tokens calls this method immediately after target sampling has
+        # been enqueued. Record before issuing the cross-stream wait below.
         self._hb_target_ready.record(target_stream)
         with torch.cuda.stream(self._hb_draft_stream):
             self._hb_draft_stream.wait_event(self._hb_target_ready)
@@ -268,21 +576,7 @@ class SlackServeSpecModelRunner(ClassicGPUModelRunner):
                 group_members = scheduler_output.minedraft_group_members
                 pending = self._hb_pending_handoff
                 if pending is not None:
-                    pending_ids = set(pending.request_ids)
-                    pinned_ids = set(scheduler_output.minedraft_pinned_req_ids)
-                    if not pending_ids.issubset(pinned_ids):
-                        raise RuntimeError(
-                            "MineDraft retained handoff lost KV ownership: "
-                            f"{sorted(pending_ids - pinned_ids)}"
-                        )
-                    preempted = pending_ids.intersection(
-                        scheduler_output.preempted_req_ids or ()
-                    )
-                    if preempted:
-                        raise RuntimeError(
-                            "MineDraft retained handoff was preempted: "
-                            f"{sorted(preempted)}"
-                        )
+                    self._validate_minedraft_pending(pending, scheduler_output)
                 if not self._hb_minedraft or not verify_ids:
                     # Priming barrier: target/drafter prefill and initial
                     # proposals run together for every newly admitted row.
@@ -429,7 +723,7 @@ class SlackServeSpecModelRunner(ClassicGPUModelRunner):
                                 ),
                             }
                         )
-                        self._hb_minedraft_step += 1
+                        self._advance_minedraft_step()
                     else:
                         self._hb_pending_handoff = current
                     if not tail_fallback and pending is None:
@@ -469,9 +763,108 @@ class SlackServeSpecModelRunner(ClassicGPUModelRunner):
                             }
                         )
                     elif not tail_fallback:
-                        draft_token_ids = self._launch_minedraft_handoff(pending)
+                        overlap_metrics: dict[str, float | int | str] = {}
+                        overlap_launch = self._hb_overlap_launch
+                        if self._hb_minedraft_overlap:
+                            if overlap_launch is None:
+                                raise RuntimeError(
+                                    "MineDraft steady stage has no overlap launch"
+                                )
+                            if overlap_launch.handoff is not pending:
+                                raise RuntimeError(
+                                    "MineDraft overlap launch does not match retained "
+                                    "handoff"
+                                )
+                            if self._hb_minedraft_online_timing:
+                                assert overlap_launch.epoch is not None
+                                assert overlap_launch.draft_start is not None
+                                assert overlap_launch.draft_end is not None
+                                assert overlap_launch.target_start is not None
+                                assert overlap_launch.target_body_end is not None
+                                assert overlap_launch.target_step_end is not None
+                                overlap_launch.draft_end.synchronize()
+                                overlap_launch.target_step_end.synchronize()
+                                draft_start_ms = overlap_launch.epoch.elapsed_time(
+                                    overlap_launch.draft_start
+                                )
+                                draft_end_ms = overlap_launch.epoch.elapsed_time(
+                                    overlap_launch.draft_end
+                                )
+                                target_start_ms = overlap_launch.epoch.elapsed_time(
+                                    overlap_launch.target_start
+                                )
+                                target_body_end_ms = overlap_launch.epoch.elapsed_time(
+                                    overlap_launch.target_body_end
+                                )
+                                target_step_end_ms = overlap_launch.epoch.elapsed_time(
+                                    overlap_launch.target_step_end
+                                )
+                                overlap_ms = max(
+                                    0.0,
+                                    min(draft_end_ms, target_step_end_ms)
+                                    - max(draft_start_ms, target_start_ms),
+                                )
+                                body_overlap_ms = max(
+                                    0.0,
+                                    min(draft_end_ms, target_body_end_ms)
+                                    - max(draft_start_ms, target_start_ms),
+                                )
+                                shorter_ms = min(
+                                    draft_end_ms - draft_start_ms,
+                                    target_step_end_ms - target_start_ms,
+                                )
+                                overlap_metrics = {
+                                    "launch_order": "target_before_draft",
+                                    "draft_stream_id": overlap_launch.draft_stream_id,
+                                    "target_stream_id": overlap_launch.target_stream_id,
+                                    "draft_start_from_epoch_cuda_ms": draft_start_ms,
+                                    "draft_end_from_epoch_cuda_ms": draft_end_ms,
+                                    "target_start_from_epoch_cuda_ms": target_start_ms,
+                                    "target_body_end_from_epoch_cuda_ms": (
+                                        target_body_end_ms
+                                    ),
+                                    "target_step_end_from_epoch_cuda_ms": (
+                                        target_step_end_ms
+                                    ),
+                                    "draft_cuda_ms": draft_end_ms - draft_start_ms,
+                                    "target_body_cuda_ms": (
+                                        target_body_end_ms - target_start_ms
+                                    ),
+                                    "target_verify_through_sampling_cuda_ms": (
+                                        target_step_end_ms - target_start_ms
+                                    ),
+                                    "body_stream_interval_overlap_cuda_ms": (
+                                        body_overlap_ms
+                                    ),
+                                    "stream_interval_overlap_cuda_ms": overlap_ms,
+                                    "stream_interval_overlap_fraction_of_shorter": (
+                                        overlap_ms / shorter_ms
+                                        if shorter_ms > 0
+                                        else 0.0
+                                    ),
+                                }
+                            else:
+                                overlap_metrics = {
+                                    "launch_order": "target_before_draft",
+                                    "draft_stream_id": overlap_launch.draft_stream_id,
+                                    "target_stream_id": overlap_launch.target_stream_id,
+                                    "online_timing": False,
+                                }
+                            overlap_metrics["experimental_graph_overlap"] = (
+                                self._hb_minedraft_experimental_graph_overlap
+                            )
+                            draft_token_ids = overlap_launch.draft_token_ids
+                            if draft_token_ids is None:
+                                raise RuntimeError(
+                                    "MineDraft overlap draft launch was not submitted"
+                                )
+                            self._hb_overlap_launch = None
+                            release_reason = "overlapped"
+                        else:
+                            draft_token_ids = self._launch_minedraft_handoff(pending)
+                            release_reason = "launched"
                         self._release_minedraft_handoff(
-                            pending, scheduler_output, "launched"
+                            pending, scheduler_output, release_reason
                         )
                         self._hb_return_req_ids = pending.request_ids.copy()
                         if pending.wave == current.wave:
@@ -487,8 +880,12 @@ class SlackServeSpecModelRunner(ClassicGPUModelRunner):
                                 "record_type": "physical_stage",
                                 "phase": scheduler_output.minedraft_phase,
                                 "step": self._hb_minedraft_step,
-                                "overlap": False,
-                                "physical_order": ["target_verify", "draft"],
+                                "overlap": self._hb_minedraft_overlap,
+                                "physical_order": (
+                                    ["target_verify_launch", "draft_launch", "join"]
+                                    if self._hb_minedraft_overlap
+                                    else ["target_verify", "draft"]
+                                ),
                                 "verify_wave": current.wave,
                                 "draft_wave": pending.wave,
                                 "verify_request_ids": current.request_ids,
@@ -525,10 +922,17 @@ class SlackServeSpecModelRunner(ClassicGPUModelRunner):
                                 "pinned_request_ids": (
                                     scheduler_output.minedraft_pinned_req_ids
                                 ),
+                                **overlap_metrics,
                             }
                         )
-                        self._hb_minedraft_step += 1
+                        self._advance_minedraft_step()
             self._hb_draft_done.record(self._hb_draft_stream)
+        if self._hb_nsys_window_close_pending:
+            torch.cuda.nvtx.range_pop()
+            if self._hb_nsys_profile:
+                torch.cuda.cudart().cudaProfilerStop()
+            self._hb_nsys_window_open = False
+            self._hb_nsys_window_close_pending = False
         target_stream.wait_event(self._hb_draft_done)
         return draft_token_ids
 

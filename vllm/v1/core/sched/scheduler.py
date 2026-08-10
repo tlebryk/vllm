@@ -106,7 +106,10 @@ class Scheduler(SchedulerInterface):
         # until EngineCore finalizes that ticket.
         self._hb_inflight_req_ids: set[str] = set()
         self._hb_preemptions_by_lane: dict[str, int] = defaultdict(int)
-        self._hb_minedraft_enabled = os.environ.get("HB_MINEDRAFT_SERIAL") == "1"
+        self._hb_minedraft_enabled = any(
+            os.environ.get(name) == "1"
+            for name in ("HB_MINEDRAFT_SERIAL", "HB_MINEDRAFT_OVERLAP")
+        )
         self._hb_minedraft_wave = 0
         self._hb_minedraft_groups: dict[str, int] = {}
         self._hb_minedraft_pinned_req_ids: set[str] = set()
@@ -122,7 +125,7 @@ class Scheduler(SchedulerInterface):
         if self._hb_minedraft_enabled:
             if not self._hb_minedraft_prefix:
                 raise ValueError(
-                    "HB_MINEDRAFT_SERIAL requires HB_MINEDRAFT_REQUEST_PREFIX"
+                    "MineDraft POC requires HB_MINEDRAFT_REQUEST_PREFIX"
                 )
             if self._hb_minedraft_batch_size <= 0:
                 raise ValueError("HB_MINEDRAFT_BATCH_SIZE must be positive")
@@ -391,7 +394,7 @@ class Scheduler(SchedulerInterface):
         minedraft_refill_expected = False
         if self._hb_minedraft_enabled:
             if lane != "default":
-                raise ValueError("HB_MINEDRAFT_SERIAL only supports the default lane")
+                raise ValueError("MineDraft POC only supports the default lane")
 
             def is_minedraft_request(request: Request) -> bool:
                 return request.request_id.startswith(self._hb_minedraft_prefix)

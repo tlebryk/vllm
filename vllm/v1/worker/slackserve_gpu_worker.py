@@ -81,11 +81,14 @@ class SlackServeGPUWorker(GPUWorker):
                     "mutually exclusive with HB_P2_SERVE"
                 )
             if (
-                os.environ.get("HB_MINEDRAFT_SERIAL") == "1"
+                any(
+                    os.environ.get(name) == "1"
+                    for name in ("HB_MINEDRAFT_SERIAL", "HB_MINEDRAFT_OVERLAP")
+                )
                 and not os.environ.get("HB_MINEDRAFT_STEP_LOG")
             ):
                 raise ValueError(
-                    "HB_MINEDRAFT_SERIAL requires HB_MINEDRAFT_STEP_LOG"
+                    "MineDraft POC requires HB_MINEDRAFT_STEP_LOG"
                 )
             return SlackServeSpecModelRunner(self.vllm_config, self.device)
         return SlackServeModelRunner(self.vllm_config, self.device)
@@ -102,7 +105,11 @@ class SlackServeGPUWorker(GPUWorker):
     def _attach_minedraft_release(
         self, output: ModelRunnerOutput | AsyncModelRunnerOutput | None
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
-        if output is None or os.environ.get("HB_MINEDRAFT_SERIAL") != "1":
+        minedraft_enabled = any(
+            os.environ.get(name) == "1"
+            for name in ("HB_MINEDRAFT_SERIAL", "HB_MINEDRAFT_OVERLAP")
+        )
+        if output is None or not minedraft_enabled:
             return output
         if not isinstance(output, ModelRunnerOutput):
             raise RuntimeError("MineDraft requires synchronous ModelRunnerOutput")

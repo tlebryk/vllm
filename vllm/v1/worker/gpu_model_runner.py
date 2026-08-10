@@ -5288,12 +5288,13 @@ class GPUModelRunner(
                 ):
                     use_cudagraphs = False
 
-                self.drafter.dummy_run(
-                    num_tokens,
-                    use_cudagraphs=use_cudagraphs,
-                    is_graph_capturing=is_graph_capturing,
-                    slot_mappings=slot_mappings,
-                )
+                with self._draft_model_capture_context():
+                    self.drafter.dummy_run(
+                        num_tokens,
+                        use_cudagraphs=use_cudagraphs,
+                        is_graph_capturing=is_graph_capturing,
+                        slot_mappings=slot_mappings,
+                    )
 
         # We register layerwise NVTX hooks here after the first dynamo tracing is
         # done to avoid nvtx operations in hook functions being traced by
@@ -5712,12 +5713,19 @@ class GPUModelRunner(
         self._cleanup_profiling_kv_cache()
         compilation_counter.num_cudagraph_captured = saved_num_cudagraph_captured
 
-        # FULL and PIECEWISE graphs share the global pool at runtime and are
-        # never replayed concurrently, so the pool overlays their memory.
-        # Take the max to avoid double-counting the overlap.
-        total_estimate = max(shared_memory_estimate.values()) + sum(
-            per_graph_estimate.values()
+        # Ordinarily FULL and PIECEWISE graphs share the global runtime pool,
+        # so their first-capture allocations overlay. Slack Serve's concurrent
+        # target/drafter mode deliberately separates those pools; account for
+        # both so KV sizing cannot consume the drafter graph's memory.
+        shared_estimate = (
+            sum(shared_memory_estimate.values())
+            if (
+                os.environ.get("HB_MINEDRAFT_EXPERIMENTAL_GRAPH_OVERLAP") == "1"
+                and os.environ.get("HB_SPEC_SEPARATE_DRAFTER_GRAPH_POOL") == "1"
+            )
+            else max(shared_memory_estimate.values())
         )
+        total_estimate = shared_estimate + sum(per_graph_estimate.values())
         logger.info(
             "Estimated CUDA graph memory: %.2f GiB total",
             total_estimate / (1 << 30),
@@ -5785,6 +5793,11 @@ class GPUModelRunner(
             scope="local",
         )
         return cuda_graph_size
+
+    @contextmanager
+    def _draft_model_capture_context(self):
+        """Hook for runners that isolate draft-model graph capture streams."""
+        yield
 
     def _warmup_and_capture(
         self,

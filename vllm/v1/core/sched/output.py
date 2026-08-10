@@ -243,7 +243,7 @@ class SchedulerOutput:
 
     # Sequential MineDraft POC metadata. The scheduler advances only this
     # stable request wave; the runner uses these fields for a correctness
-    # trace. They are inert outside HB_MINEDRAFT_SERIAL=1.
+    # trace. They are inert outside the MineDraft POC modes.
     minedraft_verify_wave: int | None = None
     minedraft_verify_req_ids: list[str] = field(default_factory=list)
     minedraft_prefill_req_ids: list[str] = field(default_factory=list)
