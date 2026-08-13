@@ -403,15 +403,25 @@ class EngineCore:
         self._iteration_index += 1
 
     def dispatch(self, lane: str = "default") -> StepTicket:
+        # HB_P2_ASYNC_DECODE=1: the decode lane may hold multiple in-flight
+        # tickets (depth bounded by the controller's FIFO). The AsyncScheduler
+        # placeholder accounting makes re-scheduling the same decode requests
+        # safe, so neither the single-flight guard nor the inflight-id mark
+        # applies to decode in that mode.
+        async_decode = getattr(self, "_hb_decode_depth", 1) > 1 and lane == "decode"
         inflight_lanes = getattr(self, "_hb_inflight_lanes", set())
-        if lane in inflight_lanes:
+        if lane in inflight_lanes and not async_decode:
             raise RuntimeError(
                 f"Slack Serve lane already has an in-flight ticket: {lane}"
             )
         scheduler_output = self.scheduler.schedule(lane=lane)
         scheduler_output.execution_lane = lane
         request_ids = set(scheduler_output.num_scheduled_tokens)
-        if request_ids and hasattr(self.scheduler, "mark_hb_inflight"):
+        if (
+            request_ids
+            and not async_decode
+            and hasattr(self.scheduler, "mark_hb_inflight")
+        ):
             self.scheduler.mark_hb_inflight(request_ids)
         inflight_lanes.add(lane)
         self._hb_inflight_lanes = inflight_lanes
@@ -436,17 +446,22 @@ class EngineCore:
 
     def complete(self, ticket: StepTicket, model_output: ModelRunnerOutput):
         """Publish one finished ticket and make its request ids schedulable."""
+        lane = ticket.scheduler_output.execution_lane
+        async_decode = getattr(self, "_hb_decode_depth", 1) > 1 and lane == "decode"
         try:
             self._process_aborts_queue()
             return self.scheduler.update_from_output(
                 ticket.scheduler_output, model_output
             )
         finally:
-            if hasattr(self.scheduler, "release_hb_inflight"):
+            # Async-decode tickets never marked their ids (see dispatch), so
+            # they must not release ids a concurrent prefill ticket owns.
+            if not async_decode and hasattr(self.scheduler, "release_hb_inflight"):
                 self.scheduler.release_hb_inflight(
                     set(ticket.scheduler_output.num_scheduled_tokens)
                 )
-            self._hb_inflight_lanes.discard(ticket.scheduler_output.execution_lane)
+            if not (async_decode and self._hb_decode_fifo):
+                self._hb_inflight_lanes.discard(lane)
 
     def step(self, lane: str = "default") -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output.
@@ -508,6 +523,26 @@ class EngineCore:
         self._hb_tickets: dict[str, StepTicket | None] = {
             lane: None for lane in self._hb_lanes
         }
+        # HB_P2_ASYNC_DECODE=1: decode lane keeps up to two in-flight tickets
+        # (FIFO), so ticket N+1's host prep (schedule + input staging) hides
+        # under ticket N's GPU execution instead of serializing between
+        # steps — the same effect vLLM's async scheduling gives stock, which
+        # otherwise costs the sync two-lane controller ~2x step time on
+        # small-batch decode tails. Requires the AsyncScheduler (placeholder
+        # accounting); the sbatch wires --scheduler-cls when the env is set.
+        self._hb_decode_depth = (
+            2 if os.environ.get("HB_P2_ASYNC_DECODE") == "1" else 1
+        )
+        if self._hb_decode_depth > 1:
+            from vllm.v1.core.sched.async_scheduler import AsyncScheduler
+
+            if not isinstance(self.scheduler, AsyncScheduler):
+                raise RuntimeError(
+                    "HB_P2_ASYNC_DECODE=1 requires the AsyncScheduler "
+                    "(pass --scheduler-cls vllm.v1.core.sched."
+                    "async_scheduler.AsyncScheduler)."
+                )
+        self._hb_decode_fifo: deque[StepTicket] = deque()
         self._hb_lane_blocked = {lane: False for lane in self._hb_lanes}
         block_pool = self.scheduler.kv_cache_manager.block_pool
         self._hb_block_pool = block_pool
@@ -617,7 +652,10 @@ class EngineCore:
         the controller never blocks on embed."""
         ticket = self.dispatch(lane)
         if self._hb_ticket_tokens(ticket) > 0:
-            self._hb_tickets[lane] = ticket
+            if lane == "decode":
+                self._hb_decode_fifo.append(ticket)
+            else:
+                self._hb_tickets[lane] = ticket
             return None
         self._hb_empty_dispatches[lane] += 1
         self._hb_lane_blocked[lane] = True
@@ -673,23 +711,32 @@ class EngineCore:
                 state == "running"
                 and not busy
                 and all(t is None for t in tickets.values())
+                and not self._hb_decode_fifo
                 and (sc is None or sc._done)
             ):
                 torch.cuda.profiler.stop()
                 self._hb_nsys_state = "done"
                 logger.info("[hb-nsys] capture STOP (idle after drain)")
 
-        # (a) Publish any ready ticket, decode first.
-        for cur in self._hb_lanes:
+        # (a) Publish any ready ticket, decode first. Decode publishes
+        #     strictly FIFO: with HB_P2_ASYNC_DECODE the second ticket's
+        #     schedule assumed the first's placeholder tokens, so
+        #     update_from_output must apply in dispatch order.
+        fifo = self._hb_decode_fifo
+        if fifo and fifo[0].future.done():
+            return self._hb_complete("decode", fifo.popleft())
+        for cur in self._hb_prefill_lanes:
             ticket = tickets[cur]
             if ticket is not None and ticket.future.done():
                 tickets[cur] = None
                 return self._hb_complete(cur, ticket)
 
-        # (b) Dispatch decode when decode-ready work exists.
+        # (b) Dispatch decode while the FIFO has room (depth 1 unless
+        #     HB_P2_ASYNC_DECODE=1) and decode-ready work exists; one per
+        #     pass. Ticket N+1's host prep hides under ticket N's GPU step.
         decode_dispatched_now = False
         if (
-            tickets["decode"] is None
+            len(fifo) < self._hb_decode_depth
             and not self._hb_lane_blocked["decode"]
             and self._hb_has_dispatchable_decode()
         ):
@@ -704,7 +751,7 @@ class EngineCore:
         pf_lane = self._hb_free_prefill_lane()
         if (
             pf_lane is not None
-            and (decode_dispatched_now or tickets["decode"] is None)
+            and (decode_dispatched_now or not fifo)
             and self._hb_has_dispatchable_prefill()
         ):
             if self._hb_prefill_headroom_ok():
@@ -717,6 +764,7 @@ class EngineCore:
         # (d) Tickets in flight but nothing publishable yet: wait briefly on the
         #     first completion, then return so input keeps getting admitted.
         inflight = [t for t in tickets.values() if t is not None]
+        inflight.extend(fifo)
         if inflight:
             futures_wait(
                 [t.future for t in inflight],

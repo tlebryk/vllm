@@ -66,7 +66,12 @@ class UniProcExecutor(Executor):
         # output waiter so a long prefill copy cannot head-of-line block a
         # completed decode result.
         if os.environ.get("HB_LANE_ROUTING") == "1":
-            return 3 if os.environ.get("HB_P2_PREFILL_LANES") == "2" else 2
+            batches = 3 if os.environ.get("HB_P2_PREFILL_LANES") == "2" else 2
+            if os.environ.get("HB_P2_ASYNC_DECODE") == "1":
+                # Decode lane holds up to TWO in-flight tickets; each needs
+                # its own async-output waiter.
+                batches += 1
+            return batches
         return 2 if self.scheduler_config.async_scheduling else 1
 
     def collective_rpc(  # type: ignore[override]
@@ -126,7 +131,15 @@ class UniProcExecutor(Executor):
         *,
         lane: str | None = None,
     ) -> ModelRunnerOutput | None | Future[ModelRunnerOutput | None]:
-        args = (grammar_output,) if lane is None else (grammar_output, lane)
+        # The plain step() path tags tickets with lane='default'; the stock
+        # Worker.sample_tokens takes no lane argument, so only forward a lane
+        # to the slackserve worker's real lanes. (Sync scheduling on the stock
+        # worker previously crashed here: TypeError, 3 positional args.)
+        args = (
+            (grammar_output,)
+            if lane is None or lane == "default"
+            else (grammar_output, lane)
+        )
         return self.collective_rpc(
             "sample_tokens",
             args=args,
