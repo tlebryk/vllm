@@ -1,5 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """ctypes binding for libsmctrl stream TPC masking (Bullet's fork of UNC
 libsmctrl). Experimental placement control for Slack Serve lanes.
 
