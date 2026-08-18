@@ -89,6 +89,12 @@ class SlackServeGPUWorker(GPUWorker):
             self._hb_dense_lock is not None
             and lane not in ("decode", "default")
         )
+        if lane not in ("decode", "default"):
+            # Load-conditional prefill mask (HB_SMCTRL_MASK_MIN_RUNNING):
+            # re-mask/uncap the prefill stream before this chunk's launches.
+            from vllm.v1.worker.hb_smctrl import maybe_mask_prefill_for_load
+
+            maybe_mask_prefill_for_load(self._lane_stream(lane))
         if locked:
             # NVTX spans the lock acquire too, so a trace shows prefill's
             # wait behind an embed unit as the gap from range-start to the

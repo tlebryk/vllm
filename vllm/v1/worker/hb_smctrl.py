@@ -105,6 +105,27 @@ def _apply_spec(ctrl: SmCtrl, stream, spec: str) -> None:
 _UNCAP_STATE: dict[int, bool] = {}
 _UNCAP_CTRL: "SmCtrl | None" = None
 
+# Decode-ready running count at prefill-dispatch time, written by the
+# two-lane controller (same process under UniProcExecutor) just before each
+# prefill dispatch. Consumed by maybe_mask_prefill_for_load.
+RUNNING_DECODE_HINT: int = 0
+
+
+def maybe_mask_prefill_for_load(stream) -> None:
+    """HB_SMCTRL_MASK_MIN_RUNNING=k: load-conditional prefill mask.
+
+    Mask the prefill stream (HB_SMCTRL_PREFILL_TPCS) only when at least k
+    decode-ready requests are running; uncap it otherwise. Rationale
+    (lambda<=1 open-loop, 8k corpus): the mask protects the decode ITL tail
+    but dilates prefill ~29% (~+63ms TTFT on 8k prompts); with few running
+    decodes there is nothing to protect and TTFT dominates mean e2el. ~us
+    cost, no-ops unless the state changes or the smctrl envs are unset.
+    """
+    spec = os.environ.get("HB_SMCTRL_MASK_MIN_RUNNING")
+    if not spec:
+        return
+    apply_prefill_uncap(stream, uncapped=RUNNING_DECODE_HINT < int(spec))
+
 
 def apply_prefill_uncap(stream, uncapped: bool) -> None:
     """Re-mask the prefill/dense stream for the embed-only tail: full GPU

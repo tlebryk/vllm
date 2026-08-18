@@ -650,6 +650,17 @@ class EngineCore:
         shared-dense-stream launch mutex (hb_embed_sidecar.DENSE_LAUNCH_LOCK,
         taken by SlackServeGPUWorker.execute_model on the executor thread) —
         the controller never blocks on embed."""
+        if lane not in ("decode", "default"):
+            # Load hint for the worker's load-conditional prefill mask
+            # (HB_SMCTRL_MASK_MIN_RUNNING): decode-ready running count at
+            # prefill-dispatch time. Same-process (UniProcExecutor) handoff.
+            from vllm.v1.worker import hb_smctrl
+
+            hb_smctrl.RUNNING_DECODE_HINT = sum(
+                1
+                for r in self.scheduler.running
+                if r.num_computed_tokens >= r.num_prompt_tokens
+            )
         ticket = self.dispatch(lane)
         if self._hb_ticket_tokens(ticket) > 0:
             if lane == "decode":

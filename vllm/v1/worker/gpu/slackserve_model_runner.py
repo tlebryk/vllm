@@ -176,9 +176,51 @@ class SlackServeModelRunner(GPUModelRunner):
             if lane != "decode":
                 context.attn_scratch = LaneAttentionScratch(self.block_tables)
 
+    def _apply_prefill_custom_ops(self) -> None:
+        """HB_P2_PREFILL_CUSTOM_OPS: per-lane custom-op dispatch.
+
+        Run the server with custom_ops ["none"] so the decode lane's FULL
+        cudagraphs are captured over the inductor-fused (stock-kernel) forward,
+        then -- after capture, when the decode lane only ever *replays* graphs
+        and never re-enters Python module forwards -- rebind the listed
+        CustomOps to forward_cuda. The only remaining caller of module
+        forwards is the eager prefill lane (skip_compiled=True), which needs
+        the hand-fused CUDA kernels to avoid the unfused-native launch storm.
+        Measured motivation: the shared custom_ops set taxes uncontended
+        decode steps +6-9% at batch<=16 (the lambda=0.87 loss), while
+        custom_ops none globally blows up prefill (TTFT +192ms, decode stalls
+        p99 150-170ms during prefill chunks).
+        """
+        spec = os.environ.get("HB_P2_PREFILL_CUSTOM_OPS", "")
+        if not spec:
+            return
+        names = {s.strip().lstrip("+") for s in spec.split(",") if s.strip()}
+        from vllm.model_executor.custom_op import CustomOp
+
+        flipped = 0
+        for mod in self.model.modules():
+            if isinstance(mod, CustomOp) and getattr(mod, "name", None) in names:
+                mod._forward_method = mod.forward_cuda
+                flipped += 1
+        if flipped == 0:
+            raise RuntimeError(
+                f"HB_P2_PREFILL_CUSTOM_OPS matched no modules: {sorted(names)}"
+            )
+        from vllm.logger import init_logger
+
+        init_logger(__name__).info(
+            "HB_P2_PREFILL_CUSTOM_OPS: rebound %d modules to forward_cuda "
+            "for the eager prefill lane (%s); decode graphs keep the "
+            "captured inductor-fused kernels",
+            flipped,
+            sorted(names),
+        )
+
     def capture_model(self) -> int:
         if not self._compile_prefill:
-            return super().capture_model()
+            n = super().capture_model()
+            self._apply_prefill_custom_ops()
+            return n
         # HB_P2_COMPILE_PREFILL=1: decode graphs must be captured over the
         # ORIGINAL eager forward (decode never uses the compiled callable).
         # support_torch_compile's __call__ returns self.forward whenever
@@ -200,10 +242,12 @@ class SlackServeModelRunner(GPUModelRunner):
                 "expected a support_torch_compile wrapper in mode 3."
             )
         try:
-            return super().capture_model()
+            n = super().capture_model()
         finally:
             for mod, prev in toggled:
                 mod.do_not_compile = prev
+        self._apply_prefill_custom_ops()
+        return n
 
     def _end_prep(
         self, context: "LaneContext", exec_stream: torch.cuda.Stream | None
