@@ -558,7 +558,8 @@ class EngineCore:
         # rate comparison (decode+prefill+embed measured separately).
         self._hb_tok = {"prefill": 0, "decode": 0}
         toklog = os.environ.get("HB_TOKLOG")
-        self._hb_toklog = open(f"{toklog}.llm.jsonl", "a") if toklog else None
+        # handle outlives this scope, written across the engine's life
+        self._hb_toklog = open(f"{toklog}.llm.jsonl", "a") if toklog else None  # noqa: SIM115
         self._hb_toklog_n = 0
         self._hb_serve_ready = True
         logger.info(
