@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Experimental Slack Serve GPU worker.
 
 Keeps lane-specific stream routing out of vLLM's common GPU worker.
@@ -20,7 +22,6 @@ def prefill_lane_names() -> list[str]:
 
 
 class SlackServeGPUWorker(GPUWorker):
-
     def init_device(self) -> None:
         super().init_device()
         self.decode_stream = torch.cuda.Stream(device=self.device)
@@ -46,6 +47,7 @@ class SlackServeGPUWorker(GPUWorker):
         # covers embed launches too.
         if os.environ.get("HB_SMCTRL_LIB"):
             from vllm.v1.worker.hb_smctrl import apply_env_masks
+
             apply_env_masks(
                 {
                     "prefill": self.lane_streams["prefill"],
@@ -60,6 +62,7 @@ class SlackServeGPUWorker(GPUWorker):
                 prefill_launch_lock_release,
                 record_prefill_tail,
             )
+
             self._hb_dense_lock = (
                 prefill_launch_lock_acquire,
                 prefill_launch_lock_release,
@@ -71,6 +74,7 @@ class SlackServeGPUWorker(GPUWorker):
         from vllm.v1.worker.gpu.slackserve_model_runner import (
             SlackServeModelRunner,
         )
+
         return SlackServeModelRunner(self.vllm_config, self.device)
 
     def _lane_stream(self, lane: str) -> torch.cuda.Stream:
@@ -85,10 +89,7 @@ class SlackServeGPUWorker(GPUWorker):
     @torch.inference_mode()
     def execute_model(self, scheduler_output):
         lane = scheduler_output.execution_lane
-        locked = (
-            self._hb_dense_lock is not None
-            and lane not in ("decode", "default")
-        )
+        locked = self._hb_dense_lock is not None and lane not in ("decode", "default")
         if lane not in ("decode", "default"):
             # Load-conditional prefill mask (HB_SMCTRL_MASK_MIN_RUNNING):
             # re-mask/uncap the prefill stream before this chunk's launches.
@@ -104,10 +105,7 @@ class SlackServeGPUWorker(GPUWorker):
         try:
             with torch.cuda.stream(self._lane_stream(lane)):
                 output = super().execute_model(scheduler_output)
-                if (
-                    output is None
-                    and scheduler_output.total_num_scheduled_tokens > 0
-                ):
+                if output is None and scheduler_output.total_num_scheduled_tokens > 0:
                     # Enqueue sampling while this ticket's lane-local inputs
                     # and request slots are still current. The returned
                     # AsyncOutput is waited by UniProcExecutor off-thread, so
@@ -132,10 +130,7 @@ class SlackServeGPUWorker(GPUWorker):
         # AsyncOutput's stream() helper restores ``main_stream`` as the
         # ambient stream on exit, so running this on any other stream would
         # silently launch postprocess unordered w.r.t. the sampler.
-        locked = (
-            self._hb_dense_lock is not None
-            and lane not in ("decode", "default")
-        )
+        locked = self._hb_dense_lock is not None and lane not in ("decode", "default")
         if locked:
             self._hb_dense_lock[0]()
         try:

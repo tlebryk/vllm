@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -5,14 +7,13 @@ from dataclasses import dataclass
 import torch
 
 from vllm.config import VllmConfig
-from vllm.config.compilation import CUDAGraphMode, CompilationMode
+from vllm.config.compilation import CompilationMode, CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.sequence import IntermediateTensors
+from vllm.v1.attention.backends.fa_utils import flash_attn_scheduler_sm_margin
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.outputs import ModelRunnerOutput
-from vllm.v1.attention.backends.fa_utils import flash_attn_scheduler_sm_margin
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
-from vllm.v1.worker.gpu.buffer_utils import fence_uva_pools
 
 # add imports
 from vllm.v1.worker.gpu.block_table import (
@@ -20,6 +21,7 @@ from vllm.v1.worker.gpu.block_table import (
     _compute_slot_mappings_kernel,
     _gather_block_tables_kernel,
 )
+from vllm.v1.worker.gpu.buffer_utils import fence_uva_pools
 from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
     get_uniform_token_count,
@@ -91,8 +93,10 @@ class SlackServeModelRunner(GPUModelRunner):
                 "the compiled callable a single lane."
             )
         if self._compile_any:
-            which = "HB_P2_COMPILE_DECODE" if self._compile_decode else (
-                "HB_P2_COMPILE_PREFILL"
+            which = (
+                "HB_P2_COMPILE_DECODE"
+                if self._compile_decode
+                else ("HB_P2_COMPILE_PREFILL")
             )
             if os.environ.get("HB_P2_DECODE_GRAPHS_ONLY") != "1":
                 raise ValueError(
@@ -295,9 +299,7 @@ class SlackServeModelRunner(GPUModelRunner):
         for group in self.attn_groups:
             for attention_group in group:
                 builder = attention_group.get_metadata_builder(0)
-                if id(builder) in seen or not hasattr(
-                    builder, "use_full_cuda_graph"
-                ):
+                if id(builder) in seen or not hasattr(builder, "use_full_cuda_graph"):
                     continue
                 seen.add(id(builder))
                 builders.append((builder, builder.use_full_cuda_graph))

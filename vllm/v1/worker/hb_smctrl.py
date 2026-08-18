@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """ctypes binding for libsmctrl stream TPC masking (Bullet's fork of UNC
 libsmctrl). Experimental placement control for Slack Serve lanes.
 
@@ -76,9 +78,7 @@ class SmCtrl:
 
     def set_stream_tpc_list(self, stream, indices: list[int]) -> None:
         """Pin ``stream`` to an explicit TPC index set (may be scattered)."""
-        self._set_mask(
-            stream, _disable_mask_from_indices(indices), f"TPCs {indices}"
-        )
+        self._set_mask(stream, _disable_mask_from_indices(indices), f"TPCs {indices}")
 
 
 def parse_range(spec: str) -> tuple[int, int]:
@@ -124,7 +124,7 @@ def maybe_mask_prefill_for_load(stream) -> None:
     spec = os.environ.get("HB_SMCTRL_MASK_MIN_RUNNING")
     if not spec:
         return
-    apply_prefill_uncap(stream, uncapped=RUNNING_DECODE_HINT < int(spec))
+    apply_prefill_uncap(stream, uncapped=int(spec) > RUNNING_DECODE_HINT)
 
 
 def apply_prefill_uncap(stream, uncapped: bool) -> None:

@@ -530,9 +530,7 @@ class EngineCore:
         # otherwise costs the sync two-lane controller ~2x step time on
         # small-batch decode tails. Requires the AsyncScheduler (placeholder
         # accounting); the sbatch wires --scheduler-cls when the env is set.
-        self._hb_decode_depth = (
-            2 if os.environ.get("HB_P2_ASYNC_DECODE") == "1" else 1
-        )
+        self._hb_decode_depth = 2 if os.environ.get("HB_P2_ASYNC_DECODE") == "1" else 1
         if self._hb_decode_depth > 1:
             from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 
@@ -546,16 +544,12 @@ class EngineCore:
         self._hb_lane_blocked = {lane: False for lane in self._hb_lanes}
         block_pool = self.scheduler.kv_cache_manager.block_pool
         self._hb_block_pool = block_pool
-        kv_watermark = float(
-            os.environ.get("HB_P2_PREFILL_KV_WATERMARK", "0") or "0"
-        )
+        kv_watermark = float(os.environ.get("HB_P2_PREFILL_KV_WATERMARK", "0") or "0")
         if kv_watermark:
             self._hb_watermark_unit = int(block_pool.num_gpu_blocks * kv_watermark)
         else:
             block_size = self.vllm_config.cache_config.block_size
-            chunk_blocks = -(
-                -self.scheduler.max_num_scheduled_tokens // block_size
-            )
+            chunk_blocks = -(-self.scheduler.max_num_scheduled_tokens // block_size)
             self._hb_watermark_unit = chunk_blocks + 256
         self._hb_watermark_skips = 0
         self._hb_empty_dispatches = {lane: 0 for lane in self._hb_lanes}
@@ -588,11 +582,8 @@ class EngineCore:
     def _hb_has_dispatchable_prefill(self) -> bool:
         """True if any not-in-flight request still has prompt KV to compute."""
         inflight = self.scheduler._hb_inflight_req_ids
-        return any(
-            r.request_id not in inflight for r in self.scheduler.waiting
-        ) or any(
-            r.request_id not in inflight
-            and r.num_computed_tokens < r.num_prompt_tokens
+        return any(r.request_id not in inflight for r in self.scheduler.waiting) or any(
+            r.request_id not in inflight and r.num_computed_tokens < r.num_prompt_tokens
             for r in self.scheduler.running
         )
 
@@ -632,7 +623,7 @@ class EngineCore:
                 self._hb_toklog.write(
                     f'{{"t": {time.monotonic()}, "prefill_tokens_cum": '
                     f'{self._hb_tok["prefill"]}, "decode_tokens_cum": '
-                    f'{self._hb_tok["decode"]}}}\n'
+                    f"{self._hb_tok['decode']}}}\n"
                 )
                 self._hb_toklog_n += 1
                 if self._hb_toklog_n % 20 == 0:
@@ -712,6 +703,7 @@ class EngineCore:
         # idle are excluded regardless of startup-time jitter.
         if os.environ.get("HB_NSYS_CAPTURE") == "1":
             import torch
+
             busy = self.scheduler.get_num_unfinished_requests() > 0
             state = getattr(self, "_hb_nsys_state", "armed")
             if state == "armed" and self.scheduler.get_num_unfinished_requests() >= 8:
