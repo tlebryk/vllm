@@ -409,7 +409,7 @@ class EngineCore:
         # safe, so neither the single-flight guard nor the inflight-id mark
         # applies to decode in that mode.
         async_decode = getattr(self, "_hb_decode_depth", 1) > 1 and lane == "decode"
-        inflight_lanes = getattr(self, "_hb_inflight_lanes", set())
+        inflight_lanes: set[str] = getattr(self, "_hb_inflight_lanes", set())
         if lane in inflight_lanes and not async_decode:
             raise RuntimeError(
                 f"Slack Serve lane already has an in-flight ticket: {lane}"
@@ -530,9 +530,7 @@ class EngineCore:
         # otherwise costs the sync two-lane controller ~2x step time on
         # small-batch decode tails. Requires the AsyncScheduler (placeholder
         # accounting); the sbatch wires --scheduler-cls when the env is set.
-        self._hb_decode_depth = (
-            2 if os.environ.get("HB_P2_ASYNC_DECODE") == "1" else 1
-        )
+        self._hb_decode_depth = 2 if os.environ.get("HB_P2_ASYNC_DECODE") == "1" else 1
         if self._hb_decode_depth > 1:
             from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 
@@ -544,18 +542,15 @@ class EngineCore:
                 )
         self._hb_decode_fifo: deque[StepTicket] = deque()
         self._hb_lane_blocked = {lane: False for lane in self._hb_lanes}
-        block_pool = self.scheduler.kv_cache_manager.block_pool
+        scheduler: Any = self.scheduler
+        block_pool = scheduler.kv_cache_manager.block_pool
         self._hb_block_pool = block_pool
-        kv_watermark = float(
-            os.environ.get("HB_P2_PREFILL_KV_WATERMARK", "0") or "0"
-        )
+        kv_watermark = float(os.environ.get("HB_P2_PREFILL_KV_WATERMARK", "0") or "0")
         if kv_watermark:
             self._hb_watermark_unit = int(block_pool.num_gpu_blocks * kv_watermark)
         else:
             block_size = self.vllm_config.cache_config.block_size
-            chunk_blocks = -(
-                -self.scheduler.max_num_scheduled_tokens // block_size
-            )
+            chunk_blocks = -(-scheduler.max_num_scheduled_tokens // block_size)
             self._hb_watermark_unit = chunk_blocks + 256
         self._hb_watermark_skips = 0
         self._hb_empty_dispatches = {lane: 0 for lane in self._hb_lanes}
@@ -564,7 +559,8 @@ class EngineCore:
         # rate comparison (decode+prefill+embed measured separately).
         self._hb_tok = {"prefill": 0, "decode": 0}
         toklog = os.environ.get("HB_TOKLOG")
-        self._hb_toklog = open(f"{toklog}.llm.jsonl", "a") if toklog else None
+        # handle outlives this scope, written across the engine's life
+        self._hb_toklog = open(f"{toklog}.llm.jsonl", "a") if toklog else None  # noqa: SIM115
         self._hb_toklog_n = 0
         self._hb_serve_ready = True
         logger.info(
@@ -587,22 +583,21 @@ class EngineCore:
 
     def _hb_has_dispatchable_prefill(self) -> bool:
         """True if any not-in-flight request still has prompt KV to compute."""
-        inflight = self.scheduler._hb_inflight_req_ids
-        return any(
-            r.request_id not in inflight for r in self.scheduler.waiting
-        ) or any(
-            r.request_id not in inflight
-            and r.num_computed_tokens < r.num_prompt_tokens
-            for r in self.scheduler.running
+        scheduler: Any = self.scheduler
+        inflight = scheduler._hb_inflight_req_ids
+        return any(r.request_id not in inflight for r in scheduler.waiting) or any(
+            r.request_id not in inflight and r.num_computed_tokens < r.num_prompt_tokens
+            for r in scheduler.running
         )
 
     def _hb_has_dispatchable_decode(self) -> bool:
         """True if any not-in-flight request is decode-ready (prompt KV done)."""
-        inflight = self.scheduler._hb_inflight_req_ids
+        scheduler: Any = self.scheduler
+        inflight = scheduler._hb_inflight_req_ids
         return any(
             r.request_id not in inflight
             and r.num_computed_tokens >= r.num_prompt_tokens
-            for r in self.scheduler.running
+            for r in scheduler.running
         )
 
     def _hb_free_prefill_lane(self) -> str | None:
@@ -632,7 +627,7 @@ class EngineCore:
                 self._hb_toklog.write(
                     f'{{"t": {time.monotonic()}, "prefill_tokens_cum": '
                     f'{self._hb_tok["prefill"]}, "decode_tokens_cum": '
-                    f'{self._hb_tok["decode"]}}}\n'
+                    f"{self._hb_tok['decode']}}}\n"
                 )
                 self._hb_toklog_n += 1
                 if self._hb_toklog_n % 20 == 0:
@@ -650,6 +645,20 @@ class EngineCore:
         shared-dense-stream launch mutex (hb_embed_sidecar.DENSE_LAUNCH_LOCK,
         taken by SlackServeGPUWorker.execute_model on the executor thread) —
         the controller never blocks on embed."""
+        if lane not in ("decode", "default"):
+            # Load hint for the worker's load-conditional prefill mask
+            # (HB_SMCTRL_MASK_MIN_RUNNING): decode-ready running count at
+            # prefill-dispatch time. Same-process (UniProcExecutor) handoff.
+            from vllm.v1.worker import hb_smctrl
+
+            scheduler: Any = self.scheduler
+            hb_smctrl.RUNNING_DECODE_HINT = len(
+                [
+                    r
+                    for r in scheduler.running
+                    if r.num_computed_tokens >= r.num_prompt_tokens
+                ]
+            )
         ticket = self.dispatch(lane)
         if self._hb_ticket_tokens(ticket) > 0:
             if lane == "decode":
@@ -701,6 +710,7 @@ class EngineCore:
         # idle are excluded regardless of startup-time jitter.
         if os.environ.get("HB_NSYS_CAPTURE") == "1":
             import torch
+
             busy = self.scheduler.get_num_unfinished_requests() > 0
             state = getattr(self, "_hb_nsys_state", "armed")
             if state == "armed" and self.scheduler.get_num_unfinished_requests() >= 8:

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -5,14 +7,13 @@ from dataclasses import dataclass
 import torch
 
 from vllm.config import VllmConfig
-from vllm.config.compilation import CUDAGraphMode, CompilationMode
+from vllm.config.compilation import CompilationMode, CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.sequence import IntermediateTensors
+from vllm.v1.attention.backends.fa_utils import flash_attn_scheduler_sm_margin
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.outputs import ModelRunnerOutput
-from vllm.v1.attention.backends.fa_utils import flash_attn_scheduler_sm_margin
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
-from vllm.v1.worker.gpu.buffer_utils import fence_uva_pools
 
 # add imports
 from vllm.v1.worker.gpu.block_table import (
@@ -20,6 +21,7 @@ from vllm.v1.worker.gpu.block_table import (
     _compute_slot_mappings_kernel,
     _gather_block_tables_kernel,
 )
+from vllm.v1.worker.gpu.buffer_utils import fence_uva_pools
 from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
     get_uniform_token_count,
@@ -91,8 +93,10 @@ class SlackServeModelRunner(GPUModelRunner):
                 "the compiled callable a single lane."
             )
         if self._compile_any:
-            which = "HB_P2_COMPILE_DECODE" if self._compile_decode else (
-                "HB_P2_COMPILE_PREFILL"
+            which = (
+                "HB_P2_COMPILE_DECODE"
+                if self._compile_decode
+                else ("HB_P2_COMPILE_PREFILL")
             )
             if os.environ.get("HB_P2_DECODE_GRAPHS_ONLY") != "1":
                 raise ValueError(
@@ -176,9 +180,51 @@ class SlackServeModelRunner(GPUModelRunner):
             if lane != "decode":
                 context.attn_scratch = LaneAttentionScratch(self.block_tables)
 
+    def _apply_prefill_custom_ops(self) -> None:
+        """HB_P2_PREFILL_CUSTOM_OPS: per-lane custom-op dispatch.
+
+        Run the server with custom_ops ["none"] so the decode lane's FULL
+        cudagraphs are captured over the inductor-fused (stock-kernel) forward,
+        then -- after capture, when the decode lane only ever *replays* graphs
+        and never re-enters Python module forwards -- rebind the listed
+        CustomOps to forward_cuda. The only remaining caller of module
+        forwards is the eager prefill lane (skip_compiled=True), which needs
+        the hand-fused CUDA kernels to avoid the unfused-native launch storm.
+        Measured motivation: the shared custom_ops set taxes uncontended
+        decode steps +6-9% at batch<=16 (the lambda=0.87 loss), while
+        custom_ops none globally blows up prefill (TTFT +192ms, decode stalls
+        p99 150-170ms during prefill chunks).
+        """
+        spec = os.environ.get("HB_P2_PREFILL_CUSTOM_OPS", "")
+        if not spec:
+            return
+        names = {s.strip().lstrip("+") for s in spec.split(",") if s.strip()}
+        from vllm.model_executor.custom_op import CustomOp
+
+        flipped = 0
+        for mod in self.model.modules():
+            if isinstance(mod, CustomOp) and getattr(mod, "name", None) in names:
+                mod._forward_method = mod.forward_cuda
+                flipped += 1
+        if flipped == 0:
+            raise RuntimeError(
+                f"HB_P2_PREFILL_CUSTOM_OPS matched no modules: {sorted(names)}"
+            )
+        from vllm.logger import init_logger
+
+        init_logger(__name__).info(
+            "HB_P2_PREFILL_CUSTOM_OPS: rebound %d modules to forward_cuda "
+            "for the eager prefill lane (%s); decode graphs keep the "
+            "captured inductor-fused kernels",
+            flipped,
+            sorted(names),
+        )
+
     def capture_model(self) -> int:
         if not self._compile_prefill:
-            return super().capture_model()
+            n = super().capture_model()
+            self._apply_prefill_custom_ops()
+            return n
         # HB_P2_COMPILE_PREFILL=1: decode graphs must be captured over the
         # ORIGINAL eager forward (decode never uses the compiled callable).
         # support_torch_compile's __call__ returns self.forward whenever
@@ -200,10 +246,12 @@ class SlackServeModelRunner(GPUModelRunner):
                 "expected a support_torch_compile wrapper in mode 3."
             )
         try:
-            return super().capture_model()
+            n = super().capture_model()
         finally:
             for mod, prev in toggled:
                 mod.do_not_compile = prev
+        self._apply_prefill_custom_ops()
+        return n
 
     def _end_prep(
         self, context: "LaneContext", exec_stream: torch.cuda.Stream | None
@@ -251,9 +299,7 @@ class SlackServeModelRunner(GPUModelRunner):
         for group in self.attn_groups:
             for attention_group in group:
                 builder = attention_group.get_metadata_builder(0)
-                if id(builder) in seen or not hasattr(
-                    builder, "use_full_cuda_graph"
-                ):
+                if id(builder) in seen or not hasattr(builder, "use_full_cuda_graph"):
                     continue
                 seen.add(id(builder))
                 builders.append((builder, builder.use_full_cuda_graph))

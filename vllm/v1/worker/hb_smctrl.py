@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """ctypes binding for libsmctrl stream TPC masking (Bullet's fork of UNC
 libsmctrl). Experimental placement control for Slack Serve lanes.
 
@@ -76,14 +78,12 @@ class SmCtrl:
 
     def set_stream_tpc_list(self, stream, indices: list[int]) -> None:
         """Pin ``stream`` to an explicit TPC index set (may be scattered)."""
-        self._set_mask(
-            stream, _disable_mask_from_indices(indices), f"TPCs {indices}"
-        )
+        self._set_mask(stream, _disable_mask_from_indices(indices), f"TPCs {indices}")
 
 
 def parse_range(spec: str) -> tuple[int, int]:
-    lo, hi = spec.split(":")
-    lo, hi = int(lo), int(hi)
+    lo_raw, hi_raw = spec.split(":")
+    lo, hi = int(lo_raw), int(hi_raw)
     if not 0 <= lo < hi:
         raise ValueError(f"bad TPC range {spec!r}")
     return lo, hi
@@ -104,6 +104,27 @@ def _apply_spec(ctrl: SmCtrl, stream, spec: str) -> None:
 
 _UNCAP_STATE: dict[int, bool] = {}
 _UNCAP_CTRL: "SmCtrl | None" = None
+
+# Decode-ready running count at prefill-dispatch time, written by the
+# two-lane controller (same process under UniProcExecutor) just before each
+# prefill dispatch. Consumed by maybe_mask_prefill_for_load.
+RUNNING_DECODE_HINT: int = 0
+
+
+def maybe_mask_prefill_for_load(stream) -> None:
+    """HB_SMCTRL_MASK_MIN_RUNNING=k: load-conditional prefill mask.
+
+    Mask the prefill stream (HB_SMCTRL_PREFILL_TPCS) only when at least k
+    decode-ready requests are running; uncap it otherwise. Rationale
+    (lambda<=1 open-loop, 8k corpus): the mask protects the decode ITL tail
+    but dilates prefill ~29% (~+63ms TTFT on 8k prompts); with few running
+    decodes there is nothing to protect and TTFT dominates mean e2el. ~us
+    cost, no-ops unless the state changes or the smctrl envs are unset.
+    """
+    spec = os.environ.get("HB_SMCTRL_MASK_MIN_RUNNING")
+    if not spec:
+        return
+    apply_prefill_uncap(stream, uncapped=int(spec) > RUNNING_DECODE_HINT)
 
 
 def apply_prefill_uncap(stream, uncapped: bool) -> None:

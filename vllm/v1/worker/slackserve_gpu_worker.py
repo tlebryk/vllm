@@ -1,9 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Experimental Slack Serve GPU worker.
 
 Keeps lane-specific stream routing out of vLLM's common GPU worker.
 """
 
 import os
+from collections.abc import Callable
+from typing import Any
 
 import torch
 
@@ -20,7 +24,6 @@ def prefill_lane_names() -> list[str]:
 
 
 class SlackServeGPUWorker(GPUWorker):
-
     def init_device(self) -> None:
         super().init_device()
         self.decode_stream = torch.cuda.Stream(device=self.device)
@@ -30,7 +33,7 @@ class SlackServeGPUWorker(GPUWorker):
         # while the GPU executes prefill tickets strictly in order - no
         # added SM contention, and same-request KV ordering comes free.
         shared = os.environ.get("HB_P2_PREFILL_SHARED_STREAM") == "1"
-        self.lane_streams = {}
+        self.lane_streams: dict[str, torch.cuda.Stream] = {}
         for index, lane in enumerate(prefill_lane_names()):
             if shared and index > 0:
                 self.lane_streams[lane] = self.lane_streams["prefill"]
@@ -46,20 +49,22 @@ class SlackServeGPUWorker(GPUWorker):
         # covers embed launches too.
         if os.environ.get("HB_SMCTRL_LIB"):
             from vllm.v1.worker.hb_smctrl import apply_env_masks
+
             apply_env_masks(
                 {
                     "prefill": self.lane_streams["prefill"],
                     "decode": self.decode_stream,
                 }
             )
-        self._hb_dense_lock = None
-        self._hb_record_prefill_tail = None
+        self._hb_dense_lock: tuple[Callable[[], None], Callable[[], None]] | None = None
+        self._hb_record_prefill_tail: Callable[[torch.cuda.Stream], None] | None = None
         if os.environ.get("HB_P2_EMBED_SIDECAR") == "1":
             from vllm.v1.engine.hb_embed_sidecar import (
                 prefill_launch_lock_acquire,
                 prefill_launch_lock_release,
                 record_prefill_tail,
             )
+
             self._hb_dense_lock = (
                 prefill_launch_lock_acquire,
                 prefill_launch_lock_release,
@@ -67,10 +72,11 @@ class SlackServeGPUWorker(GPUWorker):
             self._hb_record_prefill_tail = record_prefill_tail
 
     # override factory hook to use new model
-    def _create_model_runner(self):
+    def _create_model_runner(self) -> Any:
         from vllm.v1.worker.gpu.slackserve_model_runner import (
             SlackServeModelRunner,
         )
+
         return SlackServeModelRunner(self.vllm_config, self.device)
 
     def _lane_stream(self, lane: str) -> torch.cuda.Stream:
@@ -85,23 +91,26 @@ class SlackServeGPUWorker(GPUWorker):
     @torch.inference_mode()
     def execute_model(self, scheduler_output):
         lane = scheduler_output.execution_lane
-        locked = (
-            self._hb_dense_lock is not None
-            and lane not in ("decode", "default")
-        )
+        dense_lock = self._hb_dense_lock
+        record_prefill_tail = self._hb_record_prefill_tail
+        locked = dense_lock is not None and lane not in ("decode", "default")
+        if lane not in ("decode", "default"):
+            # Load-conditional prefill mask (HB_SMCTRL_MASK_MIN_RUNNING):
+            # re-mask/uncap the prefill stream before this chunk's launches.
+            from vllm.v1.worker.hb_smctrl import maybe_mask_prefill_for_load
+
+            maybe_mask_prefill_for_load(self._lane_stream(lane))
         if locked:
+            assert dense_lock is not None
             # NVTX spans the lock acquire too, so a trace shows prefill's
             # wait behind an embed unit as the gap from range-start to the
             # first prefill kernel.
             torch.cuda.nvtx.range_push("dense/prefill")
-            self._hb_dense_lock[0]()
+            dense_lock[0]()
         try:
             with torch.cuda.stream(self._lane_stream(lane)):
                 output = super().execute_model(scheduler_output)
-                if (
-                    output is None
-                    and scheduler_output.total_num_scheduled_tokens > 0
-                ):
+                if output is None and scheduler_output.total_num_scheduled_tokens > 0:
                     # Enqueue sampling while this ticket's lane-local inputs
                     # and request slots are still current. The returned
                     # AsyncOutput is waited by UniProcExecutor off-thread, so
@@ -110,11 +119,13 @@ class SlackServeGPUWorker(GPUWorker):
                         None, lane=lane, return_async=True
                     )
                 if locked:
-                    self._hb_record_prefill_tail(self._lane_stream(lane))
+                    assert record_prefill_tail is not None
+                    record_prefill_tail(self._lane_stream(lane))
                 return output
         finally:
             if locked:
-                self._hb_dense_lock[1]()
+                assert dense_lock is not None
+                dense_lock[1]()
                 torch.cuda.nvtx.range_pop()
 
     @torch.inference_mode()
@@ -126,18 +137,20 @@ class SlackServeGPUWorker(GPUWorker):
         # AsyncOutput's stream() helper restores ``main_stream`` as the
         # ambient stream on exit, so running this on any other stream would
         # silently launch postprocess unordered w.r.t. the sampler.
-        locked = (
-            self._hb_dense_lock is not None
-            and lane not in ("decode", "default")
-        )
+        dense_lock = self._hb_dense_lock
+        record_prefill_tail = self._hb_record_prefill_tail
+        locked = dense_lock is not None and lane not in ("decode", "default")
         if locked:
-            self._hb_dense_lock[0]()
+            assert dense_lock is not None
+            dense_lock[0]()
         try:
             with torch.cuda.stream(self._lane_stream(lane)):
                 output = self.model_runner.sample_tokens(grammar_output, lane=lane)
                 if locked:
-                    self._hb_record_prefill_tail(self._lane_stream(lane))
+                    assert record_prefill_tail is not None
+                    record_prefill_tail(self._lane_stream(lane))
                 return output
         finally:
             if locked:
-                self._hb_dense_lock[1]()
+                assert dense_lock is not None
+                dense_lock[1]()

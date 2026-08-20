@@ -67,7 +67,6 @@ logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
-    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 
 class AsyncIntermediateTensors(IntermediateTensors):
@@ -151,10 +150,10 @@ class Worker(WorkerBase):
             raise ValueError(f"Unknown profiler type: {self.profiler_config.profiler}")
 
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
+        # Initialized in init_device; Any covers the V1 and V2 runner APIs.
+        self.model_runner: Any = None
         # pending non-blocking PP send work from the previous iteration
         self._pp_send_work: list[Handle] = []
-
-
 
     def sleep(self, level: int = 1) -> None:
         from vllm.device_allocator.cumem import CuMemAllocator
@@ -298,15 +297,19 @@ class Worker(WorkerBase):
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
             report_usage_stats(self.vllm_config)
-    
-    # factory hook to create model runner, can be overridden by subclasses
-    def _create_model_runner(self):
-        if self.use_v2_model_runner:
-            from vllm.v1.worker.gpu.model_runner import GPUModelRunner
-            return GPUModelRunner(self.vllm_config, self.device)
 
-        from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-        return GPUModelRunner(self.vllm_config, self.device)
+    # factory hook to create model runner, can be overridden by subclasses
+    def _create_model_runner(self) -> Any:
+        if self.use_v2_model_runner:
+            from vllm.v1.worker.gpu.model_runner import (
+                GPUModelRunner as V2GPUModelRunner,
+            )
+
+            return V2GPUModelRunner(self.vllm_config, self.device)
+
+        from vllm.v1.worker.gpu_model_runner import GPUModelRunner as V1GPUModelRunner
+
+        return V1GPUModelRunner(self.vllm_config, self.device)
 
     # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool
     # to hijack tensor allocation.

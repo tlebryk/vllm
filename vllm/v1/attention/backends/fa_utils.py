@@ -22,6 +22,8 @@ if current_platform.is_cuda():
     from vllm._custom_ops import reshape_and_cache_flash
     from vllm.vllm_flash_attn import (  # type: ignore[attr-defined]
         flash_attn_varlen_func,
+    )
+    from vllm.vllm_flash_attn import (
         get_scheduler_metadata as _get_scheduler_metadata,
     )
 

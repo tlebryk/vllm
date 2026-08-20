@@ -44,12 +44,14 @@ class SchedulerInterface(ABC):
         mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
         include_finished_set: bool = False,
         log_stats: bool = False,
-
     ) -> None:
         raise NotImplementedError
 
     @abstractmethod
-    def schedule(self, lane: str= "default",) -> "SchedulerOutput":
+    def schedule(
+        self,
+        lane: str = "default",
+    ) -> "SchedulerOutput":
         """Schedule the requests to process in this scheduling step.
 
         The scheduling decision is made at the iteration level. Each scheduling
