@@ -13,7 +13,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass
 from threading import Thread
-from typing import Any, TypeAlias, TypeVar
+from typing import Any, TypeAlias, TypeVar, cast
 
 import msgspec.msgpack
 import zmq
@@ -287,12 +287,10 @@ class InprocClient(EngineCoreClient):
         # async scheduling is enabled, step_fn is step_with_batch_queue(),
         # which deliberately has no lane argument or lane semantics yet.
         if self.engine_core.batch_queue is None:
-            outputs, model_executed = self.engine_core.step_fn(lane=lane)
+            outputs, model_executed = cast(Any, self.engine_core.step_fn)(lane=lane)
         else:
             if lane != "default":
-                raise RuntimeError(
-                    "lane routing requires async_scheduling=False in P0"
-                )
+                raise RuntimeError("lane routing requires async_scheduling=False in P0")
             outputs, model_executed = self.engine_core.step_fn()
         self.engine_core.post_step(model_executed=model_executed)
         return outputs and outputs.get(0) or EngineCoreOutputs()

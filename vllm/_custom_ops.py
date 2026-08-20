@@ -81,9 +81,11 @@ def create_fp4_output_tensors(
 
 
 has_scaled_fp4_quant = hasattr(torch.ops, "_C") and hasattr(
-    torch.ops._C, "scaled_fp4_quant")
+    torch.ops._C, "scaled_fp4_quant"
+)
 has_scaled_fp4_quant_out = has_scaled_fp4_quant and hasattr(
-    torch.ops._C.scaled_fp4_quant, "out")
+    torch.ops._C.scaled_fp4_quant, "out"
+)
 
 if has_scaled_fp4_quant:
 

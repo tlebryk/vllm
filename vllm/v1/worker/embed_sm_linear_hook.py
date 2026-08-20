@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Route large embedding-model linears through cuBLASLt with an SM target.
 
 The SM target is a cuBLASLt algorithm-selection hint, not an affinity wall.
@@ -152,7 +154,7 @@ def _install_patch() -> None:
     def patched_lin(self, layer, x, bias=None):
         return _route(orig_lin, self, layer, x, bias)
 
-    UnquantizedLinearMethod.apply = patched_lin
+    UnquantizedLinearMethod.apply = patched_lin  # type: ignore[method-assign]
     logger.info(
         "[embed-sm-linear] patched UnquantizedLinearMethod.apply "
         "(marked-model-gated cuBLASLt SM_COUNT_TARGET path)."

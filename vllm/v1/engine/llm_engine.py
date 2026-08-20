@@ -4,7 +4,7 @@
 import time
 from collections.abc import Callable, Mapping
 from copy import copy
-from typing import Any
+from typing import Any, cast
 
 import torch.nn as nn
 from typing_extensions import TypeVar
@@ -304,7 +304,7 @@ class LLMEngine:
             if lane == "default":
                 outputs = self.engine_core.get_output()
             else:
-                outputs = self.engine_core.get_output(lane=lane)
+                outputs = cast(Any, self.engine_core).get_output(lane=lane)
 
         # 2) Process EngineCoreOutputs.
         with record_function_or_nullcontext("llm_engine step: process_outputs"):

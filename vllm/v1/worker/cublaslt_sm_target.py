@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Small cuBLASLt wrapper exposing the per-matmul SM-count target.
 
 This is intentionally local to the microexperiment.  PyTorch does not expose
@@ -12,6 +14,7 @@ import glob
 import os
 import sys
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 
@@ -46,7 +49,8 @@ class _Plan:
     layout_a: ct.c_void_p
     layout_b: ct.c_void_p
     layout_c: ct.c_void_p
-    heuristic_results: object
+    # ctypes arrays do not expose their element type precisely to mypy.
+    heuristic_results: Any
     algo_index: int
 
     @property
@@ -294,13 +298,9 @@ class CublasLtMatmul:
         #   first (default) | max_waves | min_waves | rank:<i>
         policy = os.environ.get("HB_LT_ALGO_SELECT", "first")
         if policy == "max_waves":
-            algorithm_index = max(
-                candidates, key=lambda i: results[i].waves_count
-            )
+            algorithm_index = max(candidates, key=lambda i: results[i].waves_count)
         elif policy == "min_waves":
-            algorithm_index = min(
-                candidates, key=lambda i: results[i].waves_count
-            )
+            algorithm_index = min(candidates, key=lambda i: results[i].waves_count)
         elif policy.startswith("prefer:"):
             # Preference list of algo-id byte-4 hex values (e.g.
             # "prefer:d1,18,17"): take the first candidate from the
@@ -310,8 +310,7 @@ class CublasLtMatmul:
             # launch full-GPU grids (132 CTAs on H100), starving the
             # overlapped decode lane.
             allowed = {
-                pref.strip().lower()
-                for pref in policy.split(":", 1)[1].split(",")
+                pref.strip().lower() for pref in policy.split(":", 1)[1].split(",")
             }
             algorithm_index = next(
                 (

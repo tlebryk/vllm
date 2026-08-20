@@ -92,6 +92,7 @@ def prefill_tail_clear() -> bool:
     event = PREFILL_TAIL["event"]
     return event is None or event.query()
 
+
 # Telemetry (GIL-atomic enough for counters; read at drain report time).
 LOCK_STATS = {
     "prefill_wait_ms": 0.0,
@@ -147,9 +148,7 @@ def _count_marked_linears(engine: Any) -> int:
     model = getattr(runner, "model", None)
     if model is None:
         model = runner.get_model()
-    return sum(
-        1 for m in model.modules() if getattr(m, "_hb_embed_sm_capped", False)
-    )
+    return sum(1 for m in model.modules() if getattr(m, "_hb_embed_sm_capped", False))
 
 
 class HbEmbedSidecar:
@@ -166,7 +165,9 @@ class HbEmbedSidecar:
         # 4096: the embed micro-step is the unit of dense-stream FIFO
         # granularity; a 4K step keeps the worst prefill lock handoff ~40ms.
         self.embed_budget = int(os.environ.get("HB_P2_EMBED_BUDGET", "4096"))
-        self.embed_max_model_len = int(os.environ.get("HB_P2_EMBED_MAX_MODEL_LEN", "2048"))
+        self.embed_max_model_len = int(
+            os.environ.get("HB_P2_EMBED_MAX_MODEL_LEN", "2048")
+        )
         self.embed_max_num_seqs = int(os.environ.get("HB_P2_EMBED_MAX_NUM_SEQS", "512"))
         self.embed_n = int(os.environ.get("HB_P2_EMBED_N", "512"))
         self.embed_queue_path = os.environ.get(
@@ -210,7 +211,11 @@ class HbEmbedSidecar:
         self.embed_tokens_cum = 0
         # Three-stream token accounting: cumulative embed tokens, timestamped.
         toklog = os.environ.get("HB_TOKLOG")
-        self._toklog = open(f"{toklog}.embed.jsonl", "a") if toklog else None
+        self._toklog = (
+            open(f"{toklog}.embed.jsonl", "a")  # noqa: SIM115
+            if toklog
+            else None
+        )
         self.pooled: set[str] = set()
         self.norm_samples: list[float] = []
         self.step_records: list[dict[str, Any]] = []
@@ -222,9 +227,9 @@ class HbEmbedSidecar:
     def build(self) -> None:
         from vllm import LLMEngine
         from vllm.engine.arg_utils import EngineArgs
-        from vllm.pooling_params import PoolingParams
         from vllm.envs import disable_envs_cache, enable_envs_cache
         from vllm.platforms import current_platform
+        from vllm.pooling_params import PoolingParams
 
         t0 = time.perf_counter()
         type(current_platform)._global_graph_pool = None
@@ -256,7 +261,7 @@ class HbEmbedSidecar:
         )
         disable_envs_cache()
         try:
-            kwargs = dict(
+            kwargs: dict[str, Any] = dict(
                 model=self.embed_model,
                 dtype="bfloat16",
                 trust_remote_code=True,
@@ -275,10 +280,15 @@ class HbEmbedSidecar:
                     "max_cudagraph_capture_size": 512,
                 },
             )
-            logger.info("[hb-embed-sidecar] building embed engine model=%s gmu=%.3f "
-                        "budget=%d max_model_len=%d sm_target=%d",
-                        self.embed_model, self.embed_gmu, self.embed_budget,
-                        self.embed_max_model_len, self.embed_sm_target)
+            logger.info(
+                "[hb-embed-sidecar] building embed engine model=%s gmu=%.3f "
+                "budget=%d max_model_len=%d sm_target=%d",
+                self.embed_model,
+                self.embed_gmu,
+                self.embed_budget,
+                self.embed_max_model_len,
+                self.embed_sm_target,
+            )
             self.engine = LLMEngine.from_engine_args(EngineArgs(**kwargs))
         finally:
             os.environ.pop("HB_EMBED_SM_COUNT_TARGET", None)
@@ -307,6 +317,7 @@ class HbEmbedSidecar:
         # (controller) thread, while no LLM traffic exists to race with. The
         # drain thread then opts out of registration entirely.
         from vllm.v1.worker.gpu.buffer_utils import fence_uva_pools
+
         fence_uva_pools(None)
 
         rows = [
@@ -315,7 +326,9 @@ class HbEmbedSidecar:
             if line.strip()
         ]
         if not rows:
-            raise ValueError(f"[hb-embed-sidecar] empty embed queue: {self.embed_queue_path}")
+            raise ValueError(
+                f"[hb-embed-sidecar] empty embed queue: {self.embed_queue_path}"
+            )
         prompts = [rows[i % len(rows)] for i in range(self.embed_n)]
         tokenizer = self.engine.tokenizer
         params = PoolingParams(task="embed")
@@ -329,7 +342,9 @@ class HbEmbedSidecar:
         self.prompt_count = self.embed_n
         logger.info(
             "[hb-embed-sidecar] built in %.1fs: marked_linears=%d queued=%d core=%s",
-            time.perf_counter() - t0, self.marked_linears, self.prompt_count,
+            time.perf_counter() - t0,
+            self.marked_linears,
+            self.prompt_count,
             core_name,
         )
 
@@ -350,9 +365,9 @@ class HbEmbedSidecar:
         self._thread.start()
 
     def _drain(self) -> None:
+        from vllm.utils.torch_utils import current_stream
         from vllm.v1.worker.embed_sm_linear_hook import set_runtime_sm_target
         from vllm.v1.worker.gpu.buffer_utils import set_uva_fencing_enabled
-        from vllm.utils.torch_utils import current_stream
 
         # Embed pools must not enter the module-global UVA fence registry
         # (only the LLM runner fences, on its own streams — cross-engine race).
@@ -409,13 +424,12 @@ class HbEmbedSidecar:
                 if idle_uncapped:
                     self.idle_uncapped_steps += 1
                 step_start = time.perf_counter()
-                pooled_before = len(self.pooled)
                 torch.cuda.nvtx.range_push("dense/embed")
                 try:
                     # Enqueues on the shared dense stream behind whatever unit
                     # is already in flight; the pooling execute's inline sync
                     # completes the step before the lock is released.
-                    stats = self._process_step()
+                    self._process_step()
                 finally:
                     torch.cuda.nvtx.range_pop()
                     set_runtime_sm_target(None)
@@ -434,22 +448,37 @@ class HbEmbedSidecar:
                 newly_pooled = len(newly)
                 if newly_pooled > 0 or tokens > 0:
                     self.step_records.append(
-                        {"t": time.perf_counter(), "wall_ms": wall,
-                         "scheduled_tokens": tokens,
-                         "embed_tokens_cum": self.embed_tokens_cum,
-                         "newly_pooled": newly_pooled, "pooled": len(self.pooled)}
+                        {
+                            "t": time.perf_counter(),
+                            "wall_ms": wall,
+                            "scheduled_tokens": tokens,
+                            "embed_tokens_cum": self.embed_tokens_cum,
+                            "newly_pooled": newly_pooled,
+                            "pooled": len(self.pooled),
+                        }
                     )
                     if self._toklog is not None:
-                        self._toklog.write(json.dumps(
-                            {"t": time.perf_counter(),
-                             "embed_tokens_cum": self.embed_tokens_cum}) + "\n")
+                        self._toklog.write(
+                            json.dumps(
+                                {
+                                    "t": time.perf_counter(),
+                                    "embed_tokens_cum": self.embed_tokens_cum,
+                                }
+                            )
+                            + "\n"
+                        )
                         self._toklog.flush()
                     n = len(self.step_records)
                     if n <= 4 or n % 8 == 0:
                         logger.info(
                             "[hb-embed-sidecar] step #%d tokens=%d newly_pooled=%d "
-                            "wall_ms=%.1f pooled=%d/%d", n, tokens, newly_pooled,
-                            wall, len(self.pooled), self.prompt_count,
+                            "wall_ms=%.1f pooled=%d/%d",
+                            n,
+                            tokens,
+                            newly_pooled,
+                            wall,
+                            len(self.pooled),
+                            self.prompt_count,
                         )
         finally:
             set_runtime_sm_target(None)
@@ -473,7 +502,8 @@ class HbEmbedSidecar:
                     except Exception:  # noqa: BLE001
                         self.norm_samples.append(float("nan"))
         processed = engine.output_processor.process_outputs(
-            output.outputs, engine_core_timestamp=output.timestamp,
+            output.outputs,
+            engine_core_timestamp=output.timestamp,
             iteration_stats=None,
         )
         engine.output_processor.update_scheduler_stats(output.scheduler_stats)
@@ -486,25 +516,36 @@ class HbEmbedSidecar:
         total_tokens = sum(r["scheduled_tokens"] for r in self.step_records)
         frac = len(self.pooled) / self.prompt_count if self.prompt_count else 0.0
         logger.info(
-            "[hb-embed-sidecar] HB_SIDECAR_DONE pooled=%d expected=%d drained_frac=%.3f "
+            "[hb-embed-sidecar] HB_SIDECAR_DONE pooled=%d expected=%d "
+            "drained_frac=%.3f "
             "wall_ms=%.1f steps=%d embed_tokens=%d budget=%d "
             "idle_uncapped_steps=%d "
             "lock{prefill_wait_ms=%.1f prefill_waits=%d prefill_max_ms=%.1f "
             "embed_wait_ms=%.1f embed_waits=%d embed_max_ms=%.1f} "
             "norm_samples=%s nan=%d",
-            len(self.pooled), self.prompt_count, frac, wall_ms,
-            len(self.step_records), total_tokens, self.embed_budget,
+            len(self.pooled),
+            self.prompt_count,
+            frac,
+            wall_ms,
+            len(self.step_records),
+            total_tokens,
+            self.embed_budget,
             self.idle_uncapped_steps,
-            LOCK_STATS["prefill_wait_ms"], LOCK_STATS["prefill_waits"],
+            LOCK_STATS["prefill_wait_ms"],
+            LOCK_STATS["prefill_waits"],
             LOCK_STATS["prefill_max_wait_ms"],
-            LOCK_STATS["embed_wait_ms"], LOCK_STATS["embed_waits"],
+            LOCK_STATS["embed_wait_ms"],
+            LOCK_STATS["embed_waits"],
             LOCK_STATS["embed_max_wait_ms"],
-            [round(x, 3) for x in self.norm_samples], n_nan,
+            [round(x, 3) for x in self.norm_samples],
+            n_nan,
         )
         if len(self.pooled) != self.prompt_count:
             logger.warning(
                 "[hb-embed-sidecar] embed drain incomplete: pooled=%d/%d (frac=%.3f)",
-                len(self.pooled), self.prompt_count, frac,
+                len(self.pooled),
+                self.prompt_count,
+                frac,
             )
         if n_nan:
             logger.error("[hb-embed-sidecar] CORRECTNESS FAIL %d NaN norms", n_nan)

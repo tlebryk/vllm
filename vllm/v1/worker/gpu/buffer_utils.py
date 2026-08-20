@@ -115,7 +115,9 @@ class UvaBufferPool:
         if self._event_pending[self._curr]:
             # A fenced consumer of this buffer's previous contents may still
             # be in flight; wait before the host rewrites the memory.
-            self._events[self._curr].synchronize()
+            event = self._events[self._curr]
+            assert event is not None
+            event.synchronize()
             self._event_pending[self._curr] = False
         if _uva_fencing_enabled():
             if not self._dirty:

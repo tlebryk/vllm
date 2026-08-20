@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """ctypes binding for libsmctrl stream TPC masking (Bullet's fork of UNC
 libsmctrl). Experimental placement control for Slack Serve lanes.
 
@@ -80,8 +82,8 @@ class SmCtrl:
 
 
 def parse_range(spec: str) -> tuple[int, int]:
-    lo, hi = spec.split(":")
-    lo, hi = int(lo), int(hi)
+    lo_raw, hi_raw = spec.split(":")
+    lo, hi = int(lo_raw), int(hi_raw)
     if not 0 <= lo < hi:
         raise ValueError(f"bad TPC range {spec!r}")
     return lo, hi

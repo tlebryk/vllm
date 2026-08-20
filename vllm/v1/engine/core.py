@@ -409,7 +409,7 @@ class EngineCore:
         # safe, so neither the single-flight guard nor the inflight-id mark
         # applies to decode in that mode.
         async_decode = getattr(self, "_hb_decode_depth", 1) > 1 and lane == "decode"
-        inflight_lanes = getattr(self, "_hb_inflight_lanes", set())
+        inflight_lanes: set[str] = getattr(self, "_hb_inflight_lanes", set())
         if lane in inflight_lanes and not async_decode:
             raise RuntimeError(
                 f"Slack Serve lane already has an in-flight ticket: {lane}"
@@ -542,14 +542,15 @@ class EngineCore:
                 )
         self._hb_decode_fifo: deque[StepTicket] = deque()
         self._hb_lane_blocked = {lane: False for lane in self._hb_lanes}
-        block_pool = self.scheduler.kv_cache_manager.block_pool
+        scheduler: Any = self.scheduler
+        block_pool = scheduler.kv_cache_manager.block_pool
         self._hb_block_pool = block_pool
         kv_watermark = float(os.environ.get("HB_P2_PREFILL_KV_WATERMARK", "0") or "0")
         if kv_watermark:
             self._hb_watermark_unit = int(block_pool.num_gpu_blocks * kv_watermark)
         else:
             block_size = self.vllm_config.cache_config.block_size
-            chunk_blocks = -(-self.scheduler.max_num_scheduled_tokens // block_size)
+            chunk_blocks = -(-scheduler.max_num_scheduled_tokens // block_size)
             self._hb_watermark_unit = chunk_blocks + 256
         self._hb_watermark_skips = 0
         self._hb_empty_dispatches = {lane: 0 for lane in self._hb_lanes}
@@ -582,19 +583,21 @@ class EngineCore:
 
     def _hb_has_dispatchable_prefill(self) -> bool:
         """True if any not-in-flight request still has prompt KV to compute."""
-        inflight = self.scheduler._hb_inflight_req_ids
-        return any(r.request_id not in inflight for r in self.scheduler.waiting) or any(
+        scheduler: Any = self.scheduler
+        inflight = scheduler._hb_inflight_req_ids
+        return any(r.request_id not in inflight for r in scheduler.waiting) or any(
             r.request_id not in inflight and r.num_computed_tokens < r.num_prompt_tokens
-            for r in self.scheduler.running
+            for r in scheduler.running
         )
 
     def _hb_has_dispatchable_decode(self) -> bool:
         """True if any not-in-flight request is decode-ready (prompt KV done)."""
-        inflight = self.scheduler._hb_inflight_req_ids
+        scheduler: Any = self.scheduler
+        inflight = scheduler._hb_inflight_req_ids
         return any(
             r.request_id not in inflight
             and r.num_computed_tokens >= r.num_prompt_tokens
-            for r in self.scheduler.running
+            for r in scheduler.running
         )
 
     def _hb_free_prefill_lane(self) -> str | None:
@@ -648,10 +651,13 @@ class EngineCore:
             # prefill-dispatch time. Same-process (UniProcExecutor) handoff.
             from vllm.v1.worker import hb_smctrl
 
-            hb_smctrl.RUNNING_DECODE_HINT = sum(
-                1
-                for r in self.scheduler.running
-                if r.num_computed_tokens >= r.num_prompt_tokens
+            scheduler: Any = self.scheduler
+            hb_smctrl.RUNNING_DECODE_HINT = len(
+                [
+                    r
+                    for r in scheduler.running
+                    if r.num_computed_tokens >= r.num_prompt_tokens
+                ]
             )
         ticket = self.dispatch(lane)
         if self._hb_ticket_tokens(ticket) > 0:
