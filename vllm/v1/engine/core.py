@@ -523,14 +523,24 @@ class EngineCore:
         self._hb_tickets: dict[str, StepTicket | None] = {
             lane: None for lane in self._hb_lanes
         }
-        # HB_P2_ASYNC_DECODE=1: decode lane keeps up to two in-flight tickets
+        # Decode lane may keep multiple in-flight tickets
         # (FIFO), so ticket N+1's host prep (schedule + input staging) hides
         # under ticket N's GPU execution instead of serializing between
         # steps — the same effect vLLM's async scheduling gives stock, which
         # otherwise costs the sync two-lane controller ~2x step time on
         # small-batch decode tails. Requires the AsyncScheduler (placeholder
         # accounting); the sbatch wires --scheduler-cls when the env is set.
-        self._hb_decode_depth = 2 if os.environ.get("HB_P2_ASYNC_DECODE") == "1" else 1
+        raw_depth = os.environ.get("HB_P2_ASYNC_DECODE_DEPTH")
+        self._hb_decode_depth = (
+            int(raw_depth)
+            if raw_depth is not None
+            else (2 if os.environ.get("HB_P2_ASYNC_DECODE") == "1" else 1)
+        )
+        if not 1 <= self._hb_decode_depth <= 4:
+            raise ValueError(
+                "HB_P2_ASYNC_DECODE_DEPTH must be between 1 and 4; "
+                f"got {self._hb_decode_depth}"
+            )
         if self._hb_decode_depth > 1:
             from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 

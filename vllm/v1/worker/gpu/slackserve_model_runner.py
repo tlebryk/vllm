@@ -136,12 +136,23 @@ class SlackServeModelRunner(GPUModelRunner):
         # reading. One in-flight ticket per lane makes same-lane reuse safe.
         self.use_prep_streams = os.environ.get("HB_P2_PREP_STREAM") == "1"
         self.prep_streams: dict[str, torch.cuda.Stream] = {}
-        # HB_P2_ASYNC_DECODE=1: the controller keeps up to two decode tickets
+        # The controller may keep multiple decode tickets
         # in flight (see EngineCore.step_two_lane). All host prep is enqueued
         # from the engine thread in dispatch order, so lane-context reuse
         # stays serialized; the only per-ticket resource is the output
         # copy_event (fresh per decode sample below).
-        self._hb_async_decode = os.environ.get("HB_P2_ASYNC_DECODE") == "1"
+        raw_depth = os.environ.get("HB_P2_ASYNC_DECODE_DEPTH")
+        async_decode_depth = (
+            int(raw_depth)
+            if raw_depth is not None
+            else (2 if os.environ.get("HB_P2_ASYNC_DECODE") == "1" else 1)
+        )
+        if not 1 <= async_decode_depth <= 4:
+            raise ValueError(
+                "HB_P2_ASYNC_DECODE_DEPTH must be between 1 and 4; "
+                f"got {async_decode_depth}"
+            )
+        self._hb_async_decode = async_decode_depth > 1
 
         self.contexts = {
             "decode": LaneContext(
