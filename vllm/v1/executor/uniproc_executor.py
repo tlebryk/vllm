@@ -67,10 +67,20 @@ class UniProcExecutor(Executor):
         # completed decode result.
         if os.environ.get("HB_LANE_ROUTING") == "1":
             batches = 3 if os.environ.get("HB_P2_PREFILL_LANES") == "2" else 2
-            if os.environ.get("HB_P2_ASYNC_DECODE") == "1":
-                # Decode lane holds up to TWO in-flight tickets; each needs
-                # its own async-output waiter.
-                batches += 1
+            raw_depth = os.environ.get("HB_P2_ASYNC_DECODE_DEPTH")
+            decode_depth = (
+                int(raw_depth)
+                if raw_depth is not None
+                else (2 if os.environ.get("HB_P2_ASYNC_DECODE") == "1" else 1)
+            )
+            if not 1 <= decode_depth <= 4:
+                raise ValueError(
+                    "HB_P2_ASYNC_DECODE_DEPTH must be between 1 and 4; "
+                    f"got {decode_depth}"
+                )
+            # The base count includes one decode ticket. Every additional
+            # launch-ahead ticket needs its own async-output waiter.
+            batches += decode_depth - 1
             return batches
         return 2 if self.scheduler_config.async_scheduling else 1
 
