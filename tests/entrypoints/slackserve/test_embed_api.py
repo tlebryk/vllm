@@ -112,7 +112,7 @@ def test_hybrid_defaults_are_reproducible(clean_hb_environment):
     assert args.compilation_config.cudagraph_mode.name == "FULL"
     assert args.compilation_config.custom_ops == ["none"]
     assert os.environ["HB_P2_EMBED_GMU"] == "0.18"
-    assert os.environ["HB_P2_PREFILL_KV_WATERMARK"] == "0.08"
+    assert os.environ["HB_P2_PREFILL_KV_WATERMARK"] == "0.02"
 
 
 def test_hybrid_forces_topology_b_invariants(clean_hb_environment):

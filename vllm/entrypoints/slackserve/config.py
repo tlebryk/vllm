@@ -110,8 +110,9 @@ def configure_dense_sidecar(args: Namespace) -> None:
     )
     for name, value in {
         "HB_PREFILL_SM_COUNT_TARGET": "96",
-        # Reserve output KV for the natural resident decode wave.
-        "HB_P2_PREFILL_KV_WATERMARK": "0.08",
+        # Small KV admission reserve; async-ticket refcounts provide the
+        # correctness boundary when the physical KV pool becomes tight.
+        "HB_P2_PREFILL_KV_WATERMARK": "0.02",
         "HB_LT_ALGO_SELECT": "prefer:d1,18,17",
         # Eager prefill needs these fused kernels when decode owns compilation.
         "HB_P2_PREFILL_CUSTOM_OPS": (

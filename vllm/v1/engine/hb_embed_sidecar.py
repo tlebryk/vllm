@@ -545,7 +545,9 @@ class HbEmbedSidecar:
                         "dense request finished without a pooling output"
                     )
                 data = pooling.data.detach().cpu().reshape(-1).tolist()
-                prompt_tokens = self.req_tokens.pop(item.request_id, 0)
+                # Keep the token count until _drain_live records this
+                # completed work unit in the per-step provenance log.
+                prompt_tokens = self.req_tokens.get(item.request_id, 0)
                 if not future.done():
                     future.set_result(
                         {
@@ -633,9 +635,7 @@ class HbEmbedSidecar:
                 newly = set(self.pooled) - self._pooled_seen
                 self._pooled_seen |= newly
                 tokens = sum(
-                    self.req_tokens.get(request_id)
-                    or self.req_tokens.get(request_id.rsplit("-", 1)[0], 0)
-                    for request_id in newly
+                    self.req_tokens.pop(request_id, 0) for request_id in newly
                 )
                 self.embed_tokens_cum += tokens
                 if newly or tokens:
