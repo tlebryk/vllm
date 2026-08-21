@@ -630,7 +630,11 @@ async def benchmark(
     ramp_up_end_rps: int | None = None,
     ready_check_timeout_sec: int = 600,
     ssl_context: ssl.SSLContext | bool | None = None,
-    slackserve_embedding_model: str | None = None,
+    slackserve_dense_model: str | None = None,
+    slackserve_dense_task: Literal["embed", "classify", "score"] = "embed",
+    slackserve_dense_query: str = (
+        "Determine whether the document is relevant to the query."
+    ),
 ):
     try:
         request_func = ASYNC_REQUEST_FUNCS[endpoint_type]
@@ -685,7 +689,9 @@ async def benchmark(
         ignore_eos=ignore_eos,
         extra_headers=extra_headers,
         extra_body=extra_body,
-        aux_model_name=slackserve_embedding_model,
+        aux_model_name=slackserve_dense_model,
+        aux_task=slackserve_dense_task,
+        aux_query=slackserve_dense_query,
     )
     if ready_check_timeout_sec > 0:
         test_output = await wait_for_endpoint(
@@ -853,7 +859,9 @@ async def benchmark(
             extra_headers=extra_headers,
             extra_body=extra_body,
             request_id=request_id,
-            aux_model_name=slackserve_embedding_model,
+            aux_model_name=slackserve_dense_model,
+            aux_task=slackserve_dense_task,
+            aux_query=slackserve_dense_query,
         )
         tasks.append(
             asyncio.create_task(
@@ -1019,24 +1027,24 @@ async def benchmark(
     if endpoint_type == "slackserve-pde":
         result.update(
             {
-                "slackserve_embedding_model": (
-                    slackserve_embedding_model or "embed"
+                "slackserve_dense_model": slackserve_dense_model or "embed",
+                "slackserve_dense_task": slackserve_dense_task,
+                "slackserve_dense_query": (
+                    slackserve_dense_query if slackserve_dense_task == "score" else None
                 ),
-                "slackserve_embedding_completed": sum(
+                "slackserve_dense_completed": sum(
                     output.aux_success is True for output in outputs
                 ),
-                "slackserve_embedding_input_tokens": sum(
+                "slackserve_dense_input_tokens": sum(
                     output.aux_prompt_len for output in outputs
                 ),
-                "slackserve_embedding_input_lens": [
+                "slackserve_dense_input_lens": [
                     output.aux_prompt_len for output in outputs
                 ],
-                "slackserve_embedding_latencies": [
+                "slackserve_dense_latencies": [
                     output.aux_latency for output in outputs
                 ],
-                "slackserve_embedding_errors": [
-                    output.aux_error for output in outputs
-                ],
+                "slackserve_dense_errors": [output.aux_error for output in outputs],
                 "slackserve_phase_order": "independent_concurrent",
             }
         )
@@ -1296,14 +1304,23 @@ def add_cli_args(parser: argparse.ArgumentParser):
         help="API endpoint.",
     )
     parser.add_argument(
+        "--slackserve-dense-model",
         "--slackserve-embedding-model",
+        dest="slackserve_dense_model",
         type=str,
         default=None,
-        help=(
-            "Embedding model used by --backend slackserve-pde. Each logical "
-            "request posts the prompt independently to /v1/embeddings and "
-            "/v1/completions."
-        ),
+        help=("Dense model used by Slack Serve's paired or standalone backend."),
+    )
+    parser.add_argument(
+        "--slackserve-dense-task",
+        choices=("embed", "classify", "score"),
+        default="embed",
+        help="Dense request shape used by Slack Serve benchmark backends.",
+    )
+    parser.add_argument(
+        "--slackserve-dense-query",
+        default="Determine whether the document is relevant to the query.",
+        help="Fixed query paired with each prompt document for score/rerank.",
     )
     parser.add_argument(
         "--header",
@@ -1853,7 +1870,9 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
         ramp_up_end_rps=args.ramp_up_end_rps,
         ready_check_timeout_sec=args.ready_check_timeout_sec,
         ssl_context=ssl_context,
-        slackserve_embedding_model=args.slackserve_embedding_model,
+        slackserve_dense_model=args.slackserve_dense_model,
+        slackserve_dense_task=args.slackserve_dense_task,
+        slackserve_dense_query=args.slackserve_dense_query,
     )
 
     # Save config and results to json
