@@ -641,9 +641,8 @@ async def async_request_slackserve_pde(
     dense_output, generation_output = await asyncio.gather(dense_task, generation_task)
     end = time.perf_counter()
 
-    # Preserve generation metrics as the primary output while carrying exact
-    # embedding work alongside them. The logical request succeeds only when
-    # both independent endpoint calls succeed.
+    # Generation metrics stay the primary output; dense work rides alongside.
+    # The logical request succeeds only if both endpoint calls succeed.
     generation_output.aux_success = dense_output.success
     generation_output.aux_prompt_len = dense_output.prompt_len
     generation_output.aux_latency = dense_output.latency

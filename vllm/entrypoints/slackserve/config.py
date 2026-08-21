@@ -134,7 +134,7 @@ def configure_dense_sidecar(args: Namespace) -> None:
         "HB_P2_PREFILL_KV_WATERMARK": "0.02",
         "HB_LT_ALGO_SELECT": "prefer:d1,18,17",
         # Eager prefill needs these fused kernels when decode owns compilation.
-        "HB_P2_PREFILL_CUSTOM_OPS": ("+rms_norm,+silu_and_mul,+rotary_embedding"),
+        "HB_P2_PREFILL_CUSTOM_OPS": "+rms_norm,+silu_and_mul,+rotary_embedding",
         "HB_P2_EMBED_SM_TARGET": "0",
         "HB_P2_EMBED_UNCAP_IDLE": "1",
     }.items():

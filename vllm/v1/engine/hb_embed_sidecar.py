@@ -181,11 +181,11 @@ def _count_marked_linears(engine: Any) -> int:
 class HbEmbedSidecar:
     """Owns the in-process dense engine and its shared-stream drain thread.
 
-    The original file-backed embedding drain remains the default benchmark
-    path. ``HB_P2_DENSE_LIVE=1`` instead turns the sidecar into a small
-    in-process service: callers enqueue text through :meth:`submit` and get
-    a Future resolved with that request's pooling output. The sidecar thread
-    remains the sole owner of the auxiliary engine's add/step calls.
+    The file-backed embedding drain stays the default benchmark path.
+    ``HB_P2_DENSE_LIVE=1`` turns the sidecar into an in-process service:
+    :meth:`submit` returns a Future resolved with that request's pooling
+    output. The sidecar thread stays the sole caller of the auxiliary
+    engine's add/step methods.
     """
 
     def __init__(self, host_core: Any) -> None:
@@ -225,10 +225,9 @@ class HbEmbedSidecar:
         # worst prefill wait behind embed roughly halves. Stock machinery —
         # the sync path was just async_scheduling=False calling
         # AsyncPoolingOutput.get_output() inline.
-        # The finite offline drain can pipeline sidecar steps. For live PD-E,
-        # keep the sidecar step synchronous until its batch-queue completion
-        # protocol is integrated with the server controller; the primary
-        # engine still uses Slack Serve's async decode path.
+        # The finite offline drain can pipeline sidecar steps; live PD-E keeps
+        # the step synchronous until the batch-queue completion protocol is
+        # wired into the server controller. Decode stays async either way.
         self.embed_async_sched = (
             os.environ.get("HB_P2_EMBED_ASYNC_SCHED", "0" if self.live else "1") == "1"
         )
@@ -494,9 +493,9 @@ class HbEmbedSidecar:
     ) -> Future[Any]:
         """Queue one live dense request and return its result Future.
 
-        This method runs on the host EngineCore thread through a utility RPC.
-        It deliberately does not call ``engine.add_request``: only the
-        sidecar thread mutates or steps the auxiliary EngineCore.
+        Runs on the host EngineCore thread via a utility RPC; it does not call
+        ``engine.add_request`` because only the sidecar thread mutates or steps
+        the auxiliary EngineCore.
         """
         if not self.live:
             raise RuntimeError("live dense submissions require HB_P2_DENSE_LIVE=1")

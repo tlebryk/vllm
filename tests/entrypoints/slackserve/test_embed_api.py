@@ -216,7 +216,7 @@ def test_hybrid_exports_reranker_configuration(clean_hb_environment):
     configure_dense_sidecar(args)
 
     assert os.environ["HB_P2_DENSE_TASK"] == "score"
-    assert os.environ["HB_P2_DENSE_HF_OVERRIDES"] == ('{"architectures":["Reranker"]}')
+    assert os.environ["HB_P2_DENSE_HF_OVERRIDES"] == '{"architectures":["Reranker"]}'
 
 
 def test_hybrid_rejects_invalid_hf_overrides(clean_hb_environment):

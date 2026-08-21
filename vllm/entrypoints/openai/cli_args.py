@@ -162,10 +162,8 @@ class BaseFrontendArgs:
     slackserve_dense_model: str | None = None
     """Auxiliary pooling checkpoint for Slack Serve's shared-dense sidecar.
 
-    Supplying this enables the Slack Serve two-lane generation controller and
-    exposes the auxiliary model at ``/v1/embeddings``. The model is loaded once
-    inside the primary EngineCore process so it can share the LLM prefill CUDA
-    stream.
+    Enables the two-lane generation controller and loads the model inside the
+    primary EngineCore process so it shares the LLM prefill CUDA stream.
     """
     slackserve_dense_served_model_name: str = "embed"
     """Public ``model`` name accepted by the Slack Serve dense endpoint."""

@@ -693,6 +693,7 @@ async def benchmark(
         aux_task=slackserve_dense_task,
         aux_query=slackserve_dense_query,
     )
+
     if ready_check_timeout_sec > 0:
         test_output = await wait_for_endpoint(
             request_func,
@@ -1048,6 +1049,7 @@ async def benchmark(
                 "slackserve_phase_order": "independent_concurrent",
             }
         )
+
     if spec_decode_stats is not None:
         result["spec_decode_acceptance_rate"] = spec_decode_stats["acceptance_rate"]
         result["spec_decode_acceptance_length"] = spec_decode_stats["acceptance_length"]
@@ -1309,7 +1311,7 @@ def add_cli_args(parser: argparse.ArgumentParser):
         dest="slackserve_dense_model",
         type=str,
         default=None,
-        help=("Dense model used by Slack Serve's paired or standalone backend."),
+        help="Dense model used by Slack Serve's paired or standalone backend.",
     )
     parser.add_argument(
         "--slackserve-dense-task",

@@ -202,10 +202,9 @@ def build_app(
 
     register_models_api_router(app)
 
-    # Slack Serve's auxiliary pooling model is built inside the primary
-    # EngineCore process so it can share the LLM prefill CUDA stream. Its
-    # endpoint is therefore registered separately from stock pooling routes,
-    # which always target the primary EngineClient.
+    # The auxiliary pooling model lives inside the primary EngineCore, so its
+    # routes are registered separately from stock pooling routes (which always
+    # target the primary EngineClient).
     if os.environ.get("HB_P2_DENSE_LIVE") == "1":
         from vllm.entrypoints.slackserve.embed_api_router import (
             attach_router as register_slackserve_embed_api_router,

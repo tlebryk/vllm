@@ -319,11 +319,10 @@ class EngineCore:
     def submit_hb_embedding(self, request_id: str, text: str) -> Future[Any]:
         """Submit one embedding request to Slack Serve's in-process sidecar.
 
-        This is intentionally a utility method rather than a request added to
-        the primary scheduler: the auxiliary model has its own EngineCore and
-        scheduler, but executes on the LLM prefill stream. EngineCoreProc
-        forwards a returned Future through its normal utility-RPC response
-        path once the sidecar has produced a pooling result.
+        A utility method, not a primary-scheduler request: the auxiliary model
+        has its own EngineCore and scheduler but runs on the LLM prefill
+        stream. EngineCoreProc resolves the returned Future over its normal
+        utility-RPC response path.
         """
         sidecar = self._hb_embed_sidecar
         if sidecar is None:
@@ -786,10 +785,10 @@ class EngineCore:
         sc = self._hb_embed_sidecar
         if sc is not None:
             sc.maybe_start()
-            # Publish the same prefill-priority signal used by the validated
-            # topology-B controller: dense work may run only when prefill has
-            # neither an in-flight ticket nor dispatchable work with KV
-            # headroom. The sidecar is a read-only consumer of this hint.
+            # Prefill-priority hint from the validated topology-B controller:
+            # dense work may run only when prefill has neither an in-flight
+            # ticket nor dispatchable work with KV headroom. Read-only for the
+            # sidecar.
             prefill_inflight = self._hb_inflight_prefills() > 0
             prefill_dispatchable = self._hb_has_dispatchable_prefill()
             sc.prefill_busy = prefill_inflight or (

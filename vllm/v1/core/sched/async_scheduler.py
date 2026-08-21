@@ -54,13 +54,10 @@ class AsyncScheduler(Scheduler):
         if request.num_output_placeholders < 0:
             raise RuntimeError(
                 "AsyncScheduler received more output tokens than it has "
-                "scheduled placeholders: "
-                f"request_id={request.request_id!r}, "
+                f"scheduled placeholders: request_id={request.request_id!r}, "
                 f"placeholders_before={placeholders_before}, "
                 f"new_token_count={len(new_token_ids)}, "
                 f"status_before={status_before_update}, "
-                f"num_computed_tokens={request.num_computed_tokens}, "
-                f"num_prompt_tokens={request.num_prompt_tokens}, "
                 f"num_preemptions={request.num_preemptions}"
             )
 
