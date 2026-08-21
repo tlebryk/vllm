@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Validated server configuration for Slack Serve's dense sidecar."""
 
+import json
 import os
 from argparse import Namespace
 
@@ -29,6 +30,23 @@ def configure_dense_sidecar(args: Namespace) -> None:
             "--slackserve-dense-model currently requires one GPU "
             f"(TP=PP=DP=PCP=1); got {unsupported_parallel}"
         )
+
+    dense_task = args.slackserve_dense_task
+    if dense_task not in ("embed", "score", "classify"):
+        raise ValueError(
+            "--slackserve-dense-task must be embed, score, or classify; "
+            f"got {dense_task!r}"
+        )
+    hf_overrides = args.slackserve_dense_hf_overrides
+    if hf_overrides is not None:
+        try:
+            parsed_overrides = json.loads(hf_overrides)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                "--slackserve-dense-hf-overrides must be valid JSON"
+            ) from exc
+        if not isinstance(parsed_overrides, dict):
+            raise ValueError("--slackserve-dense-hf-overrides must decode to an object")
 
     worker = "vllm.v1.worker.slackserve_gpu_worker.SlackServeGPUWorker"
     if args.worker_cls == "auto":
@@ -91,13 +109,10 @@ def configure_dense_sidecar(args: Namespace) -> None:
             "HB_P2_PREFILL_SHARED_STREAM": "1",
             "HB_P2_EMBED_MODEL": model,
             "HB_P2_DENSE_SERVED_MODEL": args.slackserve_dense_served_model_name,
+            "HB_P2_DENSE_TASK": dense_task,
             "HB_P2_EMBED_GMU": str(dense_gmu),
-            "HB_P2_EMBED_BUDGET": str(
-                args.slackserve_dense_max_num_batched_tokens
-            ),
-            "HB_P2_EMBED_MAX_MODEL_LEN": str(
-                args.slackserve_dense_max_model_len
-            ),
+            "HB_P2_EMBED_BUDGET": str(args.slackserve_dense_max_num_batched_tokens),
+            "HB_P2_EMBED_MAX_MODEL_LEN": str(args.slackserve_dense_max_model_len),
             "HB_P2_EMBED_MAX_NUM_SEQS": str(args.slackserve_dense_max_num_seqs),
             # Topology-B correctness invariants. Override stale experiment
             # variables rather than silently running a different topology.
@@ -108,6 +123,10 @@ def configure_dense_sidecar(args: Namespace) -> None:
             "HB_P2_EMBED_ASYNC_SCHED": "0",
         }
     )
+    if hf_overrides is None:
+        os.environ.pop("HB_P2_DENSE_HF_OVERRIDES", None)
+    else:
+        os.environ["HB_P2_DENSE_HF_OVERRIDES"] = hf_overrides
     for name, value in {
         "HB_PREFILL_SM_COUNT_TARGET": "96",
         # Small KV admission reserve; async-ticket refcounts provide the
@@ -115,9 +134,7 @@ def configure_dense_sidecar(args: Namespace) -> None:
         "HB_P2_PREFILL_KV_WATERMARK": "0.02",
         "HB_LT_ALGO_SELECT": "prefer:d1,18,17",
         # Eager prefill needs these fused kernels when decode owns compilation.
-        "HB_P2_PREFILL_CUSTOM_OPS": (
-            "+rms_norm,+silu_and_mul,+rotary_embedding"
-        ),
+        "HB_P2_PREFILL_CUSTOM_OPS": ("+rms_norm,+silu_and_mul,+rotary_embedding"),
         "HB_P2_EMBED_SM_TARGET": "0",
         "HB_P2_EMBED_UNCAP_IDLE": "1",
     }.items():

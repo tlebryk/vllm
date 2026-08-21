@@ -331,7 +331,44 @@ class EngineCore:
                 "Slack Serve dense sidecar is disabled; set "
                 "HB_P2_EMBED_SIDECAR=1 and HB_P2_DENSE_LIVE=1"
             )
+        if sidecar.pooling_task != "embed":
+            raise RuntimeError(
+                "Slack Serve embeddings require --slackserve-dense-task embed"
+            )
         return sidecar.submit(request_id, text)
+
+    def submit_hb_classification(
+        self, request_id: str, text: str, use_activation: bool | None
+    ) -> Future[Any]:
+        """Submit one reward/verifier prompt to the dense sidecar."""
+        sidecar = self._hb_embed_sidecar
+        if sidecar is None or sidecar.pooling_task != "classify":
+            raise RuntimeError(
+                "Slack Serve classification requires --slackserve-dense-task classify"
+            )
+        return sidecar.submit(request_id, text, use_activation)
+
+    def submit_hb_score(
+        self,
+        request_id: str,
+        query: str,
+        document: str,
+        use_activation: bool | None,
+        truncate_prompt_tokens: int | None,
+        truncation_side: str | None,
+    ) -> Future[Any]:
+        """Submit one cross-encoder pair to the dense sidecar."""
+        sidecar = self._hb_embed_sidecar
+        if sidecar is None:
+            raise RuntimeError("Slack Serve dense sidecar is disabled")
+        return sidecar.submit_score(
+            request_id,
+            query,
+            document,
+            use_activation,
+            truncate_prompt_tokens,
+            truncation_side,
+        )
 
     def add_request(self, request: Request, request_wave: int = 0):
         """Add request to the scheduler.
@@ -621,8 +658,7 @@ class EngineCore:
         """True if any not-in-flight request still has prompt KV to compute."""
         scheduler: Any = self.scheduler
         return any(
-            not scheduler.is_hb_inflight(r.request_id)
-            for r in scheduler.waiting
+            not scheduler.is_hb_inflight(r.request_id) for r in scheduler.waiting
         ) or any(
             not scheduler.is_hb_inflight(r.request_id)
             and r.num_computed_tokens < r.num_prompt_tokens
@@ -664,9 +700,7 @@ class EngineCore:
             if self._hb_toklog is not None:
                 key = "decode" if lane == "decode" else "prefill"
                 self._hb_tok[key] += tokens
-                dispatched_at = getattr(
-                    ticket, "_hb_dispatched_at", completed_at
-                )
+                dispatched_at = getattr(ticket, "_hb_dispatched_at", completed_at)
                 self._hb_toklog.write(
                     json.dumps(
                         {
@@ -678,13 +712,8 @@ class EngineCore:
                             "scheduled_requests": len(
                                 ticket.scheduler_output.num_scheduled_tokens
                             ),
-                            "dispatch_ms": getattr(
-                                ticket, "_hb_dispatch_ms", 0.0
-                            ),
-                            "ticket_wall_ms": (
-                                completed_at - dispatched_at
-                            )
-                            * 1000,
+                            "dispatch_ms": getattr(ticket, "_hb_dispatch_ms", 0.0),
+                            "ticket_wall_ms": (completed_at - dispatched_at) * 1000,
                             "running": len(self.scheduler.running),
                             "waiting": len(self.scheduler.waiting),
                             "free_kv_blocks": (

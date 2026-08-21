@@ -89,6 +89,7 @@ def install_forward_context_mutex() -> None:
     forward_context.set_forward_context = guarded
     forward_context._hb_forward_context_mutex_installed = True
 
+
 # One launch mutex for the shared dense stream: prefill's eager forward
 # (SlackServeGPUWorker.execute_model, prefill lanes) and embed micro-steps
 # acquire it around their enqueue windows. Plain Lock, equal priority.
@@ -194,7 +195,9 @@ class HbEmbedSidecar:
         self.embed_model = os.environ.get(
             "HB_P2_EMBED_MODEL", "Qwen/Qwen3-Embedding-4B"
         )
-        self.pooling_task = "embed"
+        self.pooling_task = os.environ.get("HB_P2_DENSE_TASK", "embed")
+        if self.pooling_task not in ("embed", "score", "classify"):
+            raise ValueError(f"unsupported dense task: {self.pooling_task!r}")
         self.live = os.environ.get("HB_P2_DENSE_LIVE") == "1"
         self.embed_gmu = float(os.environ.get("HB_P2_EMBED_GMU", "0.18"))
         # 4096: the embed micro-step is the unit of dense-stream FIFO
@@ -226,9 +229,9 @@ class HbEmbedSidecar:
         # keep the sidecar step synchronous until its batch-queue completion
         # protocol is integrated with the server controller; the primary
         # engine still uses Slack Serve's async decode path.
-        self.embed_async_sched = os.environ.get(
-            "HB_P2_EMBED_ASYNC_SCHED", "0" if self.live else "1"
-        ) == "1"
+        self.embed_async_sched = (
+            os.environ.get("HB_P2_EMBED_ASYNC_SCHED", "0" if self.live else "1") == "1"
+        )
         # Don't start draining before the LLM is under real load, so no embed
         # work escapes the measured window during harness warmup (the bench's
         # initial single-prompt test would otherwise free-run the queue).
@@ -268,7 +271,9 @@ class HbEmbedSidecar:
         self.drain_start = 0.0
         self.drain_end = 0.0
         self.idle_uncapped_steps = 0
-        self._live_pending: queue.Queue[tuple[str, str, Future[Any]]] = queue.Queue()
+        self._live_pending: queue.Queue[tuple[str, dict[str, Any], Future[Any]]] = (
+            queue.Queue()
+        )
         self._live_futures: dict[str, Future[Any]] = {}
         self._live_wakeup = threading.Event()
         self._live_failure: BaseException | None = None
@@ -309,7 +314,15 @@ class HbEmbedSidecar:
         )
         popped = {k: os.environ.pop(k) for k in pop_keys if k in os.environ}
         saved_mp = os.environ.get("VLLM_ENABLE_V1_MULTIPROCESSING")
+        saved_v2_runner = os.environ.get("VLLM_USE_V2_MODEL_RUNNER")
+        saved_embed_target = os.environ.get("HB_EMBED_SM_COUNT_TARGET")
+        saved_prefill_target = os.environ.pop("HB_PREFILL_SM_COUNT_TARGET", None)
         os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+        # vLLM's V2 pooling runner currently implements embedding only.
+        # Score and classify use the mature legacy pooling runner while the
+        # primary LLM remains on the V2 Slack Serve runner.
+        if self.pooling_task != "embed":
+            os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
         # Clamp to >=1 so the Lt hook installs even when the starting target
         # is low (runtime switching needs it). Explicit 0 = hook fully off:
         # smctrl mask arms want plain torch kernels for embed GEMMs.
@@ -347,10 +360,13 @@ class HbEmbedSidecar:
                     "max_cudagraph_capture_size": 512,
                 },
             )
+            if raw_overrides := os.environ.get("HB_P2_DENSE_HF_OVERRIDES"):
+                kwargs["hf_overrides"] = json.loads(raw_overrides)
             logger.info(
-                "[hb-embed-sidecar] building embed engine model=%s gmu=%.3f "
-                "budget=%d max_model_len=%d sm_target=%d",
+                "[hb-embed-sidecar] building dense engine model=%s task=%s "
+                "gmu=%.3f budget=%d max_model_len=%d sm_target=%d",
                 self.embed_model,
+                self.pooling_task,
                 self.embed_gmu,
                 self.embed_budget,
                 self.embed_max_model_len,
@@ -362,12 +378,27 @@ class HbEmbedSidecar:
             os.environ.pop("VLLM_ENABLE_V1_MULTIPROCESSING", None)
             if saved_mp is not None:
                 os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = saved_mp
+            os.environ.pop("VLLM_USE_V2_MODEL_RUNNER", None)
+            if saved_v2_runner is not None:
+                os.environ["VLLM_USE_V2_MODEL_RUNNER"] = saved_v2_runner
+            os.environ.pop("HB_EMBED_SM_COUNT_TARGET", None)
+            if saved_embed_target is not None:
+                os.environ["HB_EMBED_SM_COUNT_TARGET"] = saved_embed_target
+            if saved_prefill_target is not None:
+                os.environ["HB_PREFILL_SM_COUNT_TARGET"] = saved_prefill_target
             os.environ.pop("VLLM_CACHE_ROOT", None)
             if saved_cache_root is not None:
                 os.environ["VLLM_CACHE_ROOT"] = saved_cache_root
             for k, v in popped.items():
                 os.environ[k] = v
             enable_envs_cache()
+
+        supported_tasks = self.engine.get_supported_tasks()
+        if self.pooling_task not in supported_tasks:
+            raise RuntimeError(
+                f"dense model {self.embed_model!r} does not support task "
+                f"{self.pooling_task!r}; supported tasks: {supported_tasks}"
+            )
 
         core_name = type(self.engine.engine_core).__name__
         if "Inproc" not in core_name:
@@ -455,7 +486,12 @@ class HbEmbedSidecar:
             and not self.engine.has_unfinished_requests()
         )
 
-    def submit(self, request_id: str, text: str) -> Future[Any]:
+    def submit(
+        self,
+        request_id: str,
+        text: str,
+        use_activation: bool | None = None,
+    ) -> Future[Any]:
         """Queue one live dense request and return its result Future.
 
         This method runs on the host EngineCore thread through a utility RPC.
@@ -468,6 +504,44 @@ class HbEmbedSidecar:
             raise RuntimeError("dense sidecar is not built")
         if not request_id:
             raise ValueError("dense request_id must be non-empty")
+        return self._enqueue_live(
+            request_id,
+            {
+                "kind": self.pooling_task,
+                "text": text,
+                "use_activation": use_activation,
+            },
+        )
+
+    def submit_score(
+        self,
+        request_id: str,
+        query: str,
+        document: str,
+        use_activation: bool | None,
+        truncate_prompt_tokens: int | None,
+        truncation_side: str | None,
+    ) -> Future[Any]:
+        """Queue one native cross-encoder query/document pair."""
+        if self.pooling_task != "score":
+            raise RuntimeError(
+                "rerank submissions require --slackserve-dense-task score"
+            )
+        if not self.live or self.engine is None:
+            raise RuntimeError("live dense sidecar is not available")
+        return self._enqueue_live(
+            request_id,
+            {
+                "kind": "score",
+                "query": query,
+                "document": document,
+                "use_activation": use_activation,
+                "truncate_prompt_tokens": truncate_prompt_tokens,
+                "truncation_side": truncation_side,
+            },
+        )
+
+    def _enqueue_live(self, request_id: str, payload: dict[str, Any]) -> Future[Any]:
         future: Future[Any] = Future()
         # Keep the state transition atomic with _fail_live_requests(). Without
         # this lock a submitter could pass the failure check, then enqueue just
@@ -475,7 +549,7 @@ class HbEmbedSidecar:
         with self._live_state_lock:
             if self._live_failure is not None:
                 raise RuntimeError("dense sidecar has stopped") from self._live_failure
-            self._live_pending.put((request_id, text, future))
+            self._live_pending.put((request_id, payload, future))
             if not self._started:
                 self._started = True
                 self._thread = threading.Thread(
@@ -509,18 +583,60 @@ class HbEmbedSidecar:
 
         while True:
             try:
-                request_id, text, future = self._live_pending.get_nowait()
+                request_id, payload, future = self._live_pending.get_nowait()
             except queue.Empty:
                 return
             try:
-                (engine_prompt,) = self.engine.renderer.render_cmpl(
-                    [{"prompt": text}]
-                )
+                if payload["kind"] == "score":
+                    from vllm.entrypoints.pooling.score.protocol import RerankRequest
+                    from vllm.entrypoints.pooling.score.utils import (
+                        compress_token_type_ids,
+                        get_score_prompt,
+                    )
+
+                    request = RerankRequest(
+                        query=payload["query"],
+                        documents=[payload["document"]],
+                        use_activation=payload["use_activation"],
+                        truncate_prompt_tokens=payload["truncate_prompt_tokens"],
+                        truncation_side=payload["truncation_side"],
+                    )
+                    tokenization_kwargs = request.build_tok_params(
+                        self.engine.model_config
+                    ).get_encode_kwargs()
+                    _, engine_prompt = get_score_prompt(
+                        model_config=self.engine.model_config,
+                        tokenizer=self.engine.tokenizer,
+                        tokenization_kwargs=tokenization_kwargs,
+                        data_1=payload["query"],
+                        data_2=payload["document"],
+                    )
+                    token_type_ids = engine_prompt.pop("token_type_ids", None)
+                    pooling_params = request.to_pooling_params("score")
+                    if token_type_ids:
+                        pooling_params.extra_kwargs = {
+                            "compressed_token_type_ids": compress_token_type_ids(
+                                token_type_ids
+                            )
+                        }
+                else:
+                    (engine_prompt,) = self.engine.renderer.render_cmpl(
+                        [{"prompt": payload["text"]}]
+                    )
+                    pooling_params = PoolingParams(
+                        task=self.pooling_task,
+                        use_activation=payload["use_activation"],
+                    )
                 token_ids = engine_prompt["prompt_token_ids"]
+                if len(token_ids) > self.embed_max_model_len:
+                    raise ValueError(
+                        f"dense input has {len(token_ids)} tokens, exceeding "
+                        f"max_model_len={self.embed_max_model_len}"
+                    )
                 internal_request_id = self.engine.add_request(
                     request_id,
                     engine_prompt,
-                    PoolingParams(task=self.pooling_task),
+                    pooling_params,
                 )
                 # LLMEngine randomizes its internal request id. Outputs use
                 # that id, while the API owns the external one, so the Future
@@ -619,9 +735,7 @@ class HbEmbedSidecar:
                         self.embed_uncap_when_llm_idle
                         and self.host_core.scheduler.get_num_unfinished_requests() == 0
                     )
-                    set_runtime_sm_target(
-                        0 if idle_uncapped else self.embed_sm_target
-                    )
+                    set_runtime_sm_target(0 if idle_uncapped else self.embed_sm_target)
                     from vllm.v1.worker.hb_smctrl import apply_prefill_uncap
 
                     apply_prefill_uncap(dense_stream, idle_uncapped)
@@ -634,9 +748,7 @@ class HbEmbedSidecar:
                         DENSE_LAUNCH_LOCK.release()
                 newly = set(self.pooled) - self._pooled_seen
                 self._pooled_seen |= newly
-                tokens = sum(
-                    self.req_tokens.pop(request_id, 0) for request_id in newly
-                )
+                tokens = sum(self.req_tokens.pop(request_id, 0) for request_id in newly)
                 self.embed_tokens_cum += tokens
                 if newly or tokens:
                     record = {

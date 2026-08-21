@@ -22,6 +22,7 @@ import torch.nn as nn
 from tqdm import tqdm
 
 import vllm.envs as envs
+import vllm.forward_context as forward_context
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphStat, CUDAGraphWrapper
 from vllm.compilation.monitor import set_cudagraph_capturing_enabled
@@ -46,10 +47,7 @@ from vllm.distributed.parallel_state import (
     is_global_first_rank,
     prepare_communication_buffer_for_model,
 )
-from vllm.forward_context import (
-    BatchDescriptor,
-    set_forward_context,
-)
+from vllm.forward_context import BatchDescriptor
 from vllm.logger import init_logger
 from vllm.lora.layers import LoRAMapping, LoRAMappingType
 from vllm.model_executor.layers.attention import Attention, MLAAttention
@@ -3793,7 +3791,7 @@ class GPUModelRunner(
         # (wait_for_save + clear metadata) until after draft model runs.
         defer_kv_connector_finalize = self.speculative_config is not None
         with (
-            set_forward_context(
+            forward_context.set_forward_context(
                 attn_metadata,
                 self.vllm_config,
                 num_tokens=num_tokens_padded,
@@ -5230,7 +5228,7 @@ class GPUModelRunner(
 
             with (
                 self.maybe_randomize_inputs(input_ids, inputs_embeds),
-                set_forward_context(
+                forward_context.set_forward_context(
                     attn_metadata,
                     self.vllm_config,
                     num_tokens=num_tokens_padded,

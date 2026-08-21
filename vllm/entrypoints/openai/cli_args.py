@@ -168,7 +168,12 @@ class BaseFrontendArgs:
     stream.
     """
     slackserve_dense_served_model_name: str = "embed"
-    """Public ``model`` name accepted by Slack Serve's ``/v1/embeddings`` endpoint."""
+    """Public ``model`` name accepted by the Slack Serve dense endpoint."""
+    slackserve_dense_task: Literal["embed", "score", "classify"] = "embed"
+    """Auxiliary model task: embedding, cross-encoder reranking, or reward
+    classification."""
+    slackserve_dense_hf_overrides: str | None = None
+    """Optional JSON Hugging Face config overrides for the auxiliary model."""
     slackserve_dense_gpu_memory_utilization: float = 0.18
     """GPU-memory fraction reserved for the auxiliary embedding engine."""
     slackserve_dense_max_model_len: int = 11264
