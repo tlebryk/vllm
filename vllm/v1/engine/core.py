@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import json
 import os
 import queue
 import signal
@@ -315,6 +316,23 @@ class EngineCore:
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.model_executor.supported_tasks
 
+    def submit_hb_embedding(self, request_id: str, text: str) -> Future[Any]:
+        """Submit one embedding request to Slack Serve's in-process sidecar.
+
+        This is intentionally a utility method rather than a request added to
+        the primary scheduler: the auxiliary model has its own EngineCore and
+        scheduler, but executes on the LLM prefill stream. EngineCoreProc
+        forwards a returned Future through its normal utility-RPC response
+        path once the sidecar has produced a pooling result.
+        """
+        sidecar = self._hb_embed_sidecar
+        if sidecar is None:
+            raise RuntimeError(
+                "Slack Serve dense sidecar is disabled; set "
+                "HB_P2_EMBED_SIDECAR=1 and HB_P2_DENSE_LIVE=1"
+            )
+        return sidecar.submit(request_id, text)
+
     def add_request(self, request: Request, request_wave: int = 0):
         """Add request to the scheduler.
 
@@ -417,6 +435,8 @@ class EngineCore:
         scheduler_output = self.scheduler.schedule(lane=lane)
         scheduler_output.execution_lane = lane
         request_ids = set(scheduler_output.num_scheduled_tokens)
+        if async_decode and request_ids:
+            self.scheduler.mark_hb_async_decode(request_ids)
         if (
             request_ids
             and not async_decode
@@ -428,6 +448,8 @@ class EngineCore:
         try:
             future = self.model_executor.execute_model(scheduler_output, non_block=True)
         except Exception:
+            if async_decode and request_ids:
+                self.scheduler.release_hb_async_decode(request_ids)
             if hasattr(self.scheduler, "release_hb_inflight"):
                 self.scheduler.release_hb_inflight(request_ids)
             inflight_lanes.discard(lane)
@@ -456,6 +478,10 @@ class EngineCore:
         finally:
             # Async-decode tickets never marked their ids (see dispatch), so
             # they must not release ids a concurrent prefill ticket owns.
+            if async_decode:
+                self.scheduler.release_hb_async_decode(
+                    set(ticket.scheduler_output.num_scheduled_tokens)
+                )
             if not async_decode and hasattr(self.scheduler, "release_hb_inflight"):
                 self.scheduler.release_hb_inflight(
                     set(ticket.scheduler_output.num_scheduled_tokens)
@@ -594,9 +620,12 @@ class EngineCore:
     def _hb_has_dispatchable_prefill(self) -> bool:
         """True if any not-in-flight request still has prompt KV to compute."""
         scheduler: Any = self.scheduler
-        inflight = scheduler._hb_inflight_req_ids
-        return any(r.request_id not in inflight for r in scheduler.waiting) or any(
-            r.request_id not in inflight and r.num_computed_tokens < r.num_prompt_tokens
+        return any(
+            not scheduler.is_hb_inflight(r.request_id)
+            for r in scheduler.waiting
+        ) or any(
+            not scheduler.is_hb_inflight(r.request_id)
+            and r.num_computed_tokens < r.num_prompt_tokens
             for r in scheduler.running
         )
 
@@ -626,6 +655,7 @@ class EngineCore:
         """Finish + publish one ready ticket; unblock lanes on real work."""
         model_output = self.finish(ticket)
         engine_core_outputs = self.complete(ticket, model_output)
+        completed_at = time.perf_counter()
         tokens = self._hb_ticket_tokens(ticket)
         executed = tokens > 0
         if executed:
@@ -634,10 +664,35 @@ class EngineCore:
             if self._hb_toklog is not None:
                 key = "decode" if lane == "decode" else "prefill"
                 self._hb_tok[key] += tokens
+                dispatched_at = getattr(
+                    ticket, "_hb_dispatched_at", completed_at
+                )
                 self._hb_toklog.write(
-                    f'{{"t": {time.monotonic()}, "prefill_tokens_cum": '
-                    f'{self._hb_tok["prefill"]}, "decode_tokens_cum": '
-                    f"{self._hb_tok['decode']}}}\n"
+                    json.dumps(
+                        {
+                            "t": time.monotonic(),
+                            "prefill_tokens_cum": self._hb_tok["prefill"],
+                            "decode_tokens_cum": self._hb_tok["decode"],
+                            "lane": lane,
+                            "scheduled_tokens": tokens,
+                            "scheduled_requests": len(
+                                ticket.scheduler_output.num_scheduled_tokens
+                            ),
+                            "dispatch_ms": getattr(
+                                ticket, "_hb_dispatch_ms", 0.0
+                            ),
+                            "ticket_wall_ms": (
+                                completed_at - dispatched_at
+                            )
+                            * 1000,
+                            "running": len(self.scheduler.running),
+                            "waiting": len(self.scheduler.waiting),
+                            "free_kv_blocks": (
+                                self._hb_block_pool.get_num_free_blocks()
+                            ),
+                        }
+                    )
+                    + "\n"
                 )
                 self._hb_toklog_n += 1
                 if self._hb_toklog_n % 20 == 0:
@@ -669,7 +724,10 @@ class EngineCore:
                     if r.num_computed_tokens >= r.num_prompt_tokens
                 ]
             )
+        dispatch_started = time.perf_counter()
         ticket = self.dispatch(lane)
+        ticket._hb_dispatched_at = dispatch_started
+        ticket._hb_dispatch_ms = (time.perf_counter() - dispatch_started) * 1000
         if self._hb_ticket_tokens(ticket) > 0:
             if lane == "decode":
                 self._hb_decode_fifo.append(ticket)
@@ -699,6 +757,15 @@ class EngineCore:
         sc = self._hb_embed_sidecar
         if sc is not None:
             sc.maybe_start()
+            # Publish the same prefill-priority signal used by the validated
+            # topology-B controller: dense work may run only when prefill has
+            # neither an in-flight ticket nor dispatchable work with KV
+            # headroom. The sidecar is a read-only consumer of this hint.
+            prefill_inflight = self._hb_inflight_prefills() > 0
+            prefill_dispatchable = self._hb_has_dispatchable_prefill()
+            sc.prefill_busy = prefill_inflight or (
+                prefill_dispatchable and self._hb_prefill_headroom_ok()
+            )
             # post_prefill phase gate: latch once ALL prompt KV is computed
             # (no waiting requests, no mid-prompt running requests, no
             # in-flight prefill ticket). Latched — finite-N inf benchmark is
@@ -732,7 +799,7 @@ class EngineCore:
                 and not busy
                 and all(t is None for t in tickets.values())
                 and not self._hb_decode_fifo
-                and (sc is None or sc._done)
+                and (sc is None or sc.capture_complete())
             ):
                 torch.cuda.profiler.stop()
                 self._hb_nsys_state = "done"

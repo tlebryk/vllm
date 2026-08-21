@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """The request function for API endpoints."""
 
+import asyncio
 import io
 import json
 import os
@@ -9,7 +10,7 @@ import sys
 import time
 import traceback
 from collections.abc import Awaitable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal, Protocol
 
 import aiohttp
@@ -77,6 +78,7 @@ class RequestFuncInput:
     ignore_eos: bool = False
     language: str | None = None
     request_id: str | None = None
+    aux_model_name: str | None = None
 
 
 @dataclass
@@ -94,6 +96,10 @@ class RequestFuncOutput:
     error: str = ""
     start_time: float = 0.0
     input_audio_duration: float = 0.0  # in seconds
+    aux_success: bool | None = None
+    aux_prompt_len: int = 0
+    aux_latency: float = 0.0
+    aux_error: str = ""
 
 
 class RequestFunc(Protocol):
@@ -557,6 +563,51 @@ async def async_request_openai_embeddings(
     )
 
 
+async def async_request_slackserve_pde(
+    request_func_input: RequestFuncInput,
+    session: aiohttp.ClientSession,
+    pbar: tqdm | None = None,
+) -> RequestFuncOutput:
+    """One independent PD-E pair: submit the same prompt to E and G together."""
+    api_url = request_func_input.api_url
+    _validate_api_url(api_url, "Slack Serve PD-E API", "completions")
+    base_url, _ = api_url.rsplit("/v1/", 1)
+    embedding_input = replace(
+        request_func_input,
+        api_url=f"{base_url}/v1/embeddings",
+        model_name=request_func_input.aux_model_name or "embed",
+    )
+    start = time.perf_counter()
+    # Create generation first so the server can publish prefill demand before
+    # the independent dense sidecar chooses its first bounded work unit.
+    generation_task = asyncio.create_task(
+        async_request_openai_completions(request_func_input, session, pbar=None)
+    )
+    embedding_task = asyncio.create_task(
+        async_request_openai_embeddings(embedding_input, session, pbar=None)
+    )
+    embedding_output, generation_output = await asyncio.gather(
+        embedding_task, generation_task
+    )
+    end = time.perf_counter()
+
+    # Preserve generation metrics as the primary output while carrying exact
+    # embedding work alongside them. The logical request succeeds only when
+    # both independent endpoint calls succeed.
+    generation_output.aux_success = embedding_output.success
+    generation_output.aux_prompt_len = embedding_output.prompt_len
+    generation_output.aux_latency = embedding_output.latency
+    generation_output.aux_error = embedding_output.error
+    generation_output.start_time = start
+    generation_output.latency = end - start
+    if not embedding_output.success:
+        generation_output.success = False
+        generation_output.error = f"embedding request failed: {embedding_output.error}"
+    if pbar:
+        pbar.update(1)
+    return generation_output
+
+
 async def async_request_vllm_rerank(
     request_func_input: RequestFuncInput,
     session: aiohttp.ClientSession,
@@ -784,6 +835,7 @@ ASYNC_REQUEST_FUNCS: dict[str, RequestFunc] = {
     "openai-chat": async_request_openai_chat_completions,
     "openai-audio": async_request_openai_audio,
     "openai-embeddings": async_request_openai_embeddings,
+    "slackserve-pde": async_request_slackserve_pde,
     "openai-embeddings-chat": async_request_openai_embeddings_chat,
     "openai-embeddings-clip": async_request_openai_embeddings_clip,
     "openai-embeddings-vlm2vec": async_request_openai_embeddings_vlm2vec,
@@ -810,4 +862,4 @@ OPENAI_COMPATIBLE_BACKENDS = [
     k
     for k, v in ASYNC_REQUEST_FUNCS.items()
     if v in (async_request_openai_completions, async_request_openai_chat_completions)
-]
+] + ["slackserve-pde"]

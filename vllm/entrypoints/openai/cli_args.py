@@ -159,6 +159,24 @@ class BaseFrontendArgs:
     If set to True, only enable the Tokens In<>Out endpoint. 
     This is intended for use in a Disaggregated Everything setup.
     """
+    slackserve_dense_model: str | None = None
+    """Auxiliary pooling checkpoint for Slack Serve's shared-dense sidecar.
+
+    Supplying this enables the Slack Serve two-lane generation controller and
+    exposes the auxiliary model at ``/v1/embeddings``. The model is loaded once
+    inside the primary EngineCore process so it can share the LLM prefill CUDA
+    stream.
+    """
+    slackserve_dense_served_model_name: str = "embed"
+    """Public ``model`` name accepted by Slack Serve's ``/v1/embeddings`` endpoint."""
+    slackserve_dense_gpu_memory_utilization: float = 0.18
+    """GPU-memory fraction reserved for the auxiliary embedding engine."""
+    slackserve_dense_max_model_len: int = 11264
+    """Maximum input length served by the auxiliary embedding engine."""
+    slackserve_dense_max_num_batched_tokens: int = 8192
+    """Embedding token budget per shared-dense-stream work unit."""
+    slackserve_dense_max_num_seqs: int = 192
+    """Auxiliary scheduler capacity; physical memory remains the residency limit."""
 
     @classmethod
     def _customize_cli_kwargs(

@@ -52,8 +52,11 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import threading
 import time
+from concurrent.futures import Future
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -62,6 +65,29 @@ import torch
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+# The two eager model forwards share vLLM's module-global forward context.
+# Shared CUDA-stream FIFO orders kernels, but it does not protect that Python
+# context. This narrow mutex serializes only the forward-context scope; unlike
+# DENSE_LAUNCH_LOCK it never waits for a dense GPU unit to complete.
+FORWARD_CONTEXT_LOCK = threading.Lock()
+
+
+def install_forward_context_mutex() -> None:
+    """Protect eager forwards from the two in-process engines."""
+    import vllm.forward_context as forward_context
+
+    if getattr(forward_context, "_hb_forward_context_mutex_installed", False):
+        return
+    original = forward_context.set_forward_context
+
+    @contextmanager
+    def guarded(*args: Any, **kwargs: Any):  # noqa: ANN202
+        with FORWARD_CONTEXT_LOCK, original(*args, **kwargs) as value:
+            yield value
+
+    forward_context.set_forward_context = guarded
+    forward_context._hb_forward_context_mutex_installed = True
 
 # One launch mutex for the shared dense stream: prefill's eager forward
 # (SlackServeGPUWorker.execute_model, prefill lanes) and embed micro-steps
@@ -152,7 +178,14 @@ def _count_marked_linears(engine: Any) -> int:
 
 
 class HbEmbedSidecar:
-    """Owns the in-process embed engine, its queue, and the drain thread."""
+    """Owns the in-process dense engine and its shared-stream drain thread.
+
+    The original file-backed embedding drain remains the default benchmark
+    path. ``HB_P2_DENSE_LIVE=1`` instead turns the sidecar into a small
+    in-process service: callers enqueue text through :meth:`submit` and get
+    a Future resolved with that request's pooling output. The sidecar thread
+    remains the sole owner of the auxiliary engine's add/step calls.
+    """
 
     def __init__(self, host_core: Any) -> None:
         self.host_core = host_core
@@ -161,6 +194,8 @@ class HbEmbedSidecar:
         self.embed_model = os.environ.get(
             "HB_P2_EMBED_MODEL", "Qwen/Qwen3-Embedding-4B"
         )
+        self.pooling_task = "embed"
+        self.live = os.environ.get("HB_P2_DENSE_LIVE") == "1"
         self.embed_gmu = float(os.environ.get("HB_P2_EMBED_GMU", "0.18"))
         # 4096: the embed micro-step is the unit of dense-stream FIFO
         # granularity; a 4K step keeps the worst prefill lock handoff ~40ms.
@@ -187,7 +222,13 @@ class HbEmbedSidecar:
         # worst prefill wait behind embed roughly halves. Stock machinery —
         # the sync path was just async_scheduling=False calling
         # AsyncPoolingOutput.get_output() inline.
-        self.embed_async_sched = os.environ.get("HB_P2_EMBED_ASYNC_SCHED", "1") == "1"
+        # The finite offline drain can pipeline sidecar steps. For live PD-E,
+        # keep the sidecar step synchronous until its batch-queue completion
+        # protocol is integrated with the server controller; the primary
+        # engine still uses Slack Serve's async decode path.
+        self.embed_async_sched = os.environ.get(
+            "HB_P2_EMBED_ASYNC_SCHED", "0" if self.live else "1"
+        ) == "1"
         # Don't start draining before the LLM is under real load, so no embed
         # work escapes the measured window during harness warmup (the bench's
         # initial single-prompt test would otherwise free-run the queue).
@@ -200,9 +241,14 @@ class HbEmbedSidecar:
         # place embed during admission. Default remains "any" (gap-fitting).
         self.phase = os.environ.get("HB_P2_EMBED_PHASE", "any")
         self.prefill_exhausted = False
+        # Published by EngineCore's two-lane controller. True means prefill
+        # either owns a ticket or is dispatchable with KV headroom; live dense
+        # work yields until this becomes false.
+        self.prefill_busy = False
 
         self.marked_linears = 0
         self.prompt_count = 0
+        self.req_tokens: dict[str, int] = {}
 
         self._thread: threading.Thread | None = None
         self._started = False
@@ -222,6 +268,11 @@ class HbEmbedSidecar:
         self.drain_start = 0.0
         self.drain_end = 0.0
         self.idle_uncapped_steps = 0
+        self._live_pending: queue.Queue[tuple[str, str, Future[Any]]] = queue.Queue()
+        self._live_futures: dict[str, Future[Any]] = {}
+        self._live_wakeup = threading.Event()
+        self._live_failure: BaseException | None = None
+        self._live_state_lock = threading.Lock()
 
     # -- build (eager, at EngineCore init) ---------------------------------
     def build(self) -> None:
@@ -230,6 +281,22 @@ class HbEmbedSidecar:
         from vllm.envs import disable_envs_cache, enable_envs_cache
         from vllm.platforms import current_platform
         from vllm.pooling_params import PoolingParams
+
+        parallel = self.host_core.vllm_config.parallel_config
+        if any(
+            value != 1
+            for value in (
+                parallel.tensor_parallel_size,
+                parallel.pipeline_parallel_size,
+                parallel.data_parallel_size,
+                parallel.prefill_context_parallel_size,
+            )
+        ):
+            raise RuntimeError(
+                "Slack Serve's live embedding sidecar currently requires "
+                "one GPU (TP=PP=DP=PCP=1): it binds directly to the primary "
+                "driver worker's CUDA stream."
+            )
 
         t0 = time.perf_counter()
         type(current_platform)._global_graph_pool = None
@@ -320,6 +387,17 @@ class HbEmbedSidecar:
 
         fence_uva_pools(None)
 
+        if self.live:
+            if os.environ.get("HB_P2_DENSE_LOCK", "1") == "0":
+                install_forward_context_mutex()
+                logger.info("[hb-embed-sidecar] narrow forward-context mutex active")
+            logger.info(
+                "[hb-embed-sidecar] live dense mode ready task=%s; "
+                "awaiting API submissions",
+                self.pooling_task,
+            )
+            return
+
         rows = [
             json.loads(line)
             for line in Path(self.embed_queue_path).read_text().splitlines()
@@ -331,8 +409,7 @@ class HbEmbedSidecar:
             )
         prompts = [rows[i % len(rows)] for i in range(self.embed_n)]
         tokenizer = self.engine.tokenizer
-        params = PoolingParams(task="embed")
-        self.req_tokens: dict[str, int] = {}
+        params = PoolingParams(task=self.pooling_task)
         for i, text in enumerate(prompts):
             ids = tokenizer.encode(text)
             self.req_tokens[f"hbembed_{i}"] = len(ids)
@@ -350,6 +427,8 @@ class HbEmbedSidecar:
 
     # -- lazy drain-thread start (from step_two_lane, under real load) ------
     def maybe_start(self) -> None:
+        if self.live:
+            return
         if self.engine is None or self._started:
             return
         try:
@@ -363,6 +442,225 @@ class HbEmbedSidecar:
             target=self._drain, name="hb_embed_sidecar", daemon=True
         )
         self._thread.start()
+
+    def capture_complete(self) -> bool:
+        """Whether finite work is drained for an Nsight capture boundary."""
+        if not self.live:
+            return self._done
+        return (
+            self._started
+            and self._live_pending.empty()
+            and not self._live_futures
+            and self.engine is not None
+            and not self.engine.has_unfinished_requests()
+        )
+
+    def submit(self, request_id: str, text: str) -> Future[Any]:
+        """Queue one live dense request and return its result Future.
+
+        This method runs on the host EngineCore thread through a utility RPC.
+        It deliberately does not call ``engine.add_request``: only the
+        sidecar thread mutates or steps the auxiliary EngineCore.
+        """
+        if not self.live:
+            raise RuntimeError("live dense submissions require HB_P2_DENSE_LIVE=1")
+        if self.engine is None:
+            raise RuntimeError("dense sidecar is not built")
+        if not request_id:
+            raise ValueError("dense request_id must be non-empty")
+        future: Future[Any] = Future()
+        # Keep the state transition atomic with _fail_live_requests(). Without
+        # this lock a submitter could pass the failure check, then enqueue just
+        # after the failed drain thread had emptied its queue.
+        with self._live_state_lock:
+            if self._live_failure is not None:
+                raise RuntimeError("dense sidecar has stopped") from self._live_failure
+            self._live_pending.put((request_id, text, future))
+            if not self._started:
+                self._started = True
+                self._thread = threading.Thread(
+                    target=self._drain_live, name="hb_dense_sidecar", daemon=True
+                )
+                self._thread.start()
+        self._live_wakeup.set()
+        return future
+
+    def _bind_dense_stream(self) -> Any:
+        """Bind this sidecar thread and its runner to LLM's dense stream."""
+        from vllm.utils.torch_utils import current_stream
+        from vllm.v1.worker.gpu.buffer_utils import set_uva_fencing_enabled
+
+        # Auxiliary pools must not enter the LLM worker's module-global UVA
+        # registry; the two engines otherwise race while walking that state.
+        set_uva_fencing_enabled(False)
+        llm_worker = self.host_core.model_executor.driver_worker
+        llm_worker = getattr(llm_worker, "worker", llm_worker)
+        dense_stream = llm_worker.lane_streams["prefill"]
+        torch.cuda.set_stream(dense_stream)
+        runner = _model_runner(self.engine)
+        runner.__dict__["main_stream"] = dense_stream
+        assert current_stream().cuda_stream == dense_stream.cuda_stream
+        return dense_stream
+
+    def _submit_live_pending(self) -> None:
+        """Move all API-admitted work into the sidecar engine on its thread."""
+        assert self.engine is not None
+        from vllm.pooling_params import PoolingParams
+
+        while True:
+            try:
+                request_id, text, future = self._live_pending.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                (engine_prompt,) = self.engine.renderer.render_cmpl(
+                    [{"prompt": text}]
+                )
+                token_ids = engine_prompt["prompt_token_ids"]
+                internal_request_id = self.engine.add_request(
+                    request_id,
+                    engine_prompt,
+                    PoolingParams(task=self.pooling_task),
+                )
+                # LLMEngine randomizes its internal request id. Outputs use
+                # that id, while the API owns the external one, so the Future
+                # map and token accounting must use the returned id.
+                self.req_tokens[internal_request_id] = len(token_ids)
+                self._live_futures[internal_request_id] = future
+                self.prompt_count += 1
+            except Exception as exc:  # noqa: BLE001 - return failure to API caller
+                if not future.done():
+                    future.set_exception(exc)
+
+    def _resolve_live_outputs(self, output: Any) -> None:
+        """Resolve live API futures from one auxiliary-engine output batch."""
+        for item in output.outputs:
+            future = self._live_futures.pop(item.request_id, None)
+            if future is None:
+                continue
+            try:
+                pooling = getattr(item, "pooling_output", None)
+                if pooling is None:
+                    raise RuntimeError(
+                        "dense request finished without a pooling output"
+                    )
+                data = pooling.data.detach().cpu().reshape(-1).tolist()
+                prompt_tokens = self.req_tokens.pop(item.request_id, 0)
+                if not future.done():
+                    future.set_result(
+                        {
+                            "request_id": item.request_id,
+                            "data": data,
+                            "prompt_tokens": prompt_tokens,
+                        }
+                    )
+            except Exception as exc:  # noqa: BLE001 - propagate to utility caller
+                if not future.done():
+                    future.set_exception(exc)
+
+    def _fail_live_requests(self, exc: BaseException) -> None:
+        with self._live_state_lock:
+            self._live_failure = exc
+            while True:
+                try:
+                    _, _, future = self._live_pending.get_nowait()
+                except queue.Empty:
+                    break
+                if not future.done():
+                    future.set_exception(exc)
+            for future in self._live_futures.values():
+                if not future.done():
+                    future.set_exception(exc)
+            self._live_futures.clear()
+
+    def _drain_live(self) -> None:
+        """Serve API-admitted dense work indefinitely on the shared stream."""
+        from vllm.v1.worker.embed_sm_linear_hook import set_runtime_sm_target
+
+        try:
+            # Binding touches the primary worker's CUDA stream. It must be
+            # inside the failure boundary: otherwise a bind error kills this
+            # daemon thread before pending API Futures are failed, leaving
+            # the HTTP request hanging forever.
+            dense_stream = self._bind_dense_stream()
+            engine = self.engine
+            assert engine is not None
+            coarse_lock = os.environ.get("HB_P2_DENSE_LOCK", "1") != "0"
+            logger.info("[hb-embed-sidecar] live drain started")
+            while True:
+                self._submit_live_pending()
+                if not engine.has_unfinished_requests():
+                    self._live_wakeup.clear()
+                    # Avoid a lost wakeup between draining the queue and
+                    # sleeping: submit() sets the event after enqueueing.
+                    if self._live_pending.empty():
+                        self._live_wakeup.wait(timeout=0.1)
+                    continue
+                # Controller-published prefill priority. An already-running
+                # dense unit is not preemptible, so prefill waits behind at
+                # most one bounded unit; no new dense unit launches while
+                # prefill wants or owns the shared stream.
+                if self.prefill_busy:
+                    time.sleep(0.001)
+                    continue
+                if coarse_lock and (
+                    PREFILL_WAITING["n"] > 0 or not prefill_tail_clear()
+                ):
+                    time.sleep(0.001)
+                    continue
+                if coarse_lock:
+                    _lock_acquire("embed")
+                try:
+                    if coarse_lock and not prefill_tail_clear():
+                        continue
+                    idle_uncapped = (
+                        self.embed_uncap_when_llm_idle
+                        and self.host_core.scheduler.get_num_unfinished_requests() == 0
+                    )
+                    set_runtime_sm_target(
+                        0 if idle_uncapped else self.embed_sm_target
+                    )
+                    from vllm.v1.worker.hb_smctrl import apply_prefill_uncap
+
+                    apply_prefill_uncap(dense_stream, idle_uncapped)
+                    step_started = time.perf_counter()
+                    self._process_step()
+                    step_finished = time.perf_counter()
+                finally:
+                    set_runtime_sm_target(None)
+                    if coarse_lock:
+                        DENSE_LAUNCH_LOCK.release()
+                newly = set(self.pooled) - self._pooled_seen
+                self._pooled_seen |= newly
+                tokens = sum(
+                    self.req_tokens.get(request_id)
+                    or self.req_tokens.get(request_id.rsplit("-", 1)[0], 0)
+                    for request_id in newly
+                )
+                self.embed_tokens_cum += tokens
+                if newly or tokens:
+                    record = {
+                        "t_start": step_started,
+                        "t": step_finished,
+                        "wall_ms": (step_finished - step_started) * 1000,
+                        "scheduled_tokens": tokens,
+                        "embed_tokens_cum": self.embed_tokens_cum,
+                        "newly_pooled": len(newly),
+                        "pooled": len(self.pooled),
+                        "submitted": self.prompt_count,
+                        "llm_unfinished": (
+                            self.host_core.scheduler.get_num_unfinished_requests()
+                        ),
+                        "prefill_busy": self.prefill_busy,
+                        "idle_uncapped": idle_uncapped,
+                    }
+                    self.step_records.append(record)
+                    if self._toklog is not None:
+                        self._toklog.write(json.dumps(record) + "\n")
+                        self._toklog.flush()
+        except BaseException as exc:
+            logger.exception("[hb-embed-sidecar] live drain failed")
+            self._fail_live_requests(exc)
 
     def _drain(self) -> None:
         from vllm.utils.torch_utils import current_stream
@@ -490,6 +788,8 @@ class HbEmbedSidecar:
         """One embed engine step (offline process_step pattern) + harvest."""
         engine = self.engine
         output = engine.engine_core.get_output()
+        if self.live:
+            self._resolve_live_outputs(output)
         for item in output.outputs:
             if getattr(item, "pooling_output", None) is not None:
                 self.pooled.add(item.request_id)
