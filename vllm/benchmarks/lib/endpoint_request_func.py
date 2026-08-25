@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """The request function for API endpoints."""
 
+import asyncio
 import io
 import json
 import os
@@ -11,6 +12,7 @@ import traceback
 from collections.abc import Awaitable
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
+from urllib.parse import urlsplit
 
 import aiohttp
 import regex as re
@@ -77,6 +79,9 @@ class RequestFuncInput:
     ignore_eos: bool = False
     language: str | None = None
     request_id: str | None = None
+    aux_model_name: str | None = None
+    aux_task: Literal["embed", "classify", "score"] = "embed"
+    aux_query: str = "Determine whether the document is relevant to the query."
 
 
 @dataclass
@@ -94,6 +99,10 @@ class RequestFuncOutput:
     error: str = ""
     start_time: float = 0.0
     input_audio_duration: float = 0.0  # in seconds
+    aux_success: bool | None = None
+    aux_prompt_len: int = 0
+    aux_latency: float = 0.0
+    aux_error: str = ""
 
 
 class RequestFunc(Protocol):
@@ -557,6 +566,97 @@ async def async_request_openai_embeddings(
     )
 
 
+async def _request_dense(
+    request_func_input: RequestFuncInput,
+    session: aiohttp.ClientSession,
+    *,
+    hybrid: bool,
+    pbar: tqdm | None = None,
+) -> RequestFuncOutput:
+    """Submit one embedding, verifier, or reranker request."""
+    task = request_func_input.aux_task
+    api_url = request_func_input.api_url
+    model = (
+        request_func_input.aux_model_name
+        if hybrid and request_func_input.aux_model_name
+        else request_func_input.model_name or request_func_input.model
+    )
+    if task == "embed":
+        endpoint = "/v1/embeddings"
+        payload = {
+            "model": model,
+            "input": request_func_input.prompt,
+            "truncate_prompt_tokens": -1,
+        }
+    elif task == "classify":
+        endpoint = "/v1/verify" if hybrid else "/classify"
+        payload = {"model": model, "input": request_func_input.prompt}
+    else:
+        endpoint = "/rerank"
+        payload = {
+            "model": model,
+            "query": request_func_input.aux_query,
+            "documents": [request_func_input.prompt],
+            "truncate_prompt_tokens": -1,
+        }
+    parsed_url = urlsplit(api_url)
+    base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+    headers = _get_headers("application/json")
+    _update_headers_common(headers, request_func_input)
+    return await _run_pooling_request(
+        session,
+        f"{base_url}{endpoint}",
+        payload=payload,
+        headers=headers,
+        pbar=pbar,
+    )
+
+
+async def async_request_slackserve_dense(
+    request_func_input: RequestFuncInput,
+    session: aiohttp.ClientSession,
+    pbar: tqdm | None = None,
+) -> RequestFuncOutput:
+    """Benchmark a standalone full-GPU dense endpoint."""
+    return await _request_dense(request_func_input, session, hybrid=False, pbar=pbar)
+
+
+async def async_request_slackserve_pde(
+    request_func_input: RequestFuncInput,
+    session: aiohttp.ClientSession,
+    pbar: tqdm | None = None,
+) -> RequestFuncOutput:
+    """Submit independent generation and dense work together."""
+    api_url = request_func_input.api_url
+    _validate_api_url(api_url, "Slack Serve PD-E API", "completions")
+    start = time.perf_counter()
+    # Create generation first so the server can publish prefill demand before
+    # the independent dense sidecar chooses its first bounded work unit.
+    generation_task = asyncio.create_task(
+        async_request_openai_completions(request_func_input, session, pbar=None)
+    )
+    dense_task = asyncio.create_task(
+        _request_dense(request_func_input, session, hybrid=True, pbar=None)
+    )
+    dense_output, generation_output = await asyncio.gather(dense_task, generation_task)
+    end = time.perf_counter()
+
+    # Generation metrics stay the primary output; dense work rides alongside.
+    # The logical request succeeds only if both endpoint calls succeed.
+    generation_output.aux_success = dense_output.success
+    generation_output.aux_prompt_len = dense_output.prompt_len
+    generation_output.aux_latency = dense_output.latency
+    generation_output.aux_error = dense_output.error
+    generation_output.start_time = start
+    generation_output.latency = end - start
+    if not dense_output.success:
+        generation_output.success = False
+        generation_output.error = f"dense request failed: {dense_output.error}"
+    if pbar:
+        pbar.update(1)
+    return generation_output
+
+
 async def async_request_vllm_rerank(
     request_func_input: RequestFuncInput,
     session: aiohttp.ClientSession,
@@ -784,6 +884,8 @@ ASYNC_REQUEST_FUNCS: dict[str, RequestFunc] = {
     "openai-chat": async_request_openai_chat_completions,
     "openai-audio": async_request_openai_audio,
     "openai-embeddings": async_request_openai_embeddings,
+    "slackserve-dense": async_request_slackserve_dense,
+    "slackserve-pde": async_request_slackserve_pde,
     "openai-embeddings-chat": async_request_openai_embeddings_chat,
     "openai-embeddings-clip": async_request_openai_embeddings_clip,
     "openai-embeddings-vlm2vec": async_request_openai_embeddings_vlm2vec,
@@ -804,10 +906,11 @@ POOLING_BACKENDS = {
     "infinity-embeddings-clip",
     "vllm-pooling",
     "vllm-rerank",
+    "slackserve-dense",
 }
 
 OPENAI_COMPATIBLE_BACKENDS = [
     k
     for k, v in ASYNC_REQUEST_FUNCS.items()
     if v in (async_request_openai_completions, async_request_openai_chat_completions)
-]
+] + ["slackserve-pde"]

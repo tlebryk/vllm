@@ -29,7 +29,11 @@ from vllm.entrypoints.chat_utils import load_chat_template
 from vllm.entrypoints.launcher import serve_http
 from vllm.entrypoints.logger import RequestLogger
 from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_serve_args
-from vllm.entrypoints.openai.engine.protocol import GenerationError
+from vllm.entrypoints.openai.engine.protocol import (
+    GenerationError,
+    ModelCard,
+    ModelPermission,
+)
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.openai.server_utils import (
@@ -48,6 +52,7 @@ from vllm.entrypoints.serve.elastic_ep.middleware import (
 )
 from vllm.entrypoints.serve.render.serving import OpenAIServingRender
 from vllm.entrypoints.serve.tokenize.serving import OpenAIServingTokenization
+from vllm.entrypoints.slackserve.config import configure_dense_sidecar
 from vllm.entrypoints.utils import (
     cli_env_setup,
     log_non_default_args,
@@ -82,6 +87,7 @@ async def build_async_engine_client(
     disable_frontend_multiprocessing: bool | None = None,
     client_config: dict[str, Any] | None = None,
 ) -> AsyncIterator[EngineClient]:
+    configure_dense_sidecar(args)
     if os.getenv("VLLM_WORKER_MULTIPROC_METHOD") == "forkserver":
         # The executor is expected to be mp.
         # Pre-import heavy modules in the forkserver process
@@ -195,6 +201,16 @@ def build_app(
     )
 
     register_models_api_router(app)
+
+    # The auxiliary pooling model lives inside the primary EngineCore, so its
+    # routes are registered separately from stock pooling routes (which always
+    # target the primary EngineClient).
+    if os.environ.get("HB_P2_DENSE_LIVE") == "1":
+        from vllm.entrypoints.slackserve.embed_api_router import (
+            attach_router as register_slackserve_embed_api_router,
+        )
+
+        register_slackserve_embed_api_router(app)
 
     from vllm.entrypoints.sagemaker.api_router import (
         attach_router as register_sagemaker_api_router,
@@ -366,6 +382,15 @@ async def init_app_state(
         lora_modules=lora_modules,
     )
     await state.openai_serving_models.init_static_loras()
+    if args.slackserve_dense_model is not None:
+        state.additional_model_cards = [
+            ModelCard(
+                id=args.slackserve_dense_served_model_name,
+                max_model_len=args.slackserve_dense_max_model_len,
+                root=args.slackserve_dense_model,
+                permission=[ModelPermission()],
+            )
+        ]
 
     state.openai_serving_render = OpenAIServingRender(
         model_config=engine_client.model_config,

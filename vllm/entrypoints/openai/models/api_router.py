@@ -22,6 +22,7 @@ async def show_available_models(raw_request: Request):
     handler = models(raw_request)
 
     models_ = await handler.show_available_models()
+    models_.data.extend(getattr(raw_request.app.state, "additional_model_cards", ()))
     return JSONResponse(content=models_.model_dump())
 
 

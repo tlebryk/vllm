@@ -6,9 +6,10 @@ from dataclasses import dataclass
 
 import torch
 
+import vllm.forward_context as forward_context
 from vllm.config import VllmConfig
 from vllm.config.compilation import CompilationMode, CUDAGraphMode
-from vllm.forward_context import BatchDescriptor, set_forward_context
+from vllm.forward_context import BatchDescriptor
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backends.fa_utils import flash_attn_scheduler_sm_margin
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -563,7 +564,7 @@ class SlackServeModelRunner(GPUModelRunner):
                     f"HB_P2_COMPILE_PREFILL: lane={lane!r} would enter the "
                     "compiled callable; only prefill may."
                 )
-            with set_forward_context(
+            with forward_context.set_forward_context(
                 attn_metadata,
                 self.vllm_config,
                 num_tokens=input_batch.num_tokens_after_padding,

@@ -28,6 +28,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+import vllm.forward_context as forward_context
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import (
@@ -35,7 +36,7 @@ from vllm.distributed.parallel_state import (
     get_pp_group,
     prepare_communication_buffer_for_model,
 )
-from vllm.forward_context import BatchDescriptor, set_forward_context
+from vllm.forward_context import BatchDescriptor
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -1029,7 +1030,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 has_lora=self.lora_config is not None,
             )
 
-            with set_forward_context(
+            with forward_context.set_forward_context(
                 attn_metadata,
                 self.vllm_config,
                 num_tokens=input_batch.num_tokens_after_padding,

@@ -49,8 +49,17 @@ class AsyncScheduler(Scheduler):
         )
 
         # Update the number of output placeholders.
+        placeholders_before = request.num_output_placeholders
         request.num_output_placeholders -= len(new_token_ids)
-        assert request.num_output_placeholders >= 0
+        if request.num_output_placeholders < 0:
+            raise RuntimeError(
+                "AsyncScheduler received more output tokens than it has "
+                f"scheduled placeholders: request_id={request.request_id!r}, "
+                f"placeholders_before={placeholders_before}, "
+                f"new_token_count={len(new_token_ids)}, "
+                f"status_before={status_before_update}, "
+                f"num_preemptions={request.num_preemptions}"
+            )
 
         # Cache the new tokens. Preempted requests should be skipped.
         if status_before_update == RequestStatus.RUNNING:

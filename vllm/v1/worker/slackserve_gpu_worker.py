@@ -58,7 +58,10 @@ class SlackServeGPUWorker(GPUWorker):
             )
         self._hb_dense_lock: tuple[Callable[[], None], Callable[[], None]] | None = None
         self._hb_record_prefill_tail: Callable[[torch.cuda.Stream], None] | None = None
-        if os.environ.get("HB_P2_EMBED_SIDECAR") == "1":
+        if (
+            os.environ.get("HB_P2_EMBED_SIDECAR") == "1"
+            and os.environ.get("HB_P2_DENSE_LOCK", "1") != "0"
+        ):
             from vllm.v1.engine.hb_embed_sidecar import (
                 prefill_launch_lock_acquire,
                 prefill_launch_lock_release,

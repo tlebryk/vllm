@@ -104,6 +104,11 @@ class Scheduler(SchedulerInterface):
         # the GPU ticket completes. Keep those request ids out of both lanes
         # until EngineCore finalizes that ticket.
         self._hb_inflight_req_ids: set[str] = set()
+        # Async decode intentionally schedules the same request into multiple
+        # FIFO tickets. Refcounts keep those requests from being preempted or
+        # resumed on the prefill lane until every older decode ticket has
+        # published.
+        self._hb_async_decode_refs: dict[str, int] = defaultdict(int)
         self._hb_preemptions_by_lane: dict[str, int] = defaultdict(int)
 
         # Scheduling constraints.
@@ -362,7 +367,10 @@ class Scheduler(SchedulerInterface):
         # A request becomes decode-ready after its prompt KV has been computed.
         # The default path is intentionally unchanged.
         def lane_accepts(request: Request) -> bool:
-            if request.request_id in self._hb_inflight_req_ids:
+            if self.is_hb_inflight(
+                request.request_id,
+                include_async_decode=lane != "decode",
+            ):
                 return False
             if lane == "default":
                 return True
@@ -501,9 +509,15 @@ class Scheduler(SchedulerInterface):
 
                     # The request cannot be scheduled.
                     # Preempt the lowest-priority request.
+                    safe_victims = self.hb_safe_preemption_victims()
+                    if not safe_victims:
+                        # A pending async-decode ticket still owns every
+                        # possible victim's logical/KV state. Wait for the
+                        # oldest ticket to publish instead of invalidating it.
+                        break
                     if self.policy == SchedulingPolicy.PRIORITY:
                         preempted_req = max(
-                            self.running,
+                            safe_victims,
                             key=lambda r: (r.priority, r.arrival_time),
                         )
                         self.running.remove(preempted_req)
@@ -526,7 +540,8 @@ class Scheduler(SchedulerInterface):
                                 encoder_compute_budget += num_embeds_to_restore
                             req_index -= 1
                     else:
-                        preempted_req = self.running.pop()
+                        preempted_req = safe_victims[-1]
+                        self.running.remove(preempted_req)
 
                     self._hb_preemptions_by_lane[lane] += 1
                     self._preempt_request(preempted_req, scheduled_timestamp)
@@ -608,7 +623,10 @@ class Scheduler(SchedulerInterface):
                 request = request_queue.peek_request()
                 request_id = request.request_id
 
-                if request_id in self._hb_inflight_req_ids:
+                if self.is_hb_inflight(
+                    request_id,
+                    include_async_decode=lane != "decode",
+                ):
                     request_queue.pop_request()
                     step_skipped_waiting.prepend_request(request)
                     continue
@@ -981,6 +999,40 @@ class Scheduler(SchedulerInterface):
 
     def release_hb_inflight(self, request_ids: set[str]) -> None:
         self._hb_inflight_req_ids.difference_update(request_ids)
+
+    def mark_hb_async_decode(self, request_ids: set[str]) -> None:
+        for request_id in request_ids:
+            self._hb_async_decode_refs[request_id] += 1
+
+    def release_hb_async_decode(self, request_ids: set[str]) -> None:
+        for request_id in request_ids:
+            refs = self._hb_async_decode_refs.get(request_id, 0)
+            if refs == 0:
+                raise RuntimeError(
+                    f"released unreferenced async-decode request {request_id!r}"
+                )
+            if refs == 1:
+                self._hb_async_decode_refs.pop(request_id, None)
+            else:
+                self._hb_async_decode_refs[request_id] = refs - 1
+
+    def hb_has_async_decode_ref(self, request_id: str) -> bool:
+        return self._hb_async_decode_refs.get(request_id, 0) > 0
+
+    def is_hb_inflight(
+        self, request_id: str, *, include_async_decode: bool = True
+    ) -> bool:
+        return request_id in self._hb_inflight_req_ids or (
+            include_async_decode and self.hb_has_async_decode_ref(request_id)
+        )
+
+    def hb_safe_preemption_victims(self) -> list[Request]:
+        """Return running requests not owned by an outstanding GPU ticket."""
+        return [
+            request
+            for request in self.running
+            if not self.is_hb_inflight(request.request_id)
+        ]
 
     def _build_kv_connector_meta(
         self, connector: KVConnectorBase_V1, scheduler_output: SchedulerOutput
