@@ -11,8 +11,8 @@ the whole GPU.
 
 Env contract (read by SlackServeGPUWorker.init_device):
   HB_SMCTRL_LIB          absolute path to libsmctrl.so (enables the feature)
-  HB_SMCTRL_PREFILL_TPCS "lo:hi" TPC range for the prefill/dense lane stream
-  HB_SMCTRL_DECODE_TPCS  "lo:hi" TPC range for the decode stream
+  HB_SMCTRL_PREFILL_TPCS "lo:hi", "spread:k", or "list:i,j,..." for prefill
+  HB_SMCTRL_DECODE_TPCS  the same mask syntax for the decode stream
 
 Requires driver 570.124.06 / CUDA 12.8 (offset-fragile: libsmctrl pokes a
 hardcoded offset in the driver's stream struct, keyed on driver version).
@@ -90,13 +90,23 @@ def parse_range(spec: str) -> tuple[int, int]:
 
 
 def _apply_spec(ctrl: SmCtrl, stream, spec: str) -> None:
-    """Apply "lo:hi" (contiguous) or "spread:k" (k TPCs evenly spaced)."""
+    """Apply a contiguous, numerically spread, or explicit TPC mask."""
     if spec.startswith("spread:"):
         import torch
 
         total = torch.cuda.get_device_properties(0).multi_processor_count // 2
         count = int(spec.split(":", 1)[1])
         ctrl.set_stream_tpc_list(stream, spread_indices(count, total))
+    elif spec.startswith("list:"):
+        import torch
+
+        total = torch.cuda.get_device_properties(0).multi_processor_count // 2
+        indices = [int(value) for value in spec.split(":", 1)[1].split(",")]
+        if not indices or len(indices) != len(set(indices)):
+            raise ValueError(f"TPC list must be non-empty and unique: {spec!r}")
+        if any(index < 0 or index >= total for index in indices):
+            raise ValueError(f"TPC list indices must be in [0, {total}): {spec!r}")
+        ctrl.set_stream_tpc_list(stream, indices)
     else:
         lo, hi = parse_range(spec)
         ctrl.set_stream_tpc_range(stream, lo, hi)

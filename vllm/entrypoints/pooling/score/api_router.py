@@ -76,6 +76,23 @@ async def create_score_v1(request: ScoreRequest, raw_request: Request):
 
     return await create_score(request, raw_request)
 
+@router.post(
+    "/v1/verify",
+    dependencies=[Depends(validate_json_request)],
+    responses={
+        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
+        HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
+    },
+)
+@with_cancellation
+@load_aware_call
+async def creat_verify_v1(request: ScoreRequest, raw_request: Request):
+    logger.warning(
+        "To indicate that Score API is not part of standard OpenAI API, we "
+        "have moved it to `/score`. Please update your client accordingly."
+    )
+
+    return await create_score(request, raw_request)
 
 @router.post(
     "/rerank",
