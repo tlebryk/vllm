@@ -82,6 +82,29 @@ class SlackServeGPUWorker(GPUWorker):
 
         return SlackServeModelRunner(self.vllm_config, self.device)
 
+    def compile_or_warm_up_model(self) -> float:
+        # Register operator-mask hooks only after vLLM's Dynamo compilation,
+        # profiling, and decode CUDA-graph capture have finished. Registering
+        # them in load_model makes Dynamo trace the Python stream/mask logic
+        # during profile_run and full-graph compilation fails. Runtime prefill
+        # is deliberately eager in SlackServe, while decode only replays the
+        # already-captured graphs, so this boundary gives hooks exactly one
+        # live caller without perturbing compilation or capture.
+        elapsed = super().compile_or_warm_up_model()
+        if os.environ.get("HB_SMCTRL_LINEAR_TPCS"):
+            from vllm.v1.worker.hb_smctrl import register_linear_mask_hooks
+
+            register_linear_mask_hooks(
+                self.model_runner.model,
+                list(
+                    {
+                        stream.cuda_stream: stream
+                        for stream in self.lane_streams.values()
+                    }.values()
+                ),
+            )
+        return elapsed
+
     def _lane_stream(self, lane: str) -> torch.cuda.Stream:
         # ``default`` remains a compatibility alias for decode.
         if lane in ("decode", "default"):
