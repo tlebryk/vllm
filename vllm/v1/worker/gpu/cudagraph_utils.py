@@ -94,6 +94,7 @@ class CudaGraphManager:
         )
 
         self._graphs_captured = False
+        self.capture_stream: torch.cuda.Stream | None = None
         self._candidates: list[list[BatchExecutionDescriptor]] = []
         self._capture_descs: dict[CUDAGraphMode, list[BatchExecutionDescriptor]] = {}
         self._init_candidates()
@@ -180,7 +181,12 @@ class CudaGraphManager:
             create_forward_fn: Factory that prepares inputs (OUTSIDE graph) and
                 returns a function that runs forward with a given CUDAGraphMode.
         """
-        with graph_capture(device=self.device):
+        with graph_capture(device=self.device) as capture_context:
+            # Keep this manager's capture stream explicit. torch.cuda.graph's
+            # implicit side stream is process-global: independent graph pools
+            # captured there can still bind the same cuBLAS workspace. Those
+            # graphs race that workspace when models replay on separate streams.
+            self.capture_stream = capture_context.stream
             # Capture in order: PIECEWISE first, then FULL. PIECEWISE has larger
             # activations so FULL activations should fit in already allocated
             # buffers in the graph pool.
@@ -213,11 +219,7 @@ class CudaGraphManager:
                         # Ensure any pre-capture prefetches from offloader are complete.
                         get_offloader().sync_prev_onload()
                         mask_ctrl = getattr(self, "capture_mask_ctrl", None)
-                        capture_stream = (
-                            torch.cuda.current_stream(self.device)
-                            if mask_ctrl is not None
-                            else None
-                        )
+                        capture_stream = self.capture_stream
                         if mask_ctrl is not None:
                             mask_ctrl._set_mask(
                                 capture_stream,

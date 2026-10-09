@@ -181,6 +181,16 @@ class BaseFrontendArgs:
     Accept both queues immediately; run models in configuration order. The
     expected counts prevent an initial arrival gap from releasing model B.
     """
+    slackserve_step_trace: str | None = None
+    """Optional streamed JSONL step records and NVTX labels for diagnostics."""
+    slackserve_smctrl_mask: str | None = None
+    """Optional MODEL:prefill:TPCS spread mask while a partner has decode work.
+
+    Restricted to concurrent topology and eager prefill. Decode graphs retain
+    their original placement; replay-time stream masks cannot restrict them.
+    """
+    slackserve_smctrl_lib: str | None = None
+    """libsmctrl shared library required by --slackserve-smctrl-mask."""
     slackserve_dense_model: str | None = None
     """Auxiliary pooling checkpoint for Slack Serve's shared-dense sidecar.
 

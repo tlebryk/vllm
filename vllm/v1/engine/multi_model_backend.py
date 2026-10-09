@@ -2,6 +2,7 @@
 """Arrival-driven, single-owner backend for two native async model clients."""
 
 import asyncio
+import json
 import logging
 import queue
 import threading
@@ -14,6 +15,7 @@ from pathlib import Path
 from vllm import EngineArgs
 from vllm.v1.engine.core_client import EngineCoreClient
 from vllm.v1.engine.exceptions import EngineDeadError
+from vllm.v1.engine.model_masks import ModelLaneMasks, ModelMaskPlan, library_provenance
 from vllm.v1.engine.model_streams import ModelDecodeStreams
 from vllm.v1.engine.multi_model_config import load_specs
 from vllm.v1.engine.multi_model_controller import ModelEndpoint, MultiModelController
@@ -77,6 +79,9 @@ class MultiModelBackend:
         max_requests=8192,
         output_capacity=64,
         offline_serial_counts=None,
+        step_trace=None,
+        smctrl_mask=None,
+        smctrl_lib=None,
     ):
         if max_requests <= 0 or output_capacity <= decode_depth + 2:
             raise ValueError("invalid ingress/output capacity")
@@ -94,6 +99,22 @@ class MultiModelBackend:
         self.topology, self.decode_depth = topology, decode_depth
         self.max_requests = max_requests
         self.model_order = [s.model_id for s in specs]
+        self.mask_plan = ModelMaskPlan.parse(smctrl_mask) if smctrl_mask else None
+        self.smctrl_lib = Path(smctrl_lib).resolve() if smctrl_lib else None
+        self.lane_masks = None
+        self.mask_metadata = None
+        if self.mask_plan is not None:
+            if (
+                self.mask_plan.model_id not in self.model_order
+                or self.mask_plan.lane != "prefill"
+                or topology == "single-stream"
+                or offline_serial_counts is not None
+            ):
+                raise ValueError(
+                    "native masking supports concurrent model-owned prefill only"
+                )
+            if self.smctrl_lib is None or not self.smctrl_lib.is_file():
+                raise ValueError("native masking requires --slackserve-smctrl-lib")
         if offline_serial_counts is not None and (
             not isinstance(offline_serial_counts, dict)
             or set(offline_serial_counts) != set(self.model_order)
@@ -127,6 +148,8 @@ class MultiModelBackend:
         self.manager = None
         self.last_pool_state = None
         self.execution_stream_ids = None
+        self.step_trace = Path(step_trace) if step_trace is not None else None
+        self.step_trace_file = None
         self.thread = threading.Thread(
             target=self._run, name="vllm-multi-model-core", daemon=True
         )
@@ -311,6 +334,16 @@ class MultiModelBackend:
                 )
             self.cores[spec.model_id] = core
             self.supported_tasks[spec.model_id] = core.get_supported_tasks()
+            if self.step_trace_file is not None:
+                original_dispatch = core.dispatch
+
+                def traced_dispatch(
+                    lane, dispatch=original_dispatch, mid=spec.model_id
+                ):
+                    with torch.cuda.nvtx.range(f"{mid}:{lane}"):
+                        return dispatch(lane)
+
+                core.dispatch = traced_dispatch
         endpoints, stream_order = self._bind_execution_streams()
         torch.cuda.synchronize()
         return MultiModelController(
@@ -320,7 +353,14 @@ class MultiModelBackend:
             independent_decode=self.topology.startswith("three-stream"),
             decode_streams=stream_order,
             record_steps=False,
+            lane_masks=self.lane_masks,
+            step_observer=self._observe_step
+            if self.step_trace_file is not None
+            else None,
         )
+
+    def _observe_step(self, record):
+        self.step_trace_file.write(json.dumps(record, separators=(",", ":")) + "\n")
 
     def _bind_execution_streams(self):
         import torch
@@ -335,10 +375,12 @@ class MultiModelBackend:
             for s in self.specs
         }
         endpoints = []
+        workers = {}
         for spec in self.specs:
             core = self.cores[spec.model_id]
             wrapped = core.model_executor.driver_worker
             worker = getattr(wrapped, "worker", wrapped)
+            workers[spec.model_id] = worker
             worker.bind_lane_streams(prefill, streams[spec.model_id], serial=serial)
             endpoints.append(
                 ModelEndpoint(
@@ -353,6 +395,40 @@ class MultiModelBackend:
             "prefill": prefill.cuda_stream,
             "decode": {mid: stream.cuda_stream for mid, stream in streams.items()},
         }
+        if self.mask_plan is not None:
+            from vllm.v1.worker.hb_smctrl import SmCtrl, spread_indices
+
+            total = torch.cuda.get_device_properties(0).multi_processor_count // 2
+            if not 0 < self.mask_plan.tpcs < total:
+                raise ValueError("mask TPC count must be below full GPU")
+            # Prefill is eager; decode's captured placement is left intact.
+            if not all(w.model_runner.decode_graphs_only for w in workers.values()):
+                raise ValueError("prefill stream masking requires eager prefill")
+            indices = spread_indices(self.mask_plan.tpcs, total)
+            self.lane_masks = ModelLaneMasks(
+                self.mask_plan,
+                endpoints,
+                workers,
+                {"prefill": prefill},
+                total,
+                SmCtrl(str(self.smctrl_lib)),
+                indices,
+                activation="decode",
+            )
+            self.mask_metadata = {
+                "model_id": self.mask_plan.model_id,
+                "lane": "prefill",
+                "enabled_tpcs": self.mask_plan.tpcs,
+                "total_tpcs": total,
+                "geometry": "spread",
+                "enabled_indices": indices,
+                "activation": (
+                    "partner has decode-ready resident requests "
+                    "or productive pending decode tickets"
+                ),
+                "decode_graphs": "unchanged",
+                "library": library_provenance(self.smctrl_lib),
+            }
         stream_order = (
             None
             if self.topology in ("single-stream", "two-stream")
@@ -374,6 +450,9 @@ class MultiModelBackend:
 
     def _run(self):
         try:
+            if self.step_trace is not None:
+                self.step_trace.parent.mkdir(parents=True, exist_ok=True)
+                self.step_trace_file = self.step_trace.open("w", buffering=131072)
             controller = self._initialize()
             self.ready.set_result(None)
             observed = set()
@@ -431,10 +510,15 @@ class MultiModelBackend:
                     import torch
 
                     torch.cuda.synchronize()
+                if self.lane_masks is not None:
+                    self.lane_masks.reset()
                 for core in self.cores.values():
                     core.shutdown()
             except BaseException:
                 logger.exception("multi-model backend teardown failed")
+            finally:
+                if self.step_trace_file is not None:
+                    self.step_trace_file.close()
 
     async def close(self, timeout=30):
         self.stop.set()
@@ -474,6 +558,8 @@ class MultiModelBackend:
             "topology": self.topology,
             "execution_stream_ids": self.execution_stream_ids,
             "offline_model_serial": serial,
+            "step_trace": str(self.step_trace) if self.step_trace is not None else None,
+            "smctrl_mask": self.mask_metadata,
             "failed": self.error is not None,
         }
 

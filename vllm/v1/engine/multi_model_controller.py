@@ -182,9 +182,11 @@ class MultiModelController:
         independent_decode: bool = False,
         decode_streams: Any = None,
         record_steps: bool = True,
+        step_observer: Callable[[dict], None] | None = None,
     ) -> None:
         self.models = list(models)
         self.record_steps = record_steps
+        self.step_observer = step_observer
         self._session = None
         self._pending = {}
         self._waiting_futures = []
@@ -367,40 +369,42 @@ class MultiModelController:
             productive = scheduled.total_num_scheduled_tokens > 0
             core.post_step(model_executed=productive)
             model.publish(outputs)
-            if self.record_steps:
-                result.steps.append(
-                    {
-                        "model_id": ticket.model_id,
-                        "lane": ticket.lane,
-                        "t_start": ticket.dispatched_at,
-                        "t_end": time.perf_counter(),
-                        "dispatch_ms": ticket.dispatch_ms,
-                        "scheduled_tokens": scheduled.total_num_scheduled_tokens,
-                        "scheduled_requests": len(scheduled.num_scheduled_tokens),
-                        "num_scheduled_tokens": dict(scheduled.num_scheduled_tokens),
-                        "running_before": ticket.running_before,
-                        "waiting_before": ticket.waiting_before,
-                        "policy_phase": ticket.policy_phase,
-                        "kv_admission_policy": ticket.kv_admission_policy,
-                        "smctrl_mask": ticket.smctrl_mask,
-                        "kv_free_before": ticket.kv_free_before,
-                        "kv_free_after": (
-                            core.scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
-                        ),
-                        "preemptions": len(
-                            getattr(scheduled, "preempted_req_ids", ()) or ()
-                        ),
-                        "kv_reclamation_needed_blocks": getattr(
-                            scheduled, "kv_reclamation_needed_blocks", 0
-                        ),
-                        "kv_admission_deferred": getattr(
-                            scheduled, "kv_admission_deferred", False
-                        ),
-                    }
-                )
+            if self.record_steps or self.step_observer is not None:
+                record = {
+                    "model_id": ticket.model_id,
+                    "lane": ticket.lane,
+                    "t_start": ticket.dispatched_at,
+                    "t_end": time.perf_counter(),
+                    "dispatch_ms": ticket.dispatch_ms,
+                    "scheduled_tokens": scheduled.total_num_scheduled_tokens,
+                    "scheduled_requests": len(scheduled.num_scheduled_tokens),
+                    "num_scheduled_tokens": dict(scheduled.num_scheduled_tokens),
+                    "running_before": ticket.running_before,
+                    "waiting_before": ticket.waiting_before,
+                    "policy_phase": ticket.policy_phase,
+                    "kv_admission_policy": ticket.kv_admission_policy,
+                    "smctrl_mask": ticket.smctrl_mask,
+                    "kv_free_before": ticket.kv_free_before,
+                    "kv_free_after": (
+                        core.scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
+                    ),
+                    "preemptions": len(
+                        getattr(scheduled, "preempted_req_ids", ()) or ()
+                    ),
+                    "kv_reclamation_needed_blocks": getattr(
+                        scheduled, "kv_reclamation_needed_blocks", 0
+                    ),
+                    "kv_admission_deferred": getattr(
+                        scheduled, "kv_admission_deferred", False
+                    ),
+                }
                 pool = core.scheduler.kv_cache_manager.block_pool
                 if getattr(pool, "shared_manager", None) is not None:
-                    result.steps[-1]["shared_kv"] = pool.shared_manager.snapshot()
+                    record["shared_kv"] = pool.shared_manager.snapshot()
+                if self.record_steps:
+                    result.steps.append(record)
+                if self.step_observer is not None:
+                    self.step_observer(record)
             if productive:
                 blocked.clear()
                 reclamation_blocked.clear()
@@ -431,6 +435,7 @@ class MultiModelController:
                         model,
                         lane,
                         {t.model_id for fifo in pending.values() for t in fifo},
+                        pending_tickets=[t for fifo in pending.values() for t in fifo],
                     )
                     if self.lane_masks is not None
                     else None

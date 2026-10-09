@@ -53,6 +53,9 @@ async def build_multi_model_clients(args):
             if args.slackserve_offline_serial_counts is not None
             else None
         ),
+        step_trace=args.slackserve_step_trace,
+        smctrl_mask=args.slackserve_smctrl_mask,
+        smctrl_lib=args.slackserve_smctrl_lib,
     )
     clients = {}
     try:
