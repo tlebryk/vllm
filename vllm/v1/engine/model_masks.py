@@ -18,6 +18,8 @@ class ModelMaskPlan:
         plan = cls(model_id, lane, int(count))
         if not model_id or lane not in ("prefill", "decode") or plan.tpcs <= 0:
             raise ValueError("mask must be MODEL:prefill|decode:POSITIVE_TPC_COUNT")
+        if model_id == "*" and lane != "prefill":
+            raise ValueError("all-model masks support the shared prefill stream only")
         return plan
 
 
@@ -43,7 +45,9 @@ class ModelLaneMasks:
     ):
         self.plan, self.models, self.workers = plan, models, workers
         self.streams, self.total_tpcs, self.ctrl = streams, total_tpcs, ctrl
-        if plan.model_id not in workers or not 0 < plan.tpcs < total_tpcs:
+        if (
+            plan.model_id not in workers and plan.model_id != "*"
+        ) or not 0 < plan.tpcs < total_tpcs:
             raise ValueError(
                 "mask model must exist and TPC count must be below full GPU"
             )
@@ -54,7 +58,11 @@ class ModelLaneMasks:
         self.activation = activation
 
     def before_dispatch(self, model, lane, pending_models, *, pending_tickets=()):
-        partners = [m for m in self.models if m.model_id != model.model_id]
+        partners = [
+            m
+            for m in self.models
+            if m.model_id != model.model_id or self.plan.model_id == "*"
+        ]
         partner_ids = {m.model_id for m in partners}
         partner_active = any(
             other.model_id != model.model_id
@@ -64,6 +72,7 @@ class ModelLaneMasks:
         decode_ready = sum(
             getattr(r, "num_computed_tokens", 0) >= getattr(r, "num_prompt_tokens", 0)
             for other in partners
+            if getattr(other, "decode_enabled", True)
             for r in other.core.scheduler.running
         )
         decode_tickets = [
@@ -79,7 +88,9 @@ class ModelLaneMasks:
             else bool(decode_ready or decode_tickets)
         )
         masked = (
-            model.model_id == self.plan.model_id and lane == self.plan.lane and protect
+            (model.model_id == self.plan.model_id or self.plan.model_id == "*")
+            and lane == self.plan.lane
+            and protect
         )
         if lane == self.plan.lane:
             stream = self.streams.get((model.model_id, lane), self.streams.get(lane))

@@ -3,6 +3,7 @@
 """Pooling endpoints backed by Slack Serve's in-process dense sidecar."""
 
 import asyncio
+import json
 import os
 from http import HTTPStatus
 
@@ -31,6 +32,7 @@ from vllm.entrypoints.utils import with_cancellation
 from vllm.utils import random_uuid
 
 router = APIRouter()
+verify_router = APIRouter()
 
 
 class SlackServeEmbeddingRequest(OpenAIBaseModel):
@@ -141,8 +143,9 @@ async def create_embedding(
     )
 
 
-@router.post(
+@verify_router.post(
     "/v1/verify",
+    response_model=None,
     dependencies=[Depends(validate_json_request)],
     responses={
         HTTPStatus.OK.value: {"model": VerifyResponse},
@@ -154,6 +157,39 @@ async def create_embedding(
 async def create_verification(
     request: SlackServeVerifyRequest, raw_request: Request
 ) -> VerifyResponse:
+    if not request.input:
+        return _error("`input` must not be empty.", HTTPStatus.BAD_REQUEST.value)
+    if hasattr(raw_request.app.state, "multi_model_states"):
+        from vllm.entrypoints.pooling.classify.protocol import (
+            ClassificationCompletionRequest,
+        )
+
+        state = getattr(raw_request.state, "slackserve_model_state", None)
+        handler = getattr(state, "serving_classification", None)
+        if handler is None:
+            return _error("This model does not support scalar verification.", 400)
+        response = await handler(
+            ClassificationCompletionRequest(
+                model=request.model,
+                input=request.input,
+                use_activation=request.use_activation,
+            ),
+            raw_request,
+        )
+        if response.status_code != 200:
+            return response
+        result = json.loads(response.body)
+        if any(len(item["probs"]) != 1 for item in result["data"]):
+            return _error("Verifier output must contain exactly one scalar score.", 400)
+        return VerifyResponse(
+            id=result["id"],
+            model=result["model"],
+            data=[
+                VerifyResponseData(index=item["index"], score=item["probs"][0])
+                for item in result["data"]
+            ],
+            usage=UsageInfo(**result["usage"]),
+        )
     if task_error := _require_task("classify"):
         return task_error
     served_name = _served_name()
@@ -288,3 +324,4 @@ async def create_rerank(request: RerankRequest, raw_request: Request) -> RerankR
 
 def attach_router(app: FastAPI) -> None:
     app.include_router(router)
+    app.include_router(verify_router)

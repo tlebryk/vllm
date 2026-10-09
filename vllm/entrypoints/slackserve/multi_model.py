@@ -24,14 +24,13 @@ async def build_multi_model_clients(args):
         or args.tensor_parallel_size != 1
         or args.pipeline_parallel_size != 1
         or args.data_parallel_size != 1
-        or args.slackserve_dense_model
         or args.enable_lora
         or args.speculative_config
         or os.environ.get("HB_P2_SERVE") == "1"
     ):
         raise ValueError(
             "shared dual-model serving requires one API process/GPU without "
-            "distributed, dense-sidecar, LoRA or speculative modes"
+            "distributed, legacy sidecar, LoRA or speculative modes"
         )
     specs, configs, budget = prepare_models(
         args.slackserve_models,
@@ -83,12 +82,27 @@ class MultiModelRoutingMiddleware:
     """Route model-local native handlers; bound live HTTP bodies/streams."""
 
     generation_paths = {"/v1/completions", "/v1/chat/completions"}
-    model_paths = generation_paths | {
-        "/tokenize",
-        "/detokenize",
-        "/v1/completions/render",
-        "/v1/chat/completions/render",
+    pooling_paths = {
+        "/classify",
+        "/pooling",
+        "/v1/verify",
+        "/v1/embeddings",
+        "/score",
+        "/v1/score",
+        "/rerank",
+        "/v1/rerank",
+        "/v2/rerank",
     }
+    model_paths = (
+        generation_paths
+        | pooling_paths
+        | {
+            "/tokenize",
+            "/detokenize",
+            "/v1/completions/render",
+            "/v1/chat/completions/render",
+        }
+    )
 
     def __init__(self, app, max_requests=8192, max_body_bytes=1048576):
         self.app = app
@@ -165,6 +179,19 @@ class MultiModelRoutingMiddleware:
                 return await self._error(
                     scope, receive, send, f"model {mid!r} does not exist", 404
                 )
+            config = getattr(
+                getattr(states[mid], "engine_client", None), "model_config", None
+            )
+            if config is not None:
+                generation = config.runner_type == "generate"
+                if path in self.generation_paths and not generation:
+                    return await self._error(
+                        scope, receive, send, "this model does not generate"
+                    )
+                if path in self.pooling_paths and generation:
+                    return await self._error(
+                        scope, receive, send, "this model does not support pooling"
+                    )
             if path in self.generation_paths:
                 fmt = payload.get("response_format")
                 if fmt is None:
@@ -220,6 +247,33 @@ class MultiModelRoutingMiddleware:
                         receive,
                         send,
                         "offline model-serial counts require one prompt and n=1 "
+                        "per HTTP request",
+                    )
+            backend = getattr(
+                getattr(state, "engine_client", None), "multi_model_backend", None
+            )
+            if (
+                path in self.pooling_paths
+                and backend is not None
+                and backend.offline_serial_counts is not None
+            ):
+                # Counts refer to engine requests, not HTTP batch envelopes.
+                # Reject fan-out before admitting any part of the envelope.
+                fields = ("input", "documents", "text_1", "text_2")
+                if any(
+                    isinstance(payload.get(field), list)
+                    and (
+                        not payload[field]
+                        or not all(type(item) is int for item in payload[field])
+                        and len(payload[field]) != 1
+                    )
+                    for field in fields
+                ):
+                    return await self._error(
+                        scope,
+                        receive,
+                        send,
+                        "offline model-serial counts require one pooling input "
                         "per HTTP request",
                     )
             scope.setdefault("state", {})["slackserve_model_state"] = states[mid]

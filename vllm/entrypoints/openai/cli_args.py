@@ -160,7 +160,7 @@ class BaseFrontendArgs:
     This is intended for use in a Disaggregated Everything setup.
     """
     slackserve_models: str | None = None
-    """JSON configuration for two native generating models sharing one GPU."""
+    """JSON configuration for two native generation or pooling models on one GPU."""
     slackserve_shared_kv: Literal["private", "head", "layer"] = "layer"
     """KV capacity layout for the native dual-model backend."""
     slackserve_kv_memory_bytes: int | None = None
@@ -192,10 +192,10 @@ class BaseFrontendArgs:
     slackserve_smctrl_lib: str | None = None
     """libsmctrl shared library required by --slackserve-smctrl-mask."""
     slackserve_dense_model: str | None = None
-    """Auxiliary pooling checkpoint for Slack Serve's shared-dense sidecar.
+    """Auxiliary pooling checkpoint for the native multi-model controller.
 
-    Enables the two-lane generation controller and loads the model inside the
-    primary EngineCore process so it shares the LLM prefill CUDA stream.
+    Runs on the shared prefill stream, with generation prefill taking priority.
+    Uses private KV and the same request transport as native dual LLM serving.
     """
     slackserve_dense_served_model_name: str = "embed"
     """Public ``model`` name accepted by the Slack Serve dense endpoint."""
@@ -206,6 +206,8 @@ class BaseFrontendArgs:
     """Optional JSON Hugging Face config overrides for the auxiliary model."""
     slackserve_dense_gpu_memory_utilization: float = 0.18
     """GPU-memory fraction reserved for the auxiliary embedding engine."""
+    slackserve_dense_kv_memory_bytes: int | None = None
+    """Explicit private dense KV bytes; otherwise use utilization-based sizing."""
     slackserve_dense_max_model_len: int = 11264
     """Maximum input length served by the auxiliary embedding engine."""
     slackserve_dense_max_num_batched_tokens: int = 8192

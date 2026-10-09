@@ -18,7 +18,11 @@ router = APIRouter()
 
 
 def embedding(request: Request) -> ServingEmbedding | None:
-    return request.app.state.serving_embedding
+    return getattr(
+        getattr(request.state, "slackserve_model_state", request.app.state),
+        "serving_embedding",
+        None,
+    )
 
 
 @router.post(

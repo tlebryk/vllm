@@ -87,13 +87,13 @@ async def build_async_engine_client(
     disable_frontend_multiprocessing: bool | None = None,
     client_config: dict[str, Any] | None = None,
 ) -> AsyncIterator[EngineClient]:
+    configure_dense_sidecar(args, native=True)
     if getattr(args, "slackserve_models", None):
         from vllm.entrypoints.slackserve.multi_model import build_multi_model_clients
 
         async with build_multi_model_clients(args) as engine:
             yield engine
         return
-    configure_dense_sidecar(args)
     if os.getenv("VLLM_WORKER_MULTIPROC_METHOD") == "forkserver":
         # The executor is expected to be mp.
         # Pre-import heavy modules in the forkserver process
@@ -223,6 +223,10 @@ def build_app(
         )
 
         register_slackserve_embed_api_router(app)
+    elif getattr(args, "slackserve_models", None):
+        from vllm.entrypoints.slackserve.embed_api_router import verify_router
+
+        app.include_router(verify_router)
 
     from vllm.entrypoints.sagemaker.api_router import (
         attach_router as register_sagemaker_api_router,
@@ -359,12 +363,13 @@ async def init_app_state(
             model_args = copy(args)
             model_args.model = spec.model
             model_args.served_model_name = [spec.model_id]
+            model_args.slackserve_dense_model = None
             model_state = state if not states else State()
             await init_app_state(
                 engine_client.model_clients[spec.model_id],
                 model_state,
                 model_args,
-                supported_tasks,
+                await engine_client.model_clients[spec.model_id].get_supported_tasks(),
                 _single_model=True,
             )
             states[spec.model_id] = model_state
@@ -655,6 +660,11 @@ async def build_and_serve(
         uvicorn_kwargs["log_config"] = log_config
 
     supported_tasks = await engine_client.get_supported_tasks()
+    if hasattr(engine_client, "model_clients"):
+        all_tasks = []
+        for client in engine_client.model_clients.values():
+            all_tasks.extend(await client.get_supported_tasks())
+        supported_tasks = tuple(dict.fromkeys(all_tasks))
     logger.info("Supported tasks: %s", supported_tasks)
     app = build_app(args, supported_tasks)
     await init_app_state(engine_client, app.state, args, supported_tasks)

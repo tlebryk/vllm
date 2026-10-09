@@ -16,7 +16,11 @@ router = APIRouter()
 
 
 def classify(request: Request) -> ServingClassification | None:
-    return request.app.state.serving_classification
+    return getattr(
+        getattr(request.state, "slackserve_model_state", request.app.state),
+        "serving_classification",
+        None,
+    )
 
 
 @router.post("/classify", dependencies=[Depends(validate_json_request)])

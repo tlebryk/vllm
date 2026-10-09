@@ -10,7 +10,7 @@ from typing import Any
 class ModelSpec:
     model_id: str
     model: str
-    kv_cache_memory_bytes: int
+    kv_cache_memory_bytes: int | None
     max_model_len: int
     max_num_seqs: int
     max_num_batched_tokens: int
@@ -21,13 +21,20 @@ class ModelSpec:
     compile_decode: bool = False
     dtype: str = "float16"
     block_size: int = 16
+    runner: str = "generate"
+    pooling_task: str | None = None
+    hf_overrides: dict | None = None
+    tokenizer: str | None = None
+    trust_remote_code: bool = False
+    compilation: dict | None = None
+    prefill_custom_ops: str = ""
+    prefill_reserve_fraction: float = 0.0
 
     def __post_init__(self) -> None:
         if not self.model_id or not self.model:
             raise ValueError("each model needs an ID and checkpoint")
         if (
             min(
-                self.kv_cache_memory_bytes,
                 self.max_model_len,
                 self.max_num_seqs,
                 self.max_num_batched_tokens,
@@ -36,23 +43,40 @@ class ModelSpec:
             <= 0
         ):
             raise ValueError("KV bytes and model/scheduler capacities must be positive")
+        if self.kv_cache_memory_bytes is not None and self.kv_cache_memory_bytes <= 0:
+            raise ValueError(
+                "KV bytes must be positive or None for private auto sizing"
+            )
+        if self.runner not in ("generate", "pooling"):
+            raise ValueError("runner must be generate or pooling")
+        if self.runner == "pooling" and self.pooling_task not in (
+            "embed",
+            "classify",
+            "score",
+        ):
+            raise ValueError("pooling runner requires an embed/classify/score task")
+        if self.runner == "generate" and self.pooling_task is not None:
+            raise ValueError("generation runner cannot specify a pooling task")
+        if not 0 <= self.prefill_reserve_fraction < 1:
+            raise ValueError("prefill reserve fraction must be in [0, 1)")
         if not 0 < self.gpu_memory_utilization <= 1:
             raise ValueError("GPU memory utilization must be in (0, 1]")
         if min(self.prefill_reserve_blocks, self.prefill_sm_target) < 0:
             raise ValueError("KV reserve and SM target must be nonnegative")
-        if self.dtype not in ("float16", "bfloat16"):
-            raise ValueError("initial dense Llama path supports FP16/BF16 only")
+        if self.dtype not in ("float16", "bfloat16", "auto"):
+            raise ValueError("dense runners support FP16/BF16 or auto in private mode")
 
     def engine_kwargs(self, *, eager: bool, decode_depth: int) -> dict[str, Any]:
         if eager and self.compile_decode:
             raise ValueError("compile_decode requires graph mode")
-        return {
+        pooling = self.runner == "pooling"
+        kwargs = {
             "model": self.model,
             "revision": self.revision,
-            "runner": "generate",
+            "runner": self.runner,
             "dtype": self.dtype,
             "seed": 0,
-            "trust_remote_code": False,
+            "trust_remote_code": self.trust_remote_code,
             "enable_prefix_caching": False,
             "block_size": self.block_size,
             "gpu_memory_utilization": self.gpu_memory_utilization,
@@ -62,18 +86,22 @@ class ModelSpec:
             "max_num_batched_tokens": self.max_num_batched_tokens,
             "async_scheduling": False,
             "enforce_eager": eager,
-            "worker_cls": "vllm.v1.worker.slackserve_gpu_worker.SlackServeGPUWorker",
+            "worker_cls": (
+                "vllm.v1.worker.slackserve_pooling_worker.SlackServePoolingWorker"
+                if pooling
+                else "vllm.v1.worker.slackserve_gpu_worker.SlackServeGPUWorker"
+            ),
             "scheduler_cls": (
                 "vllm.v1.core.sched.async_scheduler.AsyncScheduler"
-                if decode_depth > 1
+                if decode_depth > 1 and not pooling
                 else "vllm.v1.core.sched.scheduler.Scheduler"
             ),
             # Dense FP16/BF16 Llama + FlashAttention avoids global FlashInfer,
             # MLA and MoE workspaces; those backends require a separate audit.
             "attention_config": {"backend": "FLASH_ATTN"},
             "compilation_config": {
-                "mode": 3 if self.compile_decode else 0,
-                "cudagraph_mode": "NONE" if eager else "FULL",
+                "mode": 3 if self.compile_decode or pooling else 0,
+                "cudagraph_mode": "NONE" if eager or pooling else "FULL",
                 "max_cudagraph_capture_size": min(self.max_num_seqs * 2, 200),
                 "custom_ops": ["all"],
                 "pass_config": {
@@ -86,16 +114,30 @@ class ModelSpec:
                 "slackserve": {
                     "model_id": self.model_id,
                     "decode_graphs_only": True,
-                    "async_decode_depth": decode_depth,
+                    "async_decode_depth": decode_depth if not pooling else 1,
                     "compile_decode": self.compile_decode,
                     "prefill_sm_target": self.prefill_sm_target,
+                    "prefill_custom_ops": self.prefill_custom_ops,
                 }
             },
         }
+        if self.compilation is not None:
+            kwargs["compilation_config"] = self.compilation
+        if self.hf_overrides is not None:
+            kwargs["hf_overrides"] = self.hf_overrides
+        if self.tokenizer is not None:
+            kwargs["tokenizer"] = self.tokenizer
+        if pooling:
+            kwargs["convert"] = "embed" if self.pooling_task == "embed" else "classify"
+        return kwargs
 
 
 def load_specs(path: Path, n: int, warmup: int) -> list[ModelSpec]:
-    specs = [ModelSpec(**row) for row in json.loads(path.read_text())]
+    specs = (
+        list(path)
+        if isinstance(path, (list, tuple))
+        else [ModelSpec(**row) for row in json.loads(path.read_text())]
+    )
     if len(specs) != 2 or len({s.model_id for s in specs}) != 2:
         raise ValueError("this verifier requires exactly two unique model IDs")
     if any(s.max_num_seqs < max(n, warmup) for s in specs):

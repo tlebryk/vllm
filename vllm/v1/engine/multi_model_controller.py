@@ -22,6 +22,7 @@ class ModelEndpoint:
     publish: Callable[[Any], None]
     prefill_reserve_blocks: int = 0
     async_decode: bool = False
+    decode_enabled: bool = True
 
     def __post_init__(self) -> None:
         if not self.model_id or self.prefill_reserve_blocks < 0:
@@ -219,6 +220,8 @@ class MultiModelController:
 
     @staticmethod
     def _ready(model: ModelEndpoint, lane: str) -> bool:
+        if lane == "decode" and not model.decode_enabled:
+            return False
         sched = model.core.scheduler
         # Prefill must also exclude requests owned by async decode tickets.
         inflight = set(sched._hb_inflight_req_ids)
@@ -351,9 +354,13 @@ class MultiModelController:
             core = model.core
             if getattr(core, "_hb_inflight_lanes", set()):
                 raise RuntimeError(f"model {model.model_id} already has pending steps")
-            if self.decode_depth > 1 and not model.async_decode:
+            if (
+                model.decode_enabled
+                and self.decode_depth > 1
+                and not model.async_decode
+            ):
                 raise ValueError("decode launch-ahead requires the async scheduler")
-            core._hb_decode_depth = self.decode_depth
+            core._hb_decode_depth = self.decode_depth if model.decode_enabled else 1
             core._hb_decode_fifo = deque()
 
         def complete(ticket: ModelTicket) -> None:
@@ -499,8 +506,16 @@ class MultiModelController:
                     # retried under the ordinary policy once A has drained.
                     blocked.difference_update(admission_blocked)
                     admission_blocked.clear()
-            for offset in range(len(self.models)):
-                index = (cursor[lane] + offset) % len(self.models)
+            indices = [
+                (cursor[lane] + offset) % len(self.models)
+                for offset in range(len(self.models))
+            ]
+            if lane == "prefill":
+                # Stable partition retains round-robin within each role.
+                # Pooling fills dense-stream slack only when generation
+                # prefill cannot dispatch (including KV watermark blocking).
+                indices.sort(key=lambda i: not self.models[i].decode_enabled)
+            for index in indices:
                 model = self.models[index]
                 if bulk_tail is not None and not bulk_tail.permits(model, lane):
                     continue
@@ -596,7 +611,7 @@ class MultiModelController:
             flushed = False
             for model in self.models:
                 if model.core.scheduler.has_finished_requests():
-                    dispatch(model, "decode")
+                    dispatch(model, "decode" if model.decode_enabled else "prefill")
                     flushed = True
                     break
             if flushed:

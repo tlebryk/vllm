@@ -24,11 +24,19 @@ logger = init_logger(__name__)
 
 
 def score(request: Request) -> ServingScores | None:
-    return request.app.state.serving_scores
+    return getattr(
+        getattr(request.state, "slackserve_model_state", request.app.state),
+        "serving_scores",
+        None,
+    )
 
 
 def rerank(request: Request) -> ServingScores | None:
-    return request.app.state.serving_scores
+    return getattr(
+        getattr(request.state, "slackserve_model_state", request.app.state),
+        "serving_scores",
+        None,
+    )
 
 
 @router.post(

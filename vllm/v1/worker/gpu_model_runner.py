@@ -2956,7 +2956,7 @@ class GPUModelRunner(
             model_runner_output.pooler_output = [None] * num_reqs
             return model_runner_output
 
-        if self.use_async_scheduling:
+        if self.use_async_scheduling or getattr(self, "async_pooling_output", False):
             return AsyncGPUPoolingModelRunnerOutput(
                 model_runner_output=model_runner_output,
                 raw_pooler_output=raw_pooler_output,

@@ -25,7 +25,12 @@ logger = logging.getLogger(__name__)
 
 def prepare_models(path, *, mode, budget, decode_depth):
     """Validate both models on CPU before starting the CUDA owner thread."""
-    specs = load_specs(Path(path), 0, 0)
+    specs = load_specs(path if isinstance(path, (list, tuple)) else Path(path), 0, 0)
+    if mode != "private" and any(
+        s.runner == "pooling" or s.kv_cache_memory_bytes is None or s.dtype == "auto"
+        for s in specs
+    ):
+        raise ValueError("pooling and auto-sized KV/dtype currently require private KV")
     prepared = []
     for spec in specs:
         config = EngineArgs(
@@ -36,6 +41,8 @@ def prepare_models(path, *, mode, budget, decode_depth):
             not in (
                 ["LlamaForCausalLM"],
                 ["Qwen3ForCausalLM"],
+                ["LlamaForSequenceClassification"],
+                ["Qwen3ForSequenceClassification"],
             )
             or config.model_config.quantization is not None
         ):
@@ -43,12 +50,17 @@ def prepare_models(path, *, mode, budget, decode_depth):
                 "native multi-model serving supports unquantized dense Llama/Qwen3"
             )
         config.model_config.served_model_name = spec.model_id
+        if spec.runner == "pooling":
+            from vllm.config.compilation import CUDAGraphMode
+
+            if config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
+                raise ValueError("native pooling requires cudagraph_mode NONE")
         prepared.append(config)
     if mode not in ("layer", "head", "private"):
         raise ValueError("invalid shared KV layout")
     if budget is not None and (budget <= 0 or mode == "private"):
         raise ValueError("explicit shared budget requires a positive head/layer pool")
-    return specs, prepared, budget or sum(s.kv_cache_memory_bytes for s in specs)
+    return specs, prepared, budget or sum(s.kv_cache_memory_bytes or 0 for s in specs)
 
 
 @dataclass(eq=False)
@@ -105,7 +117,10 @@ class MultiModelBackend:
         self.mask_metadata = None
         if self.mask_plan is not None:
             if (
-                self.mask_plan.model_id not in self.model_order
+                (
+                    self.mask_plan.model_id not in self.model_order
+                    and self.mask_plan.model_id != "*"
+                )
                 or self.mask_plan.lane != "prefill"
                 or topology == "single-stream"
                 or offline_serial_counts is not None
@@ -163,16 +178,27 @@ class MultiModelBackend:
 
     def submit(self, mid, request):
         params = request.sampling_params
+        pooling = getattr(request, "pooling_params", None)
+        spec = next((s for s in self.specs if s.model_id == mid), None)
+        if spec is None:
+            raise ValueError(f"unknown model {mid!r}")
+        runner = getattr(spec, "runner", "generate")
         if (
-            params is None
-            or params.structured_outputs is not None
+            (runner == "generate" and (params is None or pooling is not None))
+            or (runner == "pooling" and (pooling is None or params is not None))
+            or (params is not None and params.structured_outputs is not None)
+            or (
+                pooling is not None
+                and pooling.task not in self.supported_tasks.get(mid, ())
+            )
             or request.mm_features
             or request.prompt_embeds is not None
             or request.lora_request is not None
             or request.resumable
         ):
             raise ValueError(
-                "multi-model serving supports plain text generation without "
+                "multi-model serving supports model-local text generation/pooling "
+                "without "
                 "structured outputs, LoRA or streaming input"
             )
         key = mid, request.request_id
@@ -334,6 +360,13 @@ class MultiModelBackend:
                 )
             self.cores[spec.model_id] = core
             self.supported_tasks[spec.model_id] = core.get_supported_tasks()
+            if (
+                spec.runner == "pooling"
+                and spec.pooling_task not in self.supported_tasks[spec.model_id]
+            ):
+                raise ValueError(
+                    f"model {spec.model_id} does not support {spec.pooling_task}"
+                )
             if self.step_trace_file is not None:
                 original_dispatch = core.dispatch
 
@@ -387,8 +420,18 @@ class MultiModelBackend:
                     spec.model_id,
                     core,
                     lambda out, mid=spec.model_id: self._publish(mid, out),
-                    spec.prefill_reserve_blocks,
-                    self.decode_depth > 1,
+                    max(
+                        spec.prefill_reserve_blocks,
+                        int(
+                            core.scheduler.kv_cache_manager.block_pool.num_gpu_blocks
+                            * spec.prefill_reserve_fraction
+                        )
+                        if getattr(spec, "prefill_reserve_fraction", 0)
+                        else 0,
+                    ),
+                    self.decode_depth > 1
+                    and getattr(spec, "runner", "generate") == "generate",
+                    getattr(spec, "runner", "generate") == "generate",
                 )
             )
         self.execution_stream_ids = {

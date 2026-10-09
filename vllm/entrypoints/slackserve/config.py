@@ -5,15 +5,19 @@
 import json
 import os
 from argparse import Namespace
+from dataclasses import fields
 
 from vllm.config.compilation import CompilationMode, CUDAGraphMode
+from vllm.config.utils import is_init_field
 
 
-def configure_dense_sidecar(args: Namespace) -> None:
+def configure_dense_sidecar(args: Namespace, *, native: bool = False) -> None:
     """Apply the two-stream preset before ``AsyncLLM`` starts EngineCore."""
     model = getattr(args, "slackserve_dense_model", None)
     if model is None:
         return
+    if native and getattr(args, "slackserve_models", None):
+        raise ValueError("choose --slackserve-models or --slackserve-dense-model")
 
     unsupported_parallel = {
         name: getattr(args, name, 1)
@@ -98,6 +102,75 @@ def configure_dense_sidecar(args: Namespace) -> None:
             "primary and dense GPU-memory utilization must sum to at most 0.90; "
             f"got {args.gpu_memory_utilization + dense_gmu:.3f}"
         )
+
+    if native:
+        from vllm.v1.engine.multi_model_config import ModelSpec
+
+        names = args.served_model_name or [args.model]
+        if len(names) != 1:
+            raise ValueError("native dense serving requires one primary model name")
+        args.slackserve_models = [
+            ModelSpec(
+                model_id=names[0],
+                model=args.model,
+                kv_cache_memory_bytes=args.kv_cache_memory_bytes,
+                max_model_len=args.max_model_len,
+                max_num_seqs=args.max_num_seqs,
+                max_num_batched_tokens=args.max_num_batched_tokens,
+                gpu_memory_utilization=args.gpu_memory_utilization,
+                revision=args.revision,
+                tokenizer=args.tokenizer,
+                trust_remote_code=args.trust_remote_code,
+                hf_overrides=args.hf_overrides,
+                dtype=args.dtype,
+                compile_decode=True,
+                compilation={
+                    field.name: getattr(compilation, field.name)
+                    for field in fields(compilation)
+                    if is_init_field(type(compilation), field.name)
+                },
+                prefill_custom_ops=os.environ.get(
+                    "HB_P2_PREFILL_CUSTOM_OPS",
+                    "+rms_norm,+silu_and_mul,+rotary_embedding",
+                ),
+                prefill_reserve_fraction=float(
+                    os.environ.get("HB_P2_PREFILL_KV_WATERMARK", "0.02")
+                ),
+                prefill_sm_target=int(
+                    os.environ.get("HB_PREFILL_SM_COUNT_TARGET", "96")
+                ),
+            ),
+            ModelSpec(
+                model_id=args.slackserve_dense_served_model_name,
+                model=model,
+                runner="pooling",
+                pooling_task=dense_task,
+                kv_cache_memory_bytes=args.slackserve_dense_kv_memory_bytes,
+                max_model_len=args.slackserve_dense_max_model_len,
+                max_num_seqs=args.slackserve_dense_max_num_seqs,
+                max_num_batched_tokens=args.slackserve_dense_max_num_batched_tokens,
+                gpu_memory_utilization=dense_gmu,
+                dtype="bfloat16",
+                trust_remote_code=True,
+                hf_overrides=json.loads(hf_overrides) if hf_overrides else None,
+                compilation={
+                    "mode": 3,
+                    "cudagraph_mode": "NONE",
+                    "max_cudagraph_capture_size": 512,
+                },
+            ),
+        ]
+        args.slackserve_shared_kv = "private"
+        if mask := os.environ.get("HB_SMCTRL_PREFILL_TPCS"):
+            if not mask.startswith("spread:"):
+                raise ValueError("native dense masking requires a spread:TPCS mask")
+            if args.slackserve_smctrl_mask is not None:
+                raise ValueError(
+                    "choose the native mask flag or HB_SMCTRL_PREFILL_TPCS"
+                )
+            args.slackserve_smctrl_mask = f"*:prefill:{mask.split(':', 1)[1]}"
+            args.slackserve_smctrl_lib = os.environ.get("HB_SMCTRL_LIB")
+        return
 
     os.environ.update(
         {

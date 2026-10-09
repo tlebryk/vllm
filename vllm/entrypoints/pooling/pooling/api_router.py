@@ -21,7 +21,11 @@ router = APIRouter()
 
 
 def pooling(request: Request) -> OpenAIServingPooling | None:
-    return request.app.state.serving_pooling
+    return getattr(
+        getattr(request.state, "slackserve_model_state", request.app.state),
+        "serving_pooling",
+        None,
+    )
 
 
 @router.post(
