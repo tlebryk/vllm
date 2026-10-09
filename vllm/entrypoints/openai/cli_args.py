@@ -168,13 +168,19 @@ class BaseFrontendArgs:
     slackserve_kv_admission: Literal["current", "full-output"] = "current"
     """Native footprint admission or full requested-output reservation."""
     slackserve_stream_topology: Literal[
-        "two-stream", "three-stream-ordered", "three-stream-overlap"
+        "single-stream", "two-stream", "three-stream-ordered", "three-stream-overlap"
     ] = "three-stream-overlap"
-    """Shared prefill and configured model decode execution streams."""
+    """Execution streams; single-stream serializes both models' GPU work."""
     slackserve_decode_depth: int = 2
     """Global number of decode tickets, shared across models."""
     slackserve_max_requests: int = 8192
     """Bound on active/queued native requests and live HTTP streams."""
+    slackserve_offline_serial_counts: str | None = None
+    """JSON request counts by model ID for one server-gated model-serial drain.
+
+    Accept both queues immediately; run models in configuration order. The
+    expected counts prevent an initial arrival gap from releasing model B.
+    """
     slackserve_dense_model: str | None = None
     """Auxiliary pooling checkpoint for Slack Serve's shared-dense sidecar.
 

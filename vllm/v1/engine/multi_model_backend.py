@@ -5,6 +5,7 @@ import asyncio
 import logging
 import queue
 import threading
+from collections import deque
 from concurrent.futures import Future
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -75,12 +76,14 @@ class MultiModelBackend:
         decode_depth=2,
         max_requests=8192,
         output_capacity=64,
+        offline_serial_counts=None,
     ):
         if max_requests <= 0 or output_capacity <= decode_depth + 2:
             raise ValueError("invalid ingress/output capacity")
         if admission == "full-output" and mode == "private":
             raise ValueError("full-output admission requires shared KV")
         if topology not in (
+            "single-stream",
             "two-stream",
             "three-stream-ordered",
             "three-stream-overlap",
@@ -90,6 +93,24 @@ class MultiModelBackend:
         self.mode, self.budget, self.admission = mode, budget, admission
         self.topology, self.decode_depth = topology, decode_depth
         self.max_requests = max_requests
+        self.model_order = [s.model_id for s in specs]
+        if offline_serial_counts is not None and (
+            not isinstance(offline_serial_counts, dict)
+            or set(offline_serial_counts) != set(self.model_order)
+            or any(type(n) is not int or n <= 0 for n in offline_serial_counts.values())
+            or sum(offline_serial_counts.values()) > max_requests
+        ):
+            raise ValueError(
+                "offline serial counts must name both models with positive integer "
+                "counts fitting the ingress capacity"
+            )
+        self.offline_serial_counts = (
+            dict(offline_serial_counts) if offline_serial_counts is not None else None
+        )
+        self.serial_index = 0
+        self.serial_received = dict.fromkeys(self.model_order, 0)
+        self.serial_completed = dict.fromkeys(self.model_order, 0)
+        self.parked = {mid: deque() for mid in self.model_order}
         self.loop = asyncio.get_running_loop()
         self.inputs = queue.Queue(maxsize=max_requests)
         self.outputs = {s.model_id: queue.Queue(maxsize=output_capacity) for s in specs}
@@ -105,6 +126,7 @@ class MultiModelBackend:
         self.supported_tasks = {}
         self.manager = None
         self.last_pool_state = None
+        self.execution_stream_ids = None
         self.thread = threading.Thread(
             target=self._run, name="vllm-multi-model-core", daemon=True
         )
@@ -138,9 +160,15 @@ class MultiModelBackend:
                 raise ValueError("duplicate active model/request ID")
             if len(self.active) >= self.max_requests:
                 raise ValueError("multi-model request queue is full; retry later")
+            if (
+                self.offline_serial_counts is not None
+                and self.serial_received[mid] >= self.offline_serial_counts[mid]
+            ):
+                raise ValueError("offline serial request count already reached")
             entry = Submission(mid, request)
             self.inputs.put_nowait(entry)
             self.active[key] = entry
+            self.serial_received[mid] += 1
         self.wakeup.set()
 
     def cancel(self, mid, ids):
@@ -157,6 +185,27 @@ class MultiModelBackend:
         with self.lock:
             if self.active.get(key) is entry:
                 del self.active[key]
+                self.serial_completed[entry.model_id] += 1
+
+    def _advance_serial_gate(self, controller):
+        if self.offline_serial_counts is None:
+            return
+        while self.serial_index < len(self.model_order):
+            mid = self.model_order[self.serial_index]
+            with self.lock:
+                complete = self.serial_completed[mid] == self.offline_serial_counts[mid]
+            # Retire all prior GPU tickets, finished-ID flushes and KV fences
+            # before the next model is allowed to enter its scheduler.
+            if not complete or controller.has_work():
+                break
+            self.parked[mid].clear()
+            with self.lock:
+                self.serial_index += 1
+
+    def _has_dispatchable_parked(self):
+        return self.serial_index < len(self.model_order) and bool(
+            self.parked[self.model_order[self.serial_index]]
+        )
 
     def _process_inputs(self, controller):
         with self.lock:
@@ -168,14 +217,27 @@ class MultiModelBackend:
                 # ID cannot collide with an older abort/ticket still in flight.
             else:
                 self._remove(entry)
+        self._advance_serial_gate(controller)
         changed = bool(cancelled)
         for _ in range(64):
-            try:
-                entry = self.inputs.get_nowait()
-            except queue.Empty:
-                break
+            current = (
+                self.model_order[self.serial_index]
+                if self.offline_serial_counts is not None
+                and self.serial_index < len(self.model_order)
+                else None
+            )
+            if current is not None and self.parked[current]:
+                entry = self.parked[current].popleft()
+            else:
+                try:
+                    entry = self.inputs.get_nowait()
+                except queue.Empty:
+                    break
             if entry.cancelled or self.stop.is_set():
                 self._remove(entry)
+                continue
+            if self.offline_serial_counts is not None and entry.model_id != current:
+                self.parked[entry.model_id].append(entry)
                 continue
             core = self.cores[entry.model_id]
             request, wave = core.preprocess_add_request(entry.request)
@@ -197,10 +259,14 @@ class MultiModelBackend:
             self.outputs[mid].put_nowait(result)
             with self.lock:
                 for output in result.outputs:
-                    if output.finish_reason is not None:
-                        self.active.pop((mid, output.request_id), None)
+                    if (
+                        output.finish_reason is not None
+                        and self.active.pop((mid, output.request_id), None) is not None
+                    ):
+                        self.serial_completed[mid] += 1
                 for rid in result.finished_requests or ():
-                    self.active.pop((mid, rid), None)
+                    if self.active.pop((mid, rid), None) is not None:
+                        self.serial_completed[mid] += 1
             self._notify_outputs(mid)
 
     def _initialize(self):
@@ -245,11 +311,26 @@ class MultiModelBackend:
                 )
             self.cores[spec.model_id] = core
             self.supported_tasks[spec.model_id] = core.get_supported_tasks()
+        endpoints, stream_order = self._bind_execution_streams()
+        torch.cuda.synchronize()
+        return MultiModelController(
+            endpoints,
+            decode_depth=self.decode_depth,
+            kv_admission=self.admission,
+            independent_decode=self.topology.startswith("three-stream"),
+            decode_streams=stream_order,
+            record_steps=False,
+        )
+
+    def _bind_execution_streams(self):
+        import torch
+
+        serial = self.topology == "single-stream"
         prefill = torch.cuda.Stream()
-        shared_decode = torch.cuda.Stream()
+        shared_decode = prefill if serial else torch.cuda.Stream()
         streams = {
             s.model_id: shared_decode
-            if self.topology == "two-stream"
+            if self.topology in ("single-stream", "two-stream")
             else torch.cuda.Stream()
             for s in self.specs
         }
@@ -258,7 +339,7 @@ class MultiModelBackend:
             core = self.cores[spec.model_id]
             wrapped = core.model_executor.driver_worker
             worker = getattr(wrapped, "worker", wrapped)
-            worker.bind_lane_streams(prefill, streams[spec.model_id])
+            worker.bind_lane_streams(prefill, streams[spec.model_id], serial=serial)
             endpoints.append(
                 ModelEndpoint(
                     spec.model_id,
@@ -268,24 +349,20 @@ class MultiModelBackend:
                     self.decode_depth > 1,
                 )
             )
-        torch.cuda.synchronize()
+        self.execution_stream_ids = {
+            "prefill": prefill.cuda_stream,
+            "decode": {mid: stream.cuda_stream for mid, stream in streams.items()},
+        }
         stream_order = (
             None
-            if self.topology == "two-stream"
+            if self.topology in ("single-stream", "two-stream")
             else ModelDecodeStreams(
                 streams,
                 torch.cuda.Event,
                 ordered=self.topology == "three-stream-ordered",
             )
         )
-        return MultiModelController(
-            endpoints,
-            decode_depth=self.decode_depth,
-            kv_admission=self.admission,
-            independent_decode=self.topology != "two-stream",
-            decode_streams=stream_order,
-            record_steps=False,
-        )
+        return endpoints, stream_order
 
     def output_has_headroom(self):
         # A pass can publish old decode tickets, old prefill, and a new
@@ -312,6 +389,8 @@ class MultiModelBackend:
                                 [entry.request.request_id]
                             )
                         self._remove(entry)
+                    for parked in self.parked.values():
+                        parked.clear()
                     # Discard transport on teardown, while retiring GPU tickets.
                     for output_queue in self.outputs.values():
                         while not output_queue.empty():
@@ -330,7 +409,10 @@ class MultiModelBackend:
                     self.last_pool_state = self.manager.snapshot()
                 self.wakeup.wait(
                     0.001
-                    if controller.has_work() or not headroom or not self.inputs.empty()
+                    if controller.has_work()
+                    or not headroom
+                    or not self.inputs.empty()
+                    or self._has_dispatchable_parked()
                     else None
                 )
         except BaseException as exc:
@@ -369,12 +451,29 @@ class MultiModelBackend:
     def snapshot(self):
         with self.lock:
             count = len(self.active)
+            serial = (
+                {
+                    "expected": dict(self.offline_serial_counts),
+                    "received": dict(self.serial_received),
+                    "completed": dict(self.serial_completed),
+                    "current_model": (
+                        self.model_order[self.serial_index]
+                        if self.serial_index < len(self.model_order)
+                        else None
+                    ),
+                    "parked": {mid: len(q) for mid, q in self.parked.items()},
+                }
+                if self.offline_serial_counts is not None
+                else None
+            )
         return {
             "active_requests": count,
             "max_requests": self.max_requests,
             "kv": self.last_pool_state,
             "admission": self.admission,
             "topology": self.topology,
+            "execution_stream_ids": self.execution_stream_ids,
+            "offline_model_serial": serial,
             "failed": self.error is not None,
         }
 

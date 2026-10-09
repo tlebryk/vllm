@@ -82,16 +82,25 @@ class SlackServeGPUWorker(GPUWorker):
         return SlackServeModelRunner(self.vllm_config, self.device)
 
     def bind_lane_streams(
-        self, prefill_stream: torch.cuda.Stream, decode_stream: torch.cuda.Stream
+        self,
+        prefill_stream: torch.cuda.Stream,
+        decode_stream: torch.cuda.Stream,
+        *,
+        serial: bool = False,
     ) -> None:
         """Bind an idle model to the controller's shared execution lanes.
 
         Call after initialization/capture and before admitting requests. Captured
         graphs keep this runner's addresses; replay uses the supplied stream.
+        Explicit serial mode uses one stream for both phases while preserving
+        separate input contexts and asynchronous output copies.
         """
         if prefill_stream.device != self.device or decode_stream.device != self.device:
             raise ValueError("shared lane streams must use the worker's device")
-        if prefill_stream.cuda_stream == decode_stream.cuda_stream:
+        same_stream = prefill_stream.cuda_stream == decode_stream.cuda_stream
+        if serial and not same_stream:
+            raise ValueError("serial lanes must use the same execution stream")
+        if same_stream and not serial:
             raise ValueError("prefill and decode require different streams")
         if any(
             context.execute_model_state is not None

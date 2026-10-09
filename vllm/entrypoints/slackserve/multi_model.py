@@ -48,6 +48,11 @@ async def build_multi_model_clients(args):
         topology=args.slackserve_stream_topology,
         decode_depth=args.slackserve_decode_depth,
         max_requests=args.slackserve_max_requests,
+        offline_serial_counts=(
+            json.loads(args.slackserve_offline_serial_counts)
+            if args.slackserve_offline_serial_counts is not None
+            else None
+        ),
     )
     clients = {}
     try:
@@ -190,6 +195,29 @@ class MultiModelRoutingMiddleware:
                 if payload.get("n", 1) > 16:
                     return await self._error(
                         scope, receive, send, "n must not exceed 16"
+                    )
+                if (
+                    getattr(
+                        getattr(state, "engine_client", None),
+                        "multi_model_backend",
+                        None,
+                    )
+                    is not None
+                    and state.engine_client.multi_model_backend.offline_serial_counts
+                    is not None
+                    and (
+                        count != 1
+                        or path == "/v1/completions"
+                        and isinstance(payload.get("prompt"), list)
+                        and any(type(p) is not int for p in payload["prompt"])
+                    )
+                ):
+                    return await self._error(
+                        scope,
+                        receive,
+                        send,
+                        "offline model-serial counts require one prompt and n=1 "
+                        "per HTTP request",
                     )
             scope.setdefault("state", {})["slackserve_model_state"] = states[mid]
             replayed = False
