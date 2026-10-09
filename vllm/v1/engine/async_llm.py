@@ -6,7 +6,7 @@ import socket
 import time
 import warnings
 from collections.abc import AsyncGenerator, Iterable, Mapping
-from copy import copy
+from copy import copy, deepcopy
 from typing import Any
 
 import torch
@@ -86,6 +86,7 @@ class AsyncLLM(EngineClient):
         client_addresses: dict[str, str] | None = None,
         client_count: int = 1,
         client_index: int = 0,
+        engine_core_client: EngineCoreClient | None = None,
     ) -> None:
         """
         Create an AsyncLLM.
@@ -133,6 +134,10 @@ class AsyncLLM(EngineClient):
             )
 
         self.renderer = renderer = renderer_from_config(self.vllm_config)
+        if engine_core_client is not None and renderer.tokenizer is not None:
+            # Cached HF tokenizers share a mutable Rust backend. Independent
+            # model microbatch tokenizers can encode on different CPU threads.
+            renderer.tokenizer = deepcopy(renderer.tokenizer)
         self.io_processor = get_io_processor(
             self.vllm_config,
             self.renderer,
@@ -151,7 +156,7 @@ class AsyncLLM(EngineClient):
         )
 
         # EngineCore (starts the engine in background process).
-        self.engine_core = EngineCoreClient.make_async_mp_client(
+        self.engine_core = engine_core_client or EngineCoreClient.make_async_mp_client(
             vllm_config=vllm_config,
             executor_class=executor_class,
             log_stats=self.log_stats,
@@ -392,14 +397,23 @@ class AsyncLLM(EngineClient):
 
         # Fan out child requests (for n>1).
         parent_request = ParentRequest(request)
-        for idx in range(parent_params.n):
-            request_id, child_params = parent_request.get_child_info(idx)
-            child_request = request if idx == parent_params.n - 1 else copy(request)
-            child_request.request_id = request_id
-            child_request.sampling_params = child_params
-            await self._add_request(
-                child_request, prompt_text, parent_request, idx, queue
+        try:
+            for idx in range(parent_params.n):
+                request_id, child_params = parent_request.get_child_info(idx)
+                child_request = request if idx == parent_params.n - 1 else copy(request)
+                child_request.request_id = request_id
+                child_request.sampling_params = child_params
+                await self._add_request(
+                    child_request, prompt_text, parent_request, idx, queue
+                )
+        except BaseException:
+            # Admission/cancellation can fail partway through a fanout.
+            # Earlier children must not continue without a returned collector.
+            children = self.output_processor.abort_requests(
+                [parent_request.request_id], internal=True
             )
+            await self.engine_core.abort_requests_async(children)
+            raise
         return queue
 
     async def _add_request(
@@ -414,7 +428,11 @@ class AsyncLLM(EngineClient):
         self.output_processor.add_request(request, prompt, parent_req, index, queue)
 
         # Add the EngineCoreRequest to EngineCore (separate process).
-        await self.engine_core.add_request_async(request)
+        try:
+            await self.engine_core.add_request_async(request)
+        except BaseException:
+            self.output_processor.abort_requests([request.request_id], internal=True)
+            raise
 
         if self.log_requests:
             logger.info("Added request %s.", request.request_id)
@@ -1024,7 +1042,7 @@ class AsyncLLM(EngineClient):
 
     @property
     def errored(self) -> bool:
-        return self.engine_core.resources.engine_dead or not self.is_running
+        return self.engine_core.engine_dead or not self.is_running
 
     @property
     def dead_error(self) -> BaseException:

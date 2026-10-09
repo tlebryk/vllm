@@ -19,7 +19,11 @@ router = APIRouter()
 
 
 def render(request: Request) -> OpenAIServingRender | None:
-    return getattr(request.app.state, "openai_serving_render", None)
+    return getattr(
+        getattr(request.state, "slackserve_model_state", request.app.state),
+        "openai_serving_render",
+        None,
+    )
 
 
 @router.post(

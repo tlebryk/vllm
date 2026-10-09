@@ -159,6 +159,22 @@ class BaseFrontendArgs:
     If set to True, only enable the Tokens In<>Out endpoint. 
     This is intended for use in a Disaggregated Everything setup.
     """
+    slackserve_models: str | None = None
+    """JSON configuration for two native generating models sharing one GPU."""
+    slackserve_shared_kv: Literal["private", "head", "layer"] = "layer"
+    """KV capacity layout for the native dual-model backend."""
+    slackserve_kv_memory_bytes: int | None = None
+    """Total shared KV bytes; defaults to the sum of model budgets."""
+    slackserve_kv_admission: Literal["current", "full-output"] = "current"
+    """Native footprint admission or full requested-output reservation."""
+    slackserve_stream_topology: Literal[
+        "two-stream", "three-stream-ordered", "three-stream-overlap"
+    ] = "three-stream-overlap"
+    """Shared prefill and configured model decode execution streams."""
+    slackserve_decode_depth: int = 2
+    """Global number of decode tickets, shared across models."""
+    slackserve_max_requests: int = 8192
+    """Bound on active/queued native requests and live HTTP streams."""
     slackserve_dense_model: str | None = None
     """Auxiliary pooling checkpoint for Slack Serve's shared-dense sidecar.
 

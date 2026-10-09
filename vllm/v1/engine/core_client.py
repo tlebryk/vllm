@@ -127,6 +127,11 @@ class EngineCoreClient(ABC):
             return DPLBAsyncMPClient(*client_args)
         return AsyncMPClient(*client_args)
 
+    @property
+    def engine_dead(self) -> bool:
+        """Client health, independent of a particular transport implementation."""
+        return self.resources.engine_dead
+
     @abstractmethod
     def shutdown(self, timeout: float | None = None) -> None: ...
 

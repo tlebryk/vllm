@@ -29,7 +29,9 @@ logger = init_logger(__name__)
 
 
 def tokenization(request: Request) -> OpenAIServingTokenization:
-    return request.app.state.openai_serving_tokenization
+    return getattr(
+        request.state, "slackserve_model_state", request.app.state
+    ).openai_serving_tokenization
 
 
 router = APIRouter()

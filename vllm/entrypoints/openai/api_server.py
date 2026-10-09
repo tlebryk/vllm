@@ -87,6 +87,12 @@ async def build_async_engine_client(
     disable_frontend_multiprocessing: bool | None = None,
     client_config: dict[str, Any] | None = None,
 ) -> AsyncIterator[EngineClient]:
+    if getattr(args, "slackserve_models", None):
+        from vllm.entrypoints.slackserve.multi_model import build_multi_model_clients
+
+        async with build_multi_model_clients(args) as engine:
+            yield engine
+        return
     configure_dense_sidecar(args)
     if os.getenv("VLLM_WORKER_MULTIPROC_METHOD") == "forkserver":
         # The executor is expected to be mp.
@@ -191,6 +197,12 @@ def build_app(
     else:
         app = FastAPI(lifespan=lifespan)
     app.state.args = args
+    if getattr(args, "slackserve_models", None):
+        from vllm.entrypoints.slackserve.multi_model import MultiModelRoutingMiddleware
+
+        app.add_middleware(
+            MultiModelRoutingMiddleware, max_requests=args.slackserve_max_requests
+        )
 
     from vllm.entrypoints.serve import register_vllm_serve_api_routers
 
@@ -336,7 +348,33 @@ async def init_app_state(
     state: State,
     args: Namespace,
     supported_tasks: tuple["SupportedTask", ...] | None = None,
+    *,
+    _single_model: bool = False,
 ) -> None:
+    if hasattr(engine_client, "model_clients") and not _single_model:
+        from copy import copy
+
+        states = {}
+        for spec in engine_client.multi_model_specs:
+            model_args = copy(args)
+            model_args.model = spec.model
+            model_args.served_model_name = [spec.model_id]
+            model_state = state if not states else State()
+            await init_app_state(
+                engine_client.model_clients[spec.model_id],
+                model_state,
+                model_args,
+                supported_tasks,
+                _single_model=True,
+            )
+            states[spec.model_id] = model_state
+        state.multi_model_states = states
+        state.additional_model_cards = []
+        for model_state in list(states.values())[1:]:
+            cards = await model_state.openai_serving_models.show_available_models()
+            state.additional_model_cards.extend(cards.data)
+        state.args = args
+        return
     vllm_config = engine_client.vllm_config
     if supported_tasks is None:
         warnings.warn(
