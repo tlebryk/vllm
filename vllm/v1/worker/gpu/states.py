@@ -3,7 +3,11 @@
 import numpy as np
 import torch
 
-from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor, UvaBackedTensor
+from vllm.v1.worker.gpu.buffer_utils import (
+    StagedWriteTensor,
+    UvaBackedTensor,
+    UvaFenceRegistry,
+)
 
 
 class RequestState:
@@ -17,7 +21,10 @@ class RequestState:
         device: torch.device,
         model_dtype: torch.dtype,
         cache_draft_logits: bool,
+        *,
+        fence_registry: UvaFenceRegistry | None = None,
     ):
+        self.fence_registry = fence_registry
         self.max_num_reqs = max_num_reqs
         self.max_model_len = max_model_len
         self.max_num_batched_tokens = max_num_batched_tokens
@@ -37,6 +44,7 @@ class RequestState:
             dtype=torch.int32,
             device=device,
             uva_instead_of_gpu=True,
+            fence_registry=fence_registry,
         )
         # NOTE(woosuk): Distinguish clearly between prompt_len and prefill_len:
         # - prompt_len: Number of tokens in the user-provided prompt.
@@ -47,17 +55,27 @@ class RequestState:
         # preemption, prefill_len may be greater. Differentiating between these values
         # is crucial, as certain features such as prompt logprobs or frequency penalties
         # must treat prompt and output tokens separately.
-        self.prompt_len = UvaBackedTensor(self.max_num_reqs, dtype=torch.int32)
-        self.prefill_len = UvaBackedTensor(self.max_num_reqs, dtype=torch.int32)
+        self.prompt_len = UvaBackedTensor(
+            self.max_num_reqs, dtype=torch.int32, fence_registry=fence_registry
+        )
+        self.prefill_len = UvaBackedTensor(
+            self.max_num_reqs, dtype=torch.int32, fence_registry=fence_registry
+        )
         # total_len = prompt_len + output_len. It grows as the request progresses.
         self.total_len = StagedWriteTensor(
-            self.max_num_reqs, dtype=torch.int32, device=device
+            self.max_num_reqs,
+            dtype=torch.int32,
+            device=device,
+            fence_registry=fence_registry,
         )
 
         # Number of computed tokens.
         self.num_computed_prefill_tokens = np.zeros(self.max_num_reqs, dtype=np.int32)
         self.num_computed_tokens = StagedWriteTensor(
-            self.max_num_reqs, dtype=torch.int32, device=device
+            self.max_num_reqs,
+            dtype=torch.int32,
+            device=device,
+            fence_registry=fence_registry,
         )
 
         # Last sampled tokens.

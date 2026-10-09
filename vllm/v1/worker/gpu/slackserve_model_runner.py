@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 
@@ -22,7 +21,6 @@ from vllm.v1.worker.gpu.block_table import (
     _compute_slot_mappings_kernel,
     _gather_block_tables_kernel,
 )
-from vllm.v1.worker.gpu.buffer_utils import fence_uva_pools
 from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
     get_uniform_token_count,
@@ -36,11 +34,13 @@ from vllm.v1.worker.gpu.model_runner import (
     pp_broadcast,
     pp_receive,
 )
+from vllm.v1.worker.slackserve_config import SlackServeConfig
 
 
 class SlackServeModelRunner(GPUModelRunner):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
+        self.slackserve_config = SlackServeConfig.from_vllm_config(vllm_config)
         unsupported = (
             self.lora_config is not None
             or self.speculative_config is not None
@@ -73,8 +73,9 @@ class SlackServeModelRunner(GPUModelRunner):
         # and their captured buffers have nothing to do with inductor's runtime
         # buffers. Same safety argument, mirrored: exactly one live user of the
         # compiled callable (prefill), no cross-lane buffer sharing.
-        self._compile_decode = os.environ.get("HB_P2_COMPILE_DECODE") == "1"
-        self._compile_prefill = os.environ.get("HB_P2_COMPILE_PREFILL") == "1"
+        self._compile_decode = self.slackserve_config.compile_decode
+        self._compile_prefill = self.slackserve_config.compile_prefill
+        self.decode_graphs_only = self.slackserve_config.decode_graphs_only
         if self._compile_decode and self._compile_prefill:
             raise ValueError(
                 "HB_P2_COMPILE_DECODE and HB_P2_COMPILE_PREFILL are mutually "
@@ -82,7 +83,7 @@ class SlackServeModelRunner(GPUModelRunner):
             )
         self._compile_any = self._compile_decode or self._compile_prefill
         if (
-            os.environ.get("HB_P2_DECODE_GRAPHS_ONLY") == "1"
+            self.decode_graphs_only
             and self.compilation_config.mode != CompilationMode.NONE
             and not self._compile_any
         ):
@@ -99,7 +100,7 @@ class SlackServeModelRunner(GPUModelRunner):
                 if self._compile_decode
                 else ("HB_P2_COMPILE_PREFILL")
             )
-            if os.environ.get("HB_P2_DECODE_GRAPHS_ONLY") != "1":
+            if not self.decode_graphs_only:
                 raise ValueError(
                     f"{which}=1 requires HB_P2_DECODE_GRAPHS_ONLY=1: the "
                     "non-compiled lane must be pinned to eager so it cannot "
@@ -116,13 +117,11 @@ class SlackServeModelRunner(GPUModelRunner):
         # buffers: CUDA graphs are captured against those exact addresses.
         # Prefill gets separate scratch and always runs eager when
         # HB_P2_DECODE_GRAPHS_ONLY=1.
-        from vllm.v1.worker.slackserve_gpu_worker import prefill_lane_names
-
         # Per-lane FlashAttention-3 tile-scheduler SM margin (SMs left free).
         # Default 0 preserves today's behavior bit-identically.
         self.fa_sm_margin = {
-            "decode": int(os.environ.get("HB_P2_FA_SM_MARGIN_DECODE", "0") or "0"),
-            "prefill": int(os.environ.get("HB_P2_FA_SM_MARGIN_PREFILL", "0") or "0"),
+            "decode": self.slackserve_config.fa_sm_margin_decode,
+            "prefill": self.slackserve_config.fa_sm_margin_prefill,
         }
         # HB_P2_PREP_STREAM=1: enqueue ticket-head staging scatters and input
         # preparation on a dedicated PER-LANE prep stream, and make the
@@ -135,19 +134,14 @@ class SlackServeModelRunner(GPUModelRunner):
         # as soon as host refs drop, and a shared prep stream would let one
         # lane's next prep reuse memory another lane's forward is still
         # reading. One in-flight ticket per lane makes same-lane reuse safe.
-        self.use_prep_streams = os.environ.get("HB_P2_PREP_STREAM") == "1"
+        self.use_prep_streams = self.slackserve_config.prep_streams
         self.prep_streams: dict[str, torch.cuda.Stream] = {}
         # The controller may keep multiple decode tickets
         # in flight (see EngineCore.step_two_lane). All host prep is enqueued
         # from the engine thread in dispatch order, so lane-context reuse
         # stays serialized; the only per-ticket resource is the output
         # copy_event (fresh per decode sample below).
-        raw_depth = os.environ.get("HB_P2_ASYNC_DECODE_DEPTH")
-        async_decode_depth = (
-            int(raw_depth)
-            if raw_depth is not None
-            else (2 if os.environ.get("HB_P2_ASYNC_DECODE") == "1" else 1)
-        )
+        async_decode_depth = self.slackserve_config.async_decode_depth
         if not 1 <= async_decode_depth <= 4:
             raise ValueError(
                 "HB_P2_ASYNC_DECODE_DEPTH must be between 1 and 4; "
@@ -169,7 +163,7 @@ class SlackServeModelRunner(GPUModelRunner):
         # adds a second). Output D2H copies must not share a stream/event
         # across lanes: two in-flight tickets would re-record one event and
         # race their copies. The same holds for input preparation buffers.
-        for lane in prefill_lane_names():
+        for lane in self.slackserve_config.prefill_lane_names():
             self.contexts[lane] = LaneContext(
                 input_buffers=InputBuffers(
                     max_num_reqs=self.max_num_reqs,
@@ -207,7 +201,7 @@ class SlackServeModelRunner(GPUModelRunner):
         custom_ops none globally blows up prefill (TTFT +192ms, decode stalls
         p99 150-170ms during prefill chunks).
         """
-        spec = os.environ.get("HB_P2_PREFILL_CUSTOM_OPS", "")
+        spec = self.slackserve_config.prefill_custom_ops
         if not spec:
             return
         names = {s.strip().lstrip("+") for s in spec.split(",") if s.strip()}
@@ -271,7 +265,7 @@ class SlackServeModelRunner(GPUModelRunner):
         """Return to the lane's execution stream, ordered after this prep."""
         # Every kernel consuming this ticket's staged UVA buffers is enqueued
         # on the current stream by now; guard the pools' round-robin reuse.
-        fence_uva_pools(torch.cuda.current_stream(self.device))
+        self.uva_fence_registry.fence(torch.cuda.current_stream(self.device))
         if exec_stream is None:
             return
         assert context.prep_event is not None
@@ -299,10 +293,7 @@ class SlackServeModelRunner(GPUModelRunner):
         already reading it. Temporarily disabling the builder's full-graph
         path makes prefill use its own ordinary metadata allocation.
         """
-        if not (
-            lane.startswith("prefill")
-            and os.environ.get("HB_P2_DECODE_GRAPHS_ONLY") == "1"
-        ):
+        if not (lane.startswith("prefill") and self.decode_graphs_only):
             yield
             return
 
@@ -324,6 +315,25 @@ class SlackServeModelRunner(GPUModelRunner):
 
     @torch.inference_mode()
     def execute_model(
+        self,
+        scheduler_output: SchedulerOutput,
+        intermediate_tensors: IntermediateTensors | None = None,
+        dummy_run: bool = False,
+        skip_attn_for_dummy_run: bool = False,
+    ) -> ModelRunnerOutput | IntermediateTensors | None:
+        from vllm.v1.worker.embed_sm_linear_hook import model_sm_phase
+
+        with model_sm_phase(
+            self.model, scheduler_output.execution_lane.startswith("prefill")
+        ):
+            return self._execute_model(
+                scheduler_output,
+                intermediate_tensors,
+                dummy_run,
+                skip_attn_for_dummy_run,
+            )
+
+    def _execute_model(
         self,
         scheduler_output: SchedulerOutput,
         intermediate_tensors: IntermediateTensors | None = None,
@@ -381,10 +391,7 @@ class SlackServeModelRunner(GPUModelRunner):
         num_tokens_across_dp = None
 
         skip_compiled = False
-        if (
-            lane.startswith("prefill")
-            and os.environ.get("HB_P2_DECODE_GRAPHS_ONLY") == "1"
-        ):
+        if lane.startswith("prefill") and self.decode_graphs_only:
             # A captured graph owns fixed input/attention/output addresses.
             # Replaying that one graph concurrently from both lanes races
             # those buffers and causes illegal memory accesses. Keep the
@@ -696,6 +703,7 @@ class SlackServeModelRunner(GPUModelRunner):
         copy_event = context.copy_event or self.output_copy_event
         if lane == "decode" and self._hb_async_decode:
             copy_event = torch.cuda.Event()
+        ticket_tail_event = torch.cuda.Event()
         async_output = AsyncOutput(
             model_runner_output=model_runner_output,
             sampler_output=sampler_output,
@@ -703,6 +711,7 @@ class SlackServeModelRunner(GPUModelRunner):
             main_stream=context.main_stream or self.main_stream,
             copy_stream=context.copy_stream or self.output_copy_stream,
             copy_event=copy_event,
+            completion_event=ticket_tail_event,
         )
 
         # Postprocess results and update request states.
@@ -738,6 +747,7 @@ class SlackServeModelRunner(GPUModelRunner):
         # re-recording it here makes controller queries cover the full ticket.
         assert context.completion_event is not None
         context.completion_event.record(torch.cuda.current_stream(self.device))
+        ticket_tail_event.record(torch.cuda.current_stream(self.device))
 
         if return_async or self.use_async_scheduling:
             return async_output

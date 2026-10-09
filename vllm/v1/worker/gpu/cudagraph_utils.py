@@ -15,7 +15,6 @@ from vllm.distributed.parallel_state import graph_capture, is_global_first_rank
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.offloader.base import get_offloader
-from vllm.platforms import current_platform
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
@@ -90,7 +89,9 @@ class CudaGraphManager:
         self.dp_size = vllm_config.parallel_config.data_parallel_size
 
         self.graphs: dict[BatchExecutionDescriptor, torch.cuda.CUDAGraph] = {}
-        self.pool = current_platform.get_global_graph_pool() if cudagraph_mode else None
+        self.pool = (
+            self.compilation_config.get_cudagraph_pool() if cudagraph_mode else None
+        )
 
         self._graphs_captured = False
         self._candidates: list[list[BatchExecutionDescriptor]] = []

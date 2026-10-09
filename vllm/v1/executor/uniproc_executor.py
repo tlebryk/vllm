@@ -61,6 +61,12 @@ class UniProcExecutor(Executor):
 
     @cached_property
     def max_concurrent_batches(self) -> int:
+        additional = self.vllm_config.additional_config
+        if isinstance(additional, dict) and "slackserve" in additional:
+            from vllm.v1.worker.slackserve_config import SlackServeConfig
+
+            lanes = SlackServeConfig.from_vllm_config(self.vllm_config)
+            return lanes.prefill_lanes + lanes.async_decode_depth
         # Slack Serve has one in-flight batch per lane even though it keeps
         # vLLM's ordinary scheduler synchronous. Each lane needs its own
         # output waiter so a long prefill copy cannot head-of-line block a

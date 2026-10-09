@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import threading
 from collections.abc import Iterable, Sequence
 from functools import partial
 
@@ -14,39 +13,32 @@ from vllm.utils.torch_utils import (
     get_accelerator_view_from_cpu_tensor,
 )
 
+
 # UVA staging buffers are recycled round-robin; without a guard, a host
 # rewrite can race GPU kernels still reading the buffer from an earlier
 # use. Slack Serve's multi-lane controller stretches the enqueue-to-
 # execution window enough to hit this. A caller that has enqueued every
-# consumer of the staged buffers calls fence_uva_pools() once; each pool
+# consumer of the staged buffers calls its runner's registry.fence() once; each pool
 # written since the previous fence then records a per-buffer event on the
 # consuming stream, and the pool host-synchronizes that event before the
 # buffer is rewritten. Code that never fences (the ordinary single-lane
 # runner) behaves exactly as before.
-_dirty_pools: list["UvaBufferPool"] = []
+class UvaFenceRegistry:
+    """Pending UVA writes owned by one runner, never by a process or thread.
 
-# Threads that never participate in fencing (e.g. the Slack Serve embed
-# sidecar's drain thread, whose engine's pools would otherwise be fenced by
-# the LLM runner on the wrong thread/stream — a cross-engine iterate/mutate
-# race) opt out of registration entirely: their pools then behave exactly
-# like the ordinary unfenced single-lane runner.
-_fencing_optout = threading.local()
+    The runner must serialize staging/fencing and fence after the consuming
+    kernels have been enqueued on the supplied stream. Ownership isolation
+    does not replace ordering between that runner's execution lanes.
+    """
 
+    def __init__(self) -> None:
+        self._dirty_pools: list[UvaBufferPool] = []
 
-def set_uva_fencing_enabled(enabled: bool) -> None:
-    _fencing_optout.disabled = not enabled
-
-
-def _uva_fencing_enabled() -> bool:
-    return not getattr(_fencing_optout, "disabled", False)
-
-
-def fence_uva_pools(stream: torch.cuda.Stream | None = None) -> None:
-    """Mark staged UVA buffers as consumed by kernels on ``stream``."""
-    global _dirty_pools
-    pools, _dirty_pools = _dirty_pools, []
-    for pool in pools:
-        pool._record_pending(stream)
+    def fence(self, stream: torch.cuda.Stream | None = None) -> None:
+        """Record consumption of only this runner's pending buffers."""
+        pools, self._dirty_pools = self._dirty_pools, []
+        for pool in pools:
+            pool._record_pending(stream)
 
 
 def async_copy_to_gpu(
@@ -83,16 +75,19 @@ class UvaBufferPool:
         size: int | Sequence[int],
         dtype: torch.dtype,
         max_concurrency: int = 2,
+        *,
+        fence_registry: UvaFenceRegistry | None = None,
     ):
         self.size = size
         self.dtype = dtype
         self.max_concurrency = max_concurrency
+        self.fence_registry = fence_registry
 
         # UVA buffers for concurrency
         self._uva_bufs = [UvaBuffer(size, dtype) for _ in range(max_concurrency)]
         # Current buffer index
         self._curr = 0
-        # Optional consumption guard (see fence_uva_pools).
+        # Optional consumption guard (see UvaFenceRegistry.fence).
         self._events: list[torch.cuda.Event | None] = [None] * max_concurrency
         self._event_pending = [False] * max_concurrency
         self._dirty: set[int] = set()
@@ -119,9 +114,9 @@ class UvaBufferPool:
             assert event is not None
             event.synchronize()
             self._event_pending[self._curr] = False
-        if _uva_fencing_enabled():
+        if self.fence_registry is not None:
             if not self._dirty:
-                _dirty_pools.append(self)
+                self.fence_registry._dirty_pools.append(self)
             self._dirty.add(self._curr)
         buf = self._uva_bufs[self._curr]
         # CPU-to-CPU copy
@@ -142,7 +137,12 @@ class UvaBufferPool:
 
 class UvaBackedTensor:
     def __init__(
-        self, size: int | Sequence[int], dtype: torch.dtype, max_concurrency: int = 2
+        self,
+        size: int | Sequence[int],
+        dtype: torch.dtype,
+        max_concurrency: int = 2,
+        *,
+        fence_registry: UvaFenceRegistry | None = None,
     ):
         self.dtype = dtype
 
@@ -151,7 +151,9 @@ class UvaBackedTensor:
         self.np = self.cpu.numpy()
 
         # Buffers for concurrency
-        self.pool = UvaBufferPool(size, dtype, max_concurrency)
+        self.pool = UvaBufferPool(
+            size, dtype, max_concurrency, fence_registry=fence_registry
+        )
         self.gpu = self.pool.copy_to_uva(self.np)
 
     def copy_to_uva(self, n: int | None = None) -> torch.Tensor:
@@ -168,6 +170,8 @@ class StagedWriteTensor:
         device: torch.device,
         max_concurrency: int = 2,
         uva_instead_of_gpu: bool = False,
+        *,
+        fence_registry: UvaFenceRegistry | None = None,
     ):
         supported_dtypes = [torch.int32, torch.int64, torch.float32]
         if dtype not in supported_dtypes:
@@ -193,7 +197,11 @@ class StagedWriteTensor:
         self._staged_write_contents: list[int | float] = []
         self._staged_write_cu_lens: list[int] = []
 
-        new_buffer = partial(UvaBufferPool, max_concurrency=max_concurrency)
+        new_buffer = partial(
+            UvaBufferPool,
+            max_concurrency=max_concurrency,
+            fence_registry=fence_registry,
+        )
 
         self.write_indices = new_buffer(self.num_rows, dtype=torch.int32)
         self.write_starts = new_buffer(self.num_rows, dtype=torch.int32)

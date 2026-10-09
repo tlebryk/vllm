@@ -23,15 +23,21 @@ class BadWordsState:
             (self.max_num_reqs, MAX_BAD_WORDS_TOTAL_TOKENS),
             dtype=torch.int32,
             device=self.device,
+            fence_registry=req_states.fence_registry,
         )
         # cumulative offsets of bad words: [max_num_reqs, MAX_NUM_BAD_WORDS + 1]
         self.bad_word_offsets = StagedWriteTensor(
             (self.max_num_reqs, MAX_NUM_BAD_WORDS + 1),
             dtype=torch.int32,
             device=self.device,
+            fence_registry=req_states.fence_registry,
         )
         # number of bad words per request
-        self.num_bad_words = UvaBackedTensor(self.max_num_reqs, dtype=torch.int32)
+        self.num_bad_words = UvaBackedTensor(
+            self.max_num_reqs,
+            dtype=torch.int32,
+            fence_registry=req_states.fence_registry,
+        )
 
     def add_request(self, req_idx: int, sampling_params: SamplingParams) -> None:
         bad_words_token_ids = sampling_params.bad_words_token_ids

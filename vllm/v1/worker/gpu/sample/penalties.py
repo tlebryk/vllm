@@ -19,9 +19,15 @@ class PenaltiesState:
         self.vocab_size = req_states.vocab_size
         self.device = req_states.device
 
-        self.repetition_penalty = UvaBackedTensor(max_num_reqs, dtype=torch.float32)
-        self.frequency_penalty = UvaBackedTensor(max_num_reqs, dtype=torch.float32)
-        self.presence_penalty = UvaBackedTensor(max_num_reqs, dtype=torch.float32)
+        self.repetition_penalty = UvaBackedTensor(
+            max_num_reqs, dtype=torch.float32, fence_registry=req_states.fence_registry
+        )
+        self.frequency_penalty = UvaBackedTensor(
+            max_num_reqs, dtype=torch.float32, fence_registry=req_states.fence_registry
+        )
+        self.presence_penalty = UvaBackedTensor(
+            max_num_reqs, dtype=torch.float32, fence_registry=req_states.fence_registry
+        )
         self.use_penalty = np.zeros(max_num_reqs, dtype=bool)
 
         # Initialize repetition penalty manually because 0 is an invalid value for it.

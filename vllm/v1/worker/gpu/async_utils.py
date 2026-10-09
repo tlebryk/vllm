@@ -18,6 +18,7 @@ class AsyncOutput(AsyncModelRunnerOutput):
         main_stream: torch.cuda.Stream,
         copy_stream: torch.cuda.Stream,
         copy_event: torch.cuda.Event,
+        completion_event: torch.cuda.Event | None = None,
     ):
         # NOTE(woosuk): We must retain references to the GPU tensors,
         # as the copy operations are performed on a different CUDA stream than
@@ -26,6 +27,9 @@ class AsyncOutput(AsyncModelRunnerOutput):
         self.sampler_output = sampler_output
         self.num_sampled_tokens = num_sampled_tokens
         self.copy_event = copy_event
+        # A fresh SlackServe event covers postprocess as well as the forward.
+        # Decode launch-ahead must never re-record an older ticket's event.
+        self.completion_event = completion_event
 
         with stream(copy_stream, main_stream):
             copy_stream.wait_stream(main_stream)
@@ -47,6 +51,8 @@ class AsyncOutput(AsyncModelRunnerOutput):
             self.copy_event.record(copy_stream)
 
     def get_output(self) -> ModelRunnerOutput:
+        if self.completion_event is not None:
+            self.completion_event.synchronize()
         self.copy_event.synchronize()
 
         # NOTE(woosuk): The following code is to ensure compatibility with

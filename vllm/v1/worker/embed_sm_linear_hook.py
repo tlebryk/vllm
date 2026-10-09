@@ -18,6 +18,7 @@ ordinary path.
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
 
 import torch
 
@@ -84,7 +85,29 @@ def _embed_sm_capped_linear_fake(
     return x2.new_empty((x2.shape[0], w.shape[0]))
 
 
-def register_embed_model(model: torch.nn.Module) -> None:
+@torch.library.custom_op("hb::model_sm_capped_linear", mutates_args=())
+def _model_sm_capped_linear(
+    x2: torch.Tensor, w: torch.Tensor, sm_target: int
+) -> torch.Tensor:
+    """Per-model target, independent of the legacy runtime override."""
+    out = torch.empty((x2.shape[0], w.shape[0]), dtype=x2.dtype, device=x2.device)
+    _load_lt().linear(x2, w, out, sm_target)
+    return out
+
+
+@_model_sm_capped_linear.register_fake
+def _model_sm_capped_linear_fake(
+    x2: torch.Tensor, w: torch.Tensor, sm_target: int
+) -> torch.Tensor:
+    return x2.new_empty((x2.shape[0], w.shape[0]))
+
+
+def register_embed_model(
+    model: torch.nn.Module,
+    *,
+    sm_target: int | None = None,
+    min_m: int | None = None,
+) -> None:
     """Mark the embed model's linear modules and install the patch.
 
     Module-attribute gating (not stream gating): under CUDA-graph capture the
@@ -96,13 +119,28 @@ def register_embed_model(model: torch.nn.Module) -> None:
     ``HB_PREFILL_SM_COUNT_TARGET > 0``.
     """
     global _SM_TARGET, _MIN_M, _PATCHED
-    target = int(
-        os.environ.get("HB_EMBED_SM_COUNT_TARGET")
-        or os.environ.get("HB_PREFILL_SM_COUNT_TARGET")
-        or "0"
+    explicit = sm_target is not None
+    target = (
+        sm_target
+        if explicit
+        else int(
+            os.environ.get("HB_EMBED_SM_COUNT_TARGET")
+            or os.environ.get("HB_PREFILL_SM_COUNT_TARGET")
+            or "0"
+        )
     )
     if target <= 0:
         return
+    minimum_m = (
+        min_m
+        if min_m is not None
+        else int(os.environ.get("HB_EMBED_SM_TARGET_MIN_M", "256") or "256")
+    )
+    if minimum_m < 1:
+        raise ValueError("SM target minimum M must be positive")
+    state = {"target": target, "min_m": minimum_m, "prefill_active": False}
+    if explicit:
+        model._hb_model_sm_state = state
     n_marked = 0
     for mod in model.modules():
         w = getattr(mod, "weight", None)
@@ -110,9 +148,12 @@ def register_embed_model(model: torch.nn.Module) -> None:
             # Plain module attribute: dynamo treats it as a guard/constant
             # (a data_ptr() check would raise on FakeTensor during tracing).
             mod._hb_embed_sm_capped = True
+            if explicit:
+                mod._hb_model_sm_state = state
             n_marked += 1
-    _SM_TARGET = target
-    _MIN_M = int(os.environ.get("HB_EMBED_SM_TARGET_MIN_M", "256") or "256")
+    if not explicit:
+        _SM_TARGET = target
+        _MIN_M = minimum_m
     if not _PATCHED:
         _install_patch()
         _PATCHED = True
@@ -120,16 +161,38 @@ def register_embed_model(model: torch.nn.Module) -> None:
         "[embed-sm-linear] marked %d embed linear modules, "
         "SM_COUNT_TARGET=%d, min_M=%d",
         n_marked,
-        _SM_TARGET,
-        _MIN_M,
+        target,
+        minimum_m,
     )
+
+
+@contextmanager
+def model_sm_phase(model: torch.nn.Module, prefill: bool):
+    """Select only this model's eager prefill GEMMs; decode stays uncapped."""
+    state = getattr(model, "_hb_model_sm_state", None)
+    if state is None:
+        yield
+        return
+    previous = state["prefill_active"]
+    state["prefill_active"] = prefill
+    try:
+        yield
+    finally:
+        state["prefill_active"] = previous
 
 
 def _route(orig_apply, self, layer, x, bias):
     """Route to the SM-capped cuBLASLt linear iff this is a registered dense,
     prefill-shaped (large-M), bias-free, half-precision GEMM."""
+    state = getattr(layer, "_hb_model_sm_state", None)
+    target = (
+        _SM_TARGET
+        if state is None
+        else (state["target"] if state["prefill_active"] else 0)
+    )
+    minimum_m = _MIN_M if state is None else state["min_m"]
     if (
-        _SM_TARGET > 0
+        target > 0
         and bias is None
         and x.is_cuda
         and x.dtype in (torch.bfloat16, torch.float16)
@@ -138,10 +201,15 @@ def _route(orig_apply, self, layer, x, bias):
         w = layer.weight
         if w.dim() == 2 and w.is_contiguous():
             m = x.numel() // x.shape[-1] if x.shape[-1] else 0
-            if m >= _MIN_M:
+            if m >= minimum_m:
                 x2 = x.reshape(m, x.shape[-1])
                 if x2.is_contiguous():
-                    out = torch.ops.hb.embed_sm_capped_linear(x2, w, _SM_TARGET)
+                    op = (
+                        torch.ops.hb.embed_sm_capped_linear
+                        if state is None
+                        else torch.ops.hb.model_sm_capped_linear
+                    )
+                    out = op(x2, w, target)
                     return out.view(*x.shape[:-1], w.shape[0])
     return orig_apply(self, layer, x, bias)
 

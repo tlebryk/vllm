@@ -5,7 +5,11 @@ import torch
 
 from vllm.sampling_params import SamplingParams
 from vllm.triton_utils import tl, triton
-from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor, UvaBackedTensor
+from vllm.v1.worker.gpu.buffer_utils import (
+    StagedWriteTensor,
+    UvaBackedTensor,
+    UvaFenceRegistry,
+)
 
 MAX_NUM_ALLOWED_TOKEN_IDS = 1024
 MAX_NUM_LOGIT_BIAS_TOKENS = 1024
@@ -13,37 +17,55 @@ MAX_NUM_STOP_TOKEN_IDS = 128
 
 
 class LogitBiasState:
-    def __init__(self, max_num_reqs: int, device: torch.device):
+    def __init__(
+        self,
+        max_num_reqs: int,
+        device: torch.device,
+        *,
+        fence_registry: UvaFenceRegistry | None = None,
+    ):
         self.max_num_reqs = max_num_reqs
 
         # Allowed token IDs.
         self.num_allowed_token_ids = UvaBackedTensor(
-            self.max_num_reqs, dtype=torch.int32
+            self.max_num_reqs,
+            dtype=torch.int32,
+            fence_registry=fence_registry,
         )
         self.allowed_token_ids = StagedWriteTensor(
             (self.max_num_reqs, MAX_NUM_ALLOWED_TOKEN_IDS),
             dtype=torch.int32,
             device=device,
+            fence_registry=fence_registry,
         )
         # Logit bias.
-        self.num_logit_bias = UvaBackedTensor(self.max_num_reqs, dtype=torch.int32)
+        self.num_logit_bias = UvaBackedTensor(
+            self.max_num_reqs, dtype=torch.int32, fence_registry=fence_registry
+        )
         self.logit_bias_token_ids = StagedWriteTensor(
             (self.max_num_reqs, MAX_NUM_LOGIT_BIAS_TOKENS),
             dtype=torch.int32,
             device=device,
+            fence_registry=fence_registry,
         )
         self.logit_bias = StagedWriteTensor(
             (self.max_num_reqs, MAX_NUM_LOGIT_BIAS_TOKENS),
             dtype=torch.float32,
             device=device,
+            fence_registry=fence_registry,
         )
         # Min tokens.
-        self.min_lens = UvaBackedTensor(self.max_num_reqs, dtype=torch.int32)
-        self.num_stop_token_ids = UvaBackedTensor(self.max_num_reqs, dtype=torch.int32)
+        self.min_lens = UvaBackedTensor(
+            self.max_num_reqs, dtype=torch.int32, fence_registry=fence_registry
+        )
+        self.num_stop_token_ids = UvaBackedTensor(
+            self.max_num_reqs, dtype=torch.int32, fence_registry=fence_registry
+        )
         self.stop_token_ids = StagedWriteTensor(
             (self.max_num_reqs, MAX_NUM_STOP_TOKEN_IDS),
             dtype=torch.int32,
             device=device,
+            fence_registry=fence_registry,
         )
 
         # Using any of the above.

@@ -34,9 +34,13 @@ class Sampler:
         self.logprobs_mode = logprobs_mode
         self.compute_nans = envs.VLLM_COMPUTE_NANS_IN_LOGITS  # False by default.
 
-        self.sampling_states = SamplingStates(max_num_reqs, vocab_size)
+        self.sampling_states = SamplingStates(
+            max_num_reqs, vocab_size, fence_registry=req_states.fence_registry
+        )
         self.penalties_state = PenaltiesState(req_states)
-        self.logit_bias_state = LogitBiasState(max_num_reqs, device)
+        self.logit_bias_state = LogitBiasState(
+            max_num_reqs, device, fence_registry=req_states.fence_registry
+        )
         self.bad_words_state = BadWordsState(req_states)
         self.num_speculative_tokens = num_speculative_tokens
 

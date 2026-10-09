@@ -137,8 +137,6 @@ class Platform:
 
     additional_env_vars: list[str] = []
 
-    _global_graph_pool: Any | None = None
-
     @property
     def pass_key(self) -> str:
         """Inductor config key for the PassManager custom pass"""
@@ -660,15 +658,6 @@ class Platform:
             key,
         )
         return None
-
-    def get_global_graph_pool(self) -> Any:
-        """
-        Return the global graph pool for this platform.
-        """
-        cls = self.__class__
-        if cls._global_graph_pool is None:
-            cls._global_graph_pool = self.graph_pool_handle()
-        return cls._global_graph_pool
 
     @classmethod
     def get_static_graph_wrapper_cls(cls) -> str:

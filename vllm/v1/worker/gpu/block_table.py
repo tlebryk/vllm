@@ -7,7 +7,11 @@ import torch
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
-from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor, UvaBackedTensor
+from vllm.v1.worker.gpu.buffer_utils import (
+    StagedWriteTensor,
+    UvaBackedTensor,
+    UvaFenceRegistry,
+)
 
 
 class BlockTables:
@@ -21,6 +25,8 @@ class BlockTables:
         cp_size: int = 1,
         cp_rank: int = 0,
         cp_interleave: int = 1,
+        *,
+        fence_registry: UvaFenceRegistry | None = None,
     ):
         self.block_sizes = block_sizes
         self.max_num_reqs = max_num_reqs
@@ -45,6 +51,7 @@ class BlockTables:
                 (self.max_num_reqs, max_num_blocks),
                 dtype=torch.int32,
                 device=device,
+                fence_registry=fence_registry,
             )
             self.block_tables.append(block_table)
         self.block_table_ptrs = self._make_ptr_tensor(
@@ -62,6 +69,7 @@ class BlockTables:
         self.num_blocks = UvaBackedTensor(
             (self.num_kv_cache_groups, self.max_num_reqs),
             dtype=torch.int32,
+            fence_registry=fence_registry,
         )
 
         # Block tables used for model's forward pass.

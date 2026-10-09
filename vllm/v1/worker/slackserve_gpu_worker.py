@@ -14,6 +14,7 @@ import torch
 from vllm.v1.core.sched.output import GrammarOutput
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 from vllm.v1.worker.gpu_worker import Worker as GPUWorker
+from vllm.v1.worker.slackserve_config import SlackServeConfig
 
 
 def prefill_lane_names() -> list[str]:
@@ -25,6 +26,7 @@ def prefill_lane_names() -> list[str]:
 
 class SlackServeGPUWorker(GPUWorker):
     def init_device(self) -> None:
+        self.slackserve_config = SlackServeConfig.from_vllm_config(self.vllm_config)
         super().init_device()
         self.decode_stream = torch.cuda.Stream(device=self.device)
         # HB_P2_PREFILL_SHARED_STREAM=1 maps every prefill lane onto ONE
@@ -32,9 +34,9 @@ class SlackServeGPUWorker(GPUWorker):
         # ticket context (host prep pipelined behind the running ticket)
         # while the GPU executes prefill tickets strictly in order - no
         # added SM contention, and same-request KV ordering comes free.
-        shared = os.environ.get("HB_P2_PREFILL_SHARED_STREAM") == "1"
+        shared = self.slackserve_config.shared_prefill_stream
         self.lane_streams: dict[str, torch.cuda.Stream] = {}
-        for index, lane in enumerate(prefill_lane_names()):
+        for index, lane in enumerate(self.slackserve_config.prefill_lane_names()):
             if shared and index > 0:
                 self.lane_streams[lane] = self.lane_streams["prefill"]
             else:
@@ -47,7 +49,7 @@ class SlackServeGPUWorker(GPUWorker):
         # Optional libsmctrl TPC placement masks (HB_SMCTRL_*). The embed
         # sidecar shares the prefill lane's stream, so the prefill mask
         # covers embed launches too.
-        if os.environ.get("HB_SMCTRL_LIB"):
+        if self.slackserve_config.legacy_env_masks and os.environ.get("HB_SMCTRL_LIB"):
             from vllm.v1.worker.hb_smctrl import apply_env_masks
 
             apply_env_masks(
@@ -58,10 +60,7 @@ class SlackServeGPUWorker(GPUWorker):
             )
         self._hb_dense_lock: tuple[Callable[[], None], Callable[[], None]] | None = None
         self._hb_record_prefill_tail: Callable[[torch.cuda.Stream], None] | None = None
-        if (
-            os.environ.get("HB_P2_EMBED_SIDECAR") == "1"
-            and os.environ.get("HB_P2_DENSE_LOCK", "1") != "0"
-        ):
+        if self.slackserve_config.embed_sidecar and self.slackserve_config.dense_lock:
             from vllm.v1.engine.hb_embed_sidecar import (
                 prefill_launch_lock_acquire,
                 prefill_launch_lock_release,
@@ -82,6 +81,31 @@ class SlackServeGPUWorker(GPUWorker):
 
         return SlackServeModelRunner(self.vllm_config, self.device)
 
+    def bind_lane_streams(
+        self, prefill_stream: torch.cuda.Stream, decode_stream: torch.cuda.Stream
+    ) -> None:
+        """Bind an idle model to the controller's shared execution lanes.
+
+        Call after initialization/capture and before admitting requests. Captured
+        graphs keep this runner's addresses; replay uses the supplied stream.
+        """
+        if prefill_stream.device != self.device or decode_stream.device != self.device:
+            raise ValueError("shared lane streams must use the worker's device")
+        if prefill_stream.cuda_stream == decode_stream.cuda_stream:
+            raise ValueError("prefill and decode require different streams")
+        if any(
+            context.execute_model_state is not None
+            for context in self.model_runner.contexts.values()
+        ):
+            raise RuntimeError("cannot rebind a worker with a pending forward")
+        ready = torch.cuda.current_stream(self.device)
+        prefill_stream.wait_stream(ready)
+        decode_stream.wait_stream(ready)
+        self.decode_stream = decode_stream
+        self.lane_streams = {
+            lane: prefill_stream for lane in self.slackserve_config.prefill_lane_names()
+        }
+
     def _lane_stream(self, lane: str) -> torch.cuda.Stream:
         # ``default`` remains a compatibility alias for decode.
         if lane in ("decode", "default"):
@@ -97,7 +121,10 @@ class SlackServeGPUWorker(GPUWorker):
         dense_lock = self._hb_dense_lock
         record_prefill_tail = self._hb_record_prefill_tail
         locked = dense_lock is not None and lane not in ("decode", "default")
-        if lane not in ("decode", "default"):
+        if (
+            lane not in ("decode", "default")
+            and self.slackserve_config.legacy_env_masks
+        ):
             # Load-conditional prefill mask (HB_SMCTRL_MASK_MIN_RUNNING):
             # re-mask/uncap the prefill stream before this chunk's launches.
             from vllm.v1.worker.hb_smctrl import maybe_mask_prefill_for_load

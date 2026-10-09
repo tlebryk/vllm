@@ -56,7 +56,7 @@ from vllm.v1.worker.gpu.attn_utils import (
     init_kv_cache,
 )
 from vllm.v1.worker.gpu.block_table import BlockTables
-from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
+from vllm.v1.worker.gpu.buffer_utils import UvaFenceRegistry, async_copy_to_gpu
 from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
@@ -190,6 +190,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.pooling_runner: PoolingRunner | None = None
 
         # General request states.
+        # Registry ownership follows the runner even if execution moves threads.
+        # Stock runners do not fence; Slack Serve fences at its prep boundary.
+        self.uva_fence_registry = UvaFenceRegistry()
         self.req_states = RequestState(
             max_num_reqs=self.max_num_reqs,
             max_model_len=self.max_model_len,
@@ -199,6 +202,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             device=self.device,
             model_dtype=self.dtype,
             cache_draft_logits=not use_strict_rejection_sampling,
+            fence_registry=self.uva_fence_registry,
         )
         self.input_buffers = InputBuffers(
             max_num_reqs=self.max_num_reqs,
@@ -305,7 +309,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.is_pooling_model and self.is_last_pp_rank:
             self.pooling_runner = PoolingRunner(self.model)
 
-        if self.is_pooling_model or os.environ.get("HB_PREFILL_SM_COUNT_TARGET"):
+        additional = self.vllm_config.additional_config
+        if isinstance(additional, dict) and "slackserve" in additional:
+            from vllm.v1.worker.embed_sm_linear_hook import register_embed_model
+            from vllm.v1.worker.slackserve_config import SlackServeConfig
+
+            lanes = SlackServeConfig.from_vllm_config(self.vllm_config)
+            register_embed_model(
+                self.model,
+                sm_target=lanes.prefill_sm_target,
+                min_m=lanes.sm_target_min_m,
+            )
+        elif self.is_pooling_model or os.environ.get("HB_PREFILL_SM_COUNT_TARGET"):
             # Slack Serve: opt pooling-model linears into the cuBLASLt
             # SM-count-target path, or explicitly opt in a dedicated decoder
             # prefill engine. Ordinary decode engines remain untouched.
@@ -350,6 +365,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cp_size=self.dcp_size,
             cp_rank=self.dcp_rank,
             cp_interleave=self.cp_interleave,
+            fence_registry=self.uva_fence_registry,
         )
 
         self.attn_backends, self.attn_groups = init_attn_backend(

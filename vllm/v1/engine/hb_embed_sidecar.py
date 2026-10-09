@@ -36,12 +36,9 @@ small. The drain starts only once the LLM is under real load
 (HB_P2_EMBED_START_MIN_REQS, default 8) so no embed work escapes the
 measured window during harness warmup.
 
-UVA: the embed engine's stock runner must NOT register its staged-buffer
-pools in the module-global dirty registry (only the LLM runner fences, on
-its own streams — the cross-engine iterate/mutate race of jobs 274982/
-275003). The drain thread disables registration for itself via
-set_uva_fencing_enabled(False); embed pools then behave exactly like the
-ordinary unfenced single-lane runner.
+UVA: each V2 runner owns its staged-buffer fence registry. The LLM can
+only fence its own pools; the stock pooling runner keeps its ordinary
+unfenced behavior without a thread-local registration opt-out.
 
 Build happens ONCE, eagerly, during EngineCore.__init__ (before the busy
 loop, so no live forward to race and the ~30-60 s load stays out of served
@@ -283,7 +280,6 @@ class HbEmbedSidecar:
         from vllm import LLMEngine
         from vllm.engine.arg_utils import EngineArgs
         from vllm.envs import disable_envs_cache, enable_envs_cache
-        from vllm.platforms import current_platform
         from vllm.pooling_params import PoolingParams
 
         parallel = self.host_core.vllm_config.parallel_config
@@ -303,7 +299,6 @@ class HbEmbedSidecar:
             )
 
         t0 = time.perf_counter()
-        type(current_platform)._global_graph_pool = None
 
         pop_keys = (
             "HB_P2_EMBED_SIDECAR",
@@ -409,13 +404,6 @@ class HbEmbedSidecar:
             # With an explicit target of 0 the Lt hook is intentionally off
             # (smctrl mask arms use plain torch kernels for embed GEMMs).
             raise RuntimeError("[hb-embed-sidecar] SM hook marked no embed linears")
-
-        # Flush any UVA pools the embed build/warmup registered on THIS
-        # (controller) thread, while no LLM traffic exists to race with. The
-        # drain thread then opts out of registration entirely.
-        from vllm.v1.worker.gpu.buffer_utils import fence_uva_pools
-
-        fence_uva_pools(None)
 
         if self.live:
             if os.environ.get("HB_P2_DENSE_LOCK", "1") == "0":
@@ -561,11 +549,7 @@ class HbEmbedSidecar:
     def _bind_dense_stream(self) -> Any:
         """Bind this sidecar thread and its runner to LLM's dense stream."""
         from vllm.utils.torch_utils import current_stream
-        from vllm.v1.worker.gpu.buffer_utils import set_uva_fencing_enabled
 
-        # Auxiliary pools must not enter the LLM worker's module-global UVA
-        # registry; the two engines otherwise race while walking that state.
-        set_uva_fencing_enabled(False)
         llm_worker = self.host_core.model_executor.driver_worker
         llm_worker = getattr(llm_worker, "worker", llm_worker)
         dense_stream = llm_worker.lane_streams["prefill"]
@@ -776,11 +760,6 @@ class HbEmbedSidecar:
     def _drain(self) -> None:
         from vllm.utils.torch_utils import current_stream
         from vllm.v1.worker.embed_sm_linear_hook import set_runtime_sm_target
-        from vllm.v1.worker.gpu.buffer_utils import set_uva_fencing_enabled
-
-        # Embed pools must not enter the module-global UVA fence registry
-        # (only the LLM runner fences, on its own streams — cross-engine race).
-        set_uva_fencing_enabled(False)
 
         # SHARED dense stream: the LLM prefill lane's stream, pinned as this
         # thread's ambient stream. Two streams total in the process.
