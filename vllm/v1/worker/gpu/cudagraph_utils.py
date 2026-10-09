@@ -212,13 +212,31 @@ class CudaGraphManager:
                         # Sync offloader's copy stream before capture.
                         # Ensure any pre-capture prefetches from offloader are complete.
                         get_offloader().sync_prev_onload()
-                        with torch.cuda.graph(graph, self.pool):
-                            forward_fn(CUDAGraphMode.NONE)
-                            # Join offloader's copy stream after forward to avoid
-                            # unjoined stream error. The last layer's start_prefetch
-                            # forks copy_stream, but wait_prefetch only happens in
-                            # the next forward pass.
-                            get_offloader().join_after_forward()
+                        mask_ctrl = getattr(self, "capture_mask_ctrl", None)
+                        capture_stream = (
+                            torch.cuda.current_stream(self.device)
+                            if mask_ctrl is not None
+                            else None
+                        )
+                        if mask_ctrl is not None:
+                            mask_ctrl._set_mask(
+                                capture_stream,
+                                self.capture_disable_mask,
+                                "decode graph capture",
+                                log=False,
+                            )
+                        try:
+                            with torch.cuda.graph(
+                                graph, self.pool, stream=capture_stream
+                            ):
+                                forward_fn(CUDAGraphMode.NONE)
+                                # Join offloader's copy stream after forward.
+                                get_offloader().join_after_forward()
+                        finally:
+                            if mask_ctrl is not None:
+                                mask_ctrl._set_mask(
+                                    capture_stream, 0, "unrestricted", log=False
+                                )
                         self.graphs[desc] = graph
         self._graphs_captured = True
 
@@ -279,6 +297,7 @@ class ModelCudaGraphManager(CudaGraphManager):
         has_lora: bool = False,
         use_aux_hidden_state_outputs: bool = False,
         progress_bar_desc: str = "Capturing CUDA graphs",
+        shared_kv_mapping=None,
     ) -> None:
         """Capture CUDA graphs for model forward pass."""
         self.use_aux_hidden_state_outputs = use_aux_hidden_state_outputs
@@ -302,6 +321,10 @@ class ModelCudaGraphManager(CudaGraphManager):
                 attn_groups,
                 kv_cache_config,
             )
+            if shared_kv_mapping is not None:
+                attn_metadata, slot_mappings = shared_kv_mapping.prepare(
+                    "decode", attn_metadata, slot_mappings
+                )
 
             def forward_fn(cg_mode: CUDAGraphMode) -> None:
                 batch_descriptor = (

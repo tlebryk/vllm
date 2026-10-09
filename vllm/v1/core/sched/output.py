@@ -241,6 +241,12 @@ class SchedulerOutput:
     # Execution stream selected by the experimental Slack Serve runner.
     execution_lane: str = "default"
 
+    # A failed allocation that existing GPU-fenced KV releases can satisfy.
+    # The controller retries after reclamation instead of causing more eviction.
+    kv_reclamation_needed_blocks: int = 0
+    # A waiting request would consume capacity reserved for running outputs.
+    kv_admission_deferred: bool = False
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(

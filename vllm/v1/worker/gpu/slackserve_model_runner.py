@@ -185,6 +185,12 @@ class SlackServeModelRunner(GPUModelRunner):
         for lane, context in self.contexts.items():
             if lane != "decode":
                 context.attn_scratch = LaneAttentionScratch(self.block_tables)
+        self.shared_kv_mapping = None
+        if self.shared_kv is not None:
+            from vllm.v1.worker.gpu.shared_kv import SharedKVMapping
+
+            shared, model_id = self.shared_kv
+            self.shared_kv_mapping = SharedKVMapping(self, shared, model_id)
 
     def _apply_prefill_custom_ops(self) -> None:
         """HB_P2_PREFILL_CUSTOM_OPS: per-lane custom-op dispatch.
@@ -259,6 +265,44 @@ class SlackServeModelRunner(GPUModelRunner):
         self._apply_prefill_custom_ops()
         return n
 
+    def capture_decode_mask(self, ctrl, disable_mask: int) -> int:
+        """Capture a second, model-owned graph bank with a fixed TPC mask.
+
+        Both banks use this runner's decode inputs and output destination, but
+        independent graph allocation pools. Runtime never replays them concurrently
+        because this model has one FIFO decode stream.
+        """
+        from vllm.v1.worker.gpu.cudagraph_utils import ModelCudaGraphManager
+
+        if self._compile_any or not self.decode_graphs_only:
+            raise ValueError(
+                "decode mask variants require eager capture and decode-only graphs"
+            )
+        original = self.cudagraph_manager
+        if not original._graphs_captured or not original.graphs:
+            raise ValueError("decode masking requires captured FULL graphs")
+        masked = ModelCudaGraphManager(
+            self.vllm_config,
+            self.device,
+            original.cudagraph_mode,
+            original.decode_query_len,
+        )
+        masked.pool = torch.cuda.graph_pool_handle()
+        masked.hidden_states = original.hidden_states
+        masked.aux_hidden_states = original.aux_hidden_states
+        masked.capture_mask_ctrl = ctrl
+        masked.capture_disable_mask = disable_mask
+        self.cudagraph_manager = masked
+        try:
+            size = super().capture_model()
+        finally:
+            self.cudagraph_manager = original
+        self._decode_mask_banks = {False: original, True: masked}
+        return size
+
+    def select_decode_mask(self, masked: bool) -> None:
+        self.cudagraph_manager = self._decode_mask_banks[masked]
+
     def _end_prep(
         self, context: "LaneContext", exec_stream: torch.cuda.Stream | None
     ) -> None:
@@ -323,15 +367,21 @@ class SlackServeModelRunner(GPUModelRunner):
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         from vllm.v1.worker.embed_sm_linear_hook import model_sm_phase
 
-        with model_sm_phase(
-            self.model, scheduler_output.execution_lane.startswith("prefill")
-        ):
-            return self._execute_model(
-                scheduler_output,
-                intermediate_tensors,
-                dummy_run,
-                skip_attn_for_dummy_run,
-            )
+        try:
+            with model_sm_phase(
+                self.model, scheduler_output.execution_lane.startswith("prefill")
+            ):
+                return self._execute_model(
+                    scheduler_output,
+                    intermediate_tensors,
+                    dummy_run,
+                    skip_attn_for_dummy_run,
+                )
+        except Exception as error:
+            shared_kv = getattr(self, "shared_kv", None)
+            if shared_kv is not None:
+                shared_kv[0].poison(error)
+            raise
 
     def _execute_model(
         self,
@@ -357,6 +407,10 @@ class SlackServeModelRunner(GPUModelRunner):
                 self.prep_streams[lane] = prep_stream
             prep_exec_stream = torch.cuda.current_stream(self.device)
             torch.cuda.set_stream(prep_stream)
+        if getattr(self, "shared_kv_mapping", None) is not None:
+            # Lane-local translated tables/slots are captured graph inputs.
+            # Prep-stream writes must follow the previous forward's reads.
+            torch.cuda.current_stream(self.device).wait_event(context.completion_event)
         if not dummy_run:
             # The staged-write scatter kernels read shared, persistent UVA
             # staging buffers (req_states/block_tables/sampler). Before this
@@ -504,6 +558,10 @@ class SlackServeModelRunner(GPUModelRunner):
                     self.attn_groups,
                     self.kv_cache_config,
                 )
+            if getattr(self, "shared_kv_mapping", None) is not None:
+                attn_metadata, slot_mappings_by_layer = self.shared_kv_mapping.prepare(
+                    lane, attn_metadata, slot_mappings_by_layer
+                )
 
         inputs_embeds = None
         if self.supports_mm_inputs and self.is_first_pp_rank:
@@ -607,6 +665,13 @@ class SlackServeModelRunner(GPUModelRunner):
         assert context.completion_event is not None
         context.main_stream = torch.cuda.current_stream(self.device)
         context.completion_event.record(context.main_stream)
+        if not dummy_run and self.shared_kv is not None:
+            # A fresh event is immutable after publication to the allocator;
+            # the ordinary per-lane event is re-recorded during sampling.
+            event = torch.cuda.Event()
+            event.record(context.main_stream)
+            shared, model_id = self.shared_kv
+            shared.record_use(model_id, lane, event)
         if dummy_run:
             self.execute_model_state = execute_model_state
 

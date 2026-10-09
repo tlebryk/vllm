@@ -57,7 +57,7 @@ class SmCtrl:
         ]
         self.lib.libsmctrl_set_stream_mask_ext.restype = ctypes.c_int
 
-    def _set_mask(self, stream, mask: int, desc: str) -> None:
+    def _set_mask(self, stream, mask: int, desc: str, *, log: bool = True) -> None:
         arg = _CUint128(
             low=mask & 0xFFFFFFFFFFFFFFFF, high=(mask >> 64) & 0xFFFFFFFFFFFFFFFF
         )
@@ -66,7 +66,8 @@ class SmCtrl:
         )
         if ret != 0:
             raise OSError(ret, f"libsmctrl_set_stream_mask_ext failed: {ret}")
-        logger.info("smctrl: stream %#x pinned to %s", stream.cuda_stream, desc)
+        if log:
+            logger.info("smctrl: stream %#x pinned to %s", stream.cuda_stream, desc)
 
     def set_stream_tpc_range(self, stream, lo: int, hi: int) -> None:
         """Pin ``stream`` (torch.cuda.Stream) to TPCs [lo, hi)."""

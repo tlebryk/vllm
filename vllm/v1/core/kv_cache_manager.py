@@ -142,6 +142,9 @@ class KVCacheManager:
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
         self.kv_cache_config = kv_cache_config
+        # A failed allocation may need GPU-fenced releases, rather than more
+        # eviction. Reset for every attempt; private pools leave this at zero.
+        self.allocation_pending_blocks = 0
 
         # Pre-constructed KVCacheBlocks with no blocks, callers should use this
         # via create_kv_cache_blocks instead of creating new ones to avoid GC
@@ -297,6 +300,7 @@ class KVCacheManager:
         Returns:
             A list of new allocated blocks.
         """
+        self.allocation_pending_blocks = 0
         # When loading KV data asynchronously, we may have zero new tokens to
         # compute while still allocating slots for externally computed tokens.
         if num_new_tokens == 0 and num_external_computed_tokens == 0:
@@ -346,6 +350,13 @@ class KVCacheManager:
         )
 
         if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
+            after_reclamation = getattr(
+                self.block_pool, "can_allocate_after_reclamation", None
+            )
+            if after_reclamation is not None and after_reclamation(
+                num_blocks_to_allocate
+            ):
+                self.allocation_pending_blocks = num_blocks_to_allocate
             # Cannot allocate new blocks
             return None
 

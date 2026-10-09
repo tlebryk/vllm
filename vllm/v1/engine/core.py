@@ -284,6 +284,17 @@ class EngineCore:
         kv_cache_configs = get_kv_cache_configs(
             vllm_config, kv_cache_specs, available_gpu_memory
         )
+        if vllm_config.additional_config.get("shared_kv") is not None:
+            from vllm.v1.core.shared_kv import shared_kv_for_config
+
+            shared, model_id = shared_kv_for_config(vllm_config)
+            if len(kv_cache_configs) != 1:
+                raise ValueError("shared KV requires an in-process single GPU executor")
+            cache = kv_cache_configs[0]
+            _, spec = shared.validate_config(model_id, cache)
+            cache.num_blocks = shared.logical_capacity(model_id)
+            for tensor in cache.kv_cache_tensors:
+                tensor.size = cache.num_blocks * spec.page_size_bytes
 
         # If auto-fit reduced max_model_len, sync the new value to workers.
         # This is needed because workers were spawned before memory profiling

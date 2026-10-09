@@ -382,13 +382,37 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         self.kv_caches: list[torch.Tensor] = []
-        kv_caches_dict = init_kv_cache(
-            self.kv_caches,
-            self.compilation_config.static_forward_context,
-            self.kv_cache_config,
-            self.attn_backends,
-            self.device,
-        )
+        self.shared_kv = None
+        if self.vllm_config.additional_config.get("shared_kv") is not None:
+            from vllm.v1.attention.backends.utils import get_kv_cache_layout
+            from vllm.v1.core.shared_kv import shared_kv_for_config
+            from vllm.v1.worker.utils import bind_kv_cache
+
+            if (
+                type(self).__name__ != "SlackServeModelRunner"
+                or any(
+                    backend.get_name() != "FLASH_ATTN"
+                    for backend in self.attn_backends.values()
+                )
+                or get_kv_cache_layout() != "NHD"
+            ):
+                raise ValueError("shared KV requires SlackServe and NHD FlashAttention")
+            self.shared_kv = shared_kv_for_config(self.vllm_config)
+            shared, model_id = self.shared_kv
+            kv_caches_dict = shared.bind_storage(model_id, kv_cache_config, self.device)
+            bind_kv_cache(
+                kv_caches_dict,
+                self.compilation_config.static_forward_context,
+                self.kv_caches,
+            )
+        else:
+            kv_caches_dict = init_kv_cache(
+                self.kv_caches,
+                self.compilation_config.static_forward_context,
+                self.kv_cache_config,
+                self.attn_backends,
+                self.device,
+            )
         self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
 
     @torch.inference_mode()
@@ -569,6 +593,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.kv_cache_config,
                 has_lora=self.lora_config is not None,
                 use_aux_hidden_state_outputs=self.use_aux_hidden_state_outputs,
+                shared_kv_mapping=getattr(self, "shared_kv_mapping", None),
             )
             if self.speculator is not None:
                 self.speculator.capture_model()

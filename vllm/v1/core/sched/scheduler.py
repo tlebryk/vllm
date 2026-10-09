@@ -244,6 +244,14 @@ class Scheduler(SchedulerInterface):
             hash_block_size=self.block_size,
             metrics_collector=self.kv_metrics_collector,
         )
+        if vllm_config.additional_config.get("shared_kv") is not None:
+            from vllm.v1.core.shared_kv import (
+                install_shared_block_pool,
+                shared_kv_for_config,
+            )
+
+            shared, model_id = shared_kv_for_config(vllm_config)
+            install_shared_block_pool(self.kv_cache_manager, shared, model_id)
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
 
@@ -381,6 +389,8 @@ class Scheduler(SchedulerInterface):
         scheduled_resumed_reqs: list[Request] = []
         scheduled_running_reqs: list[Request] = []
         preempted_reqs: list[Request] = []
+        kv_reclamation_needed_blocks = 0
+        kv_admission_deferred = False
 
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
@@ -507,6 +517,15 @@ class Scheduler(SchedulerInterface):
                         # The request can be scheduled.
                         break
 
+                    if self.kv_cache_manager.allocation_pending_blocks:
+                        # Eviction has already made enough capacity available
+                        # once its GPU fences finish. Yield instead of evicting
+                        # more requests while those same releases are pending.
+                        kv_reclamation_needed_blocks = (
+                            self.kv_cache_manager.allocation_pending_blocks
+                        )
+                        break
+
                     # The request cannot be scheduled.
                     # Preempt the lowest-priority request.
                     safe_victims = self.hb_safe_preemption_victims()
@@ -609,6 +628,7 @@ class Scheduler(SchedulerInterface):
         if (
             lane != "decode"
             and not preempted_reqs
+            and not kv_reclamation_needed_blocks
             and self._pause_state == PauseState.UNPAUSED
         ):
             step_skipped_waiting = create_request_queue(self.policy)
@@ -786,6 +806,11 @@ class Scheduler(SchedulerInterface):
                         for i in encoder_inputs_to_schedule
                     )
 
+                admission_guard = getattr(self, "_hb_kv_admission_guard", None)
+                if admission_guard is not None and not admission_guard(request):
+                    kv_admission_deferred = True
+                    break
+
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
                     num_new_tokens,
@@ -799,6 +824,9 @@ class Scheduler(SchedulerInterface):
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
+                    kv_reclamation_needed_blocks = (
+                        self.kv_cache_manager.allocation_pending_blocks
+                    )
 
                     # NOTE: we need to untouch the request from the encode cache
                     # manager
@@ -970,6 +998,8 @@ class Scheduler(SchedulerInterface):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
+            kv_reclamation_needed_blocks=kv_reclamation_needed_blocks,
+            kv_admission_deferred=kv_admission_deferred,
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
