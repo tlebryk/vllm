@@ -147,7 +147,10 @@ class SlackServeGPUWorker(GPUWorker):
             torch.cuda.nvtx.range_push("dense/prefill")
             dense_lock[0]()
         try:
-            with torch.cuda.stream(self._lane_stream(lane)):
+            with (
+                torch.cuda.stream(self._lane_stream(lane)),
+                self.model_runner.uva_fence_registry.use_lane(lane),
+            ):
                 output = super().execute_model(scheduler_output)
                 if output is None and scheduler_output.total_num_scheduled_tokens > 0:
                     # Enqueue sampling while this ticket's lane-local inputs
@@ -183,7 +186,10 @@ class SlackServeGPUWorker(GPUWorker):
             assert dense_lock is not None
             dense_lock[0]()
         try:
-            with torch.cuda.stream(self._lane_stream(lane)):
+            with (
+                torch.cuda.stream(self._lane_stream(lane)),
+                self.model_runner.uva_fence_registry.use_lane(lane),
+            ):
                 output = self.model_runner.sample_tokens(grammar_output, lane=lane)
                 if locked:
                     assert record_prefill_tail is not None

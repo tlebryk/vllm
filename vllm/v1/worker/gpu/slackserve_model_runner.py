@@ -135,6 +135,8 @@ class SlackServeModelRunner(GPUModelRunner):
         # lane's next prep reuse memory another lane's forward is still
         # reading. One in-flight ticket per lane makes same-lane reuse safe.
         self.use_prep_streams = self.slackserve_config.prep_streams
+        self.lane_staging = self.slackserve_config.lane_staging
+        self.uva_fence_registry.isolate_lanes = self.lane_staging
         self.prep_streams: dict[str, torch.cuda.Stream] = {}
         # The controller may keep multiple decode tickets
         # in flight (see EngineCore.step_two_lane). All host prep is enqueued
@@ -304,12 +306,17 @@ class SlackServeModelRunner(GPUModelRunner):
         self.cudagraph_manager = self._decode_mask_banks[masked]
 
     def _end_prep(
-        self, context: "LaneContext", exec_stream: torch.cuda.Stream | None
+        self,
+        context: "LaneContext",
+        exec_stream: torch.cuda.Stream | None,
+        *,
+        fence: bool = True,
     ) -> None:
         """Return to the lane's execution stream, ordered after this prep."""
-        # Every kernel consuming this ticket's staged UVA buffers is enqueued
-        # on the current stream by now; guard the pools' round-robin reuse.
-        self.uva_fence_registry.fence(torch.cuda.current_stream(self.device))
+        # The legacy staging guard ends at prep. Lane-owned snapshots may
+        # also feed sampling, so productive tickets defer their fence to tail.
+        if fence:
+            self.uva_fence_registry.fence(torch.cuda.current_stream(self.device))
         if exec_stream is None:
             return
         assert context.prep_event is not None
@@ -412,13 +419,13 @@ class SlackServeModelRunner(GPUModelRunner):
             # Prep-stream writes must follow the previous forward's reads.
             torch.cuda.current_stream(self.device).wait_event(context.completion_event)
         if not dummy_run:
-            # The staged-write scatter kernels read shared, persistent UVA
-            # staging buffers (req_states/block_tables/sampler). Before this
-            # lane's CPU code overwrites that staging memory, every other
-            # lane's already-enqueued scatter kernels must have consumed it.
-            for other_lane, other in self.contexts.items():
-                if other_lane != lane and other.staging_event is not None:
-                    other.staging_event.synchronize()
+            # The legacy slots are shared across lanes. Private lane banks
+            # instead guard reuse of the specific buffer, including consumers
+            # after prep, so unrelated decode staging need not block prefill.
+            if not self.lane_staging:
+                for other_lane, other in self.contexts.items():
+                    if other_lane != lane and other.staging_event is not None:
+                        other.staging_event.synchronize()
             # Update the request states.
             self.finish_requests(scheduler_output)
             self.free_states(scheduler_output)
@@ -590,7 +597,9 @@ class SlackServeModelRunner(GPUModelRunner):
             model_inputs["inputs_embeds"] = None
             assert intermediate_tensors is not None
 
-        self._end_prep(context, prep_exec_stream)
+        self._end_prep(
+            context, prep_exec_stream, fence=not self.lane_staging or dummy_run
+        )
 
         # Run model.
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
@@ -810,6 +819,10 @@ class SlackServeModelRunner(GPUModelRunner):
         # Publish lane readiness only after sampling and postprocess have been
         # enqueued. execute_model recorded this same event after the forward;
         # re-recording it here makes controller queries cover the full ticket.
+        if self.lane_staging:
+            # Sampling also consumes UVA parameter snapshots. Record after
+            # every consumer, including reads of snapshots without fresh copies.
+            self.uva_fence_registry.fence(torch.cuda.current_stream(self.device))
         assert context.completion_event is not None
         context.completion_event.record(torch.cuda.current_stream(self.device))
         ticket_tail_event.record(torch.cuda.current_stream(self.device))

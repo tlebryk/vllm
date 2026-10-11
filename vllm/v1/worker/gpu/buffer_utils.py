@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable, Sequence
+from contextlib import contextmanager
 from functools import partial
 
 import numpy as np
@@ -33,6 +34,24 @@ class UvaFenceRegistry:
 
     def __init__(self) -> None:
         self._dirty_pools: list[UvaBufferPool] = []
+        self.isolate_lanes = False
+        self.lane: str | None = None
+
+    @contextmanager
+    def use_lane(self, lane: str):
+        """Select host staging slots on the runner's serialized owner thread.
+
+        Decode retains the original slots, including capture/warmup addresses.
+        Prefill lanes lazily allocate private slots with the same reuse guards.
+        """
+        previous = self.lane
+        self.lane = (
+            lane if self.isolate_lanes and lane not in ("decode", "default") else None
+        )
+        try:
+            yield
+        finally:
+            self.lane = previous
 
     def fence(self, stream: torch.cuda.Stream | None = None) -> None:
         """Record consumption of only this runner's pending buffers."""
@@ -91,11 +110,41 @@ class UvaBufferPool:
         self._events: list[torch.cuda.Event | None] = [None] * max_concurrency
         self._event_pending = [False] * max_concurrency
         self._dirty: set[int] = set()
+        self._lane_slots: dict[str | None, list[int]] = {
+            None: list(range(max_concurrency))
+        }
+        self._lane_cursors: dict[str | None, int] = {None: 0}
+        self._consumer_events: dict[int, dict[int, torch.cuda.Event]] = {}
+        self._consumer_pending: dict[int, set[int]] = {}
+
+    def _mark_used(self, index: int) -> None:
+        if self.fence_registry is not None:
+            if not self._dirty:
+                self.fence_registry._dirty_pools.append(self)
+            self._dirty.add(index)
+
+    def mark_read(self) -> None:
+        """Fence fresh consumers even when an immutable UVA view was not copied."""
+        if self.fence_registry is not None and self.fence_registry.isolate_lanes:
+            self._mark_used(self._curr)
 
     def _record_pending(self, stream: torch.cuda.Stream | None) -> None:
         if stream is None:
             stream = torch.cuda.current_stream()
         for index in self._dirty:
+            if self.fence_registry is not None and self.fence_registry.isolate_lanes:
+                # One snapshot can be read by its owning lane and another
+                # lane without being recopied. Retain every stream's fence;
+                # a fast later reader must not replace a slow earlier one.
+                stream_key = stream.cuda_stream
+                events = self._consumer_events.setdefault(index, {})
+                event = events.get(stream_key)
+                if event is None:
+                    event = torch.cuda.Event()
+                    events[stream_key] = event
+                event.record(stream)
+                self._consumer_pending.setdefault(index, set()).add(stream_key)
+                continue
             event = self._events[index]
             if event is None:
                 event = torch.cuda.Event()
@@ -105,8 +154,23 @@ class UvaBufferPool:
         self._dirty.clear()
 
     def copy_to_uva(self, x: torch.Tensor | np.ndarray | list) -> torch.Tensor:
-        # Round robin to the next buffer.
-        self._curr = (self._curr + 1) % self.max_concurrency
+        lane = self.fence_registry.lane if self.fence_registry is not None else None
+        if lane not in self._lane_slots:
+            start = len(self._uva_bufs)
+            self._uva_bufs.extend(
+                UvaBuffer(self.size, self.dtype) for _ in range(self.max_concurrency)
+            )
+            self._events.extend([None] * self.max_concurrency)
+            self._event_pending.extend([False] * self.max_concurrency)
+            self._lane_slots[lane] = list(range(start, start + self.max_concurrency))
+            self._lane_cursors[lane] = 0
+        cursor = (self._lane_cursors[lane] + 1) % self.max_concurrency
+        self._lane_cursors[lane] = cursor
+        self._curr = self._lane_slots[lane][cursor]
+        for stream_key in self._consumer_pending.get(self._curr, ()):
+            self._consumer_events[self._curr][stream_key].synchronize()
+        if self._curr in self._consumer_pending:
+            self._consumer_pending[self._curr].clear()
         if self._event_pending[self._curr]:
             # A fenced consumer of this buffer's previous contents may still
             # be in flight; wait before the host rewrites the memory.
@@ -114,10 +178,7 @@ class UvaBufferPool:
             assert event is not None
             event.synchronize()
             self._event_pending[self._curr] = False
-        if self.fence_registry is not None:
-            if not self._dirty:
-                self.fence_registry._dirty_pools.append(self)
-            self._dirty.add(self._curr)
+        self._mark_used(self._curr)
         buf = self._uva_bufs[self._curr]
         # CPU-to-CPU copy
         dst = buf.cpu if isinstance(x, torch.Tensor) else buf.np
@@ -155,6 +216,17 @@ class UvaBackedTensor:
             size, dtype, max_concurrency, fence_registry=fence_registry
         )
         self.gpu = self.pool.copy_to_uva(self.np)
+
+    @property
+    def gpu(self) -> torch.Tensor:
+        # A future ticket can consume the last snapshot without copying it
+        # again (prompt lengths, for example). Extend its consumption fence.
+        self.pool.mark_read()
+        return self._gpu
+
+    @gpu.setter
+    def gpu(self, value: torch.Tensor) -> None:
+        self._gpu = value
 
     def copy_to_uva(self, n: int | None = None) -> torch.Tensor:
         # CPU-to-CPU copy

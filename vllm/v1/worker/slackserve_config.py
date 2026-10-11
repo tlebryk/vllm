@@ -16,6 +16,7 @@ class SlackServeConfig:
     compile_decode: bool = False
     compile_prefill: bool = False
     prep_streams: bool = False
+    lane_staging: bool = False
     async_decode_depth: int = 1
     fa_sm_margin_decode: int = 0
     fa_sm_margin_prefill: int = 0
@@ -74,6 +75,7 @@ class SlackServeConfig:
             compile_decode=flag("HB_P2_COMPILE_DECODE"),
             compile_prefill=flag("HB_P2_COMPILE_PREFILL"),
             prep_streams=flag("HB_P2_PREP_STREAM"),
+            lane_staging=flag("HB_P2_LANE_STAGING"),
             async_decode_depth=integer(
                 "HB_P2_ASYNC_DECODE_DEPTH", 2 if flag("HB_P2_ASYNC_DECODE") else 1
             ),

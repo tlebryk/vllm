@@ -19,6 +19,7 @@ class ModelSpec:
     prefill_reserve_blocks: int = 0
     prefill_sm_target: int = 0
     compile_decode: bool = False
+    lane_staging: bool = False
     dtype: str = "float16"
     block_size: int = 16
     runner: str = "generate"
@@ -57,6 +58,8 @@ class ModelSpec:
             raise ValueError("pooling runner requires an embed/classify/score task")
         if self.runner == "generate" and self.pooling_task is not None:
             raise ValueError("generation runner cannot specify a pooling task")
+        if self.runner == "pooling" and self.lane_staging:
+            raise ValueError("lane_staging currently requires the generation runner")
         if not 0 <= self.prefill_reserve_fraction < 1:
             raise ValueError("prefill reserve fraction must be in [0, 1)")
         if not 0 < self.gpu_memory_utilization <= 1:
@@ -116,6 +119,7 @@ class ModelSpec:
                     "decode_graphs_only": True,
                     "async_decode_depth": decode_depth if not pooling else 1,
                     "compile_decode": self.compile_decode,
+                    "lane_staging": self.lane_staging,
                     "prefill_sm_target": self.prefill_sm_target,
                     "prefill_custom_ops": self.prefill_custom_ops,
                 }
