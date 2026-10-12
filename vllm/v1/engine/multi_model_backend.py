@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Arrival-driven, single-owner backend for two native async model clients."""
+"""Arrival-driven, single-owner backend for native async model clients."""
 
 import asyncio
 import json
@@ -24,13 +24,14 @@ logger = logging.getLogger(__name__)
 
 
 def prepare_models(path, *, mode, budget, decode_depth):
-    """Validate both models on CPU before starting the CUDA owner thread."""
+    """Validate model configurations before starting the CUDA owner thread."""
     specs = load_specs(path if isinstance(path, (list, tuple)) else Path(path), 0, 0)
+    if len(specs) == 1 and mode != "private":
+        raise ValueError("single-model native serving requires private KV")
     if mode != "private" and any(
-        s.runner == "pooling" or s.kv_cache_memory_bytes is None or s.dtype == "auto"
-        for s in specs
+        s.kv_cache_memory_bytes is None or s.dtype == "auto" for s in specs
     ):
-        raise ValueError("pooling and auto-sized KV/dtype currently require private KV")
+        raise ValueError("auto-sized KV/dtype currently require private KV")
     prepared = []
     for spec in specs:
         config = EngineArgs(
@@ -94,6 +95,11 @@ class MultiModelBackend:
         step_trace=None,
         smctrl_mask=None,
         smctrl_lib=None,
+        smctrl_min_decode_requests=1,
+        dense_step_tokens=0,
+        smctrl_indices=None,
+        smctrl_max_dense_wait_ms=0,
+        adaptive_dense_steps=False,
     ):
         if max_requests <= 0 or output_capacity <= decode_depth + 2:
             raise ValueError("invalid ingress/output capacity")
@@ -112,6 +118,19 @@ class MultiModelBackend:
         self.max_requests = max_requests
         self.model_order = [s.model_id for s in specs]
         self.mask_plan = ModelMaskPlan.parse(smctrl_mask) if smctrl_mask else None
+        if smctrl_min_decode_requests < 1:
+            raise ValueError("minimum decode requests must be positive")
+        self.smctrl_min_decode_requests = smctrl_min_decode_requests
+        if dense_step_tokens < 0:
+            raise ValueError("dense step tokens must be nonnegative")
+        self.dense_step_tokens = dense_step_tokens
+        self.smctrl_indices = smctrl_indices
+        self.smctrl_max_dense_wait_ms = smctrl_max_dense_wait_ms
+        if adaptive_dense_steps and (self.mask_plan is None or not dense_step_tokens):
+            raise ValueError(
+                "adaptive dense steps require a mask and a positive dense step size"
+            )
+        self.adaptive_dense_steps = adaptive_dense_steps
         self.smctrl_lib = Path(smctrl_lib).resolve() if smctrl_lib else None
         self.lane_masks = None
         self.mask_metadata = None
@@ -162,6 +181,8 @@ class MultiModelBackend:
         self.supported_tasks = {}
         self.manager = None
         self.last_pool_state = None
+        self.last_engine_state = None
+        self.idle_free_blocks = {}
         self.execution_stream_ids = None
         self.step_trace = Path(step_trace) if step_trace is not None else None
         self.step_trace_file = None
@@ -379,6 +400,10 @@ class MultiModelBackend:
                 core.dispatch = traced_dispatch
         endpoints, stream_order = self._bind_execution_streams()
         torch.cuda.synchronize()
+        self.idle_free_blocks = {
+            mid: core.scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
+            for mid, core in self.cores.items()
+        }
         return MultiModelController(
             endpoints,
             decode_depth=self.decode_depth,
@@ -387,6 +412,7 @@ class MultiModelBackend:
             decode_streams=stream_order,
             record_steps=False,
             lane_masks=self.lane_masks,
+            adaptive_dense_steps=self.adaptive_dense_steps,
             step_observer=self._observe_step
             if self.step_trace_file is not None
             else None,
@@ -432,6 +458,8 @@ class MultiModelBackend:
                     self.decode_depth > 1
                     and getattr(spec, "runner", "generate") == "generate",
                     getattr(spec, "runner", "generate") == "generate",
+                    spec.prefill_step_tokens
+                    or (self.dense_step_tokens if spec.runner == "pooling" else 0),
                 )
             )
         self.execution_stream_ids = {
@@ -447,7 +475,11 @@ class MultiModelBackend:
             # Prefill is eager; decode's captured placement is left intact.
             if not all(w.model_runner.decode_graphs_only for w in workers.values()):
                 raise ValueError("prefill stream masking requires eager prefill")
-            indices = spread_indices(self.mask_plan.tpcs, total)
+            indices = (
+                list(self.smctrl_indices)
+                if self.smctrl_indices is not None
+                else spread_indices(self.mask_plan.tpcs, total)
+            )
             self.lane_masks = ModelLaneMasks(
                 self.mask_plan,
                 endpoints,
@@ -457,17 +489,21 @@ class MultiModelBackend:
                 SmCtrl(str(self.smctrl_lib)),
                 indices,
                 activation="decode",
+                min_decode_requests=self.smctrl_min_decode_requests,
+                max_dense_wait_ms=self.smctrl_max_dense_wait_ms,
             )
             self.mask_metadata = {
                 "model_id": self.mask_plan.model_id,
                 "lane": "prefill",
                 "enabled_tpcs": self.mask_plan.tpcs,
                 "total_tpcs": total,
-                "geometry": "spread",
+                "geometry": "explicit" if self.smctrl_indices is not None else "spread",
                 "enabled_indices": indices,
+                "min_decode_requests": self.smctrl_min_decode_requests,
+                "max_dense_wait_ms": self.smctrl_max_dense_wait_ms,
                 "activation": (
-                    "partner has decode-ready resident requests "
-                    "or productive pending decode tickets"
+                    "decode-ready resident or pending batch load reaches "
+                    "min_decode_requests; pipeline tickets are not summed"
                 ),
                 "decode_graphs": "unchanged",
                 "library": library_provenance(self.smctrl_lib),
@@ -529,6 +565,39 @@ class MultiModelBackend:
                 observed = {f for f in observed if not f.done()}
                 if self.manager is not None:
                     self.last_pool_state = self.manager.snapshot()
+                free_blocks = {}
+                for mid, core in self.cores.items():
+                    pool = core.scheduler.kv_cache_manager.block_pool
+                    free_blocks[mid] = pool.get_num_free_blocks()
+                # Read scheduler/KV state on their owner thread. HTTP readers
+                # receive a completed snapshot, including younger decode
+                # tickets that may outlive an EOS response. No GPU sync.
+                engine_state = {
+                    "has_work": controller.has_work(),
+                    "pending_tickets": sum(
+                        len(q) for q in controller._pending.values()
+                    ),
+                    "inputs_queued": self.inputs.qsize(),
+                    "models": {
+                        mid: {
+                            "free_blocks": free_blocks[mid],
+                            "idle_free_blocks": self.idle_free_blocks[mid],
+                            "running": len(core.scheduler.running),
+                            "waiting": len(core.scheduler.waiting),
+                            "async_decode_refs": len(
+                                getattr(core.scheduler, "_hb_async_decode_refs", ())
+                            ),
+                        }
+                        for mid, core in self.cores.items()
+                    },
+                }
+                if (
+                    not engine_state["has_work"]
+                    and not engine_state["inputs_queued"]
+                    and self.step_trace_file is not None
+                ):
+                    self.step_trace_file.flush()
+                self.last_engine_state = engine_state
                 self.wakeup.wait(
                     0.001
                     if controller.has_work()
@@ -597,12 +666,15 @@ class MultiModelBackend:
             "active_requests": count,
             "max_requests": self.max_requests,
             "kv": self.last_pool_state,
+            "engine_state": self.last_engine_state,
             "admission": self.admission,
             "topology": self.topology,
             "execution_stream_ids": self.execution_stream_ids,
             "offline_model_serial": serial,
             "step_trace": str(self.step_trace) if self.step_trace is not None else None,
             "smctrl_mask": self.mask_metadata,
+            "dense_step_tokens": self.dense_step_tokens,
+            "adaptive_dense_steps": self.adaptive_dense_steps,
             "failed": self.error is not None,
         }
 

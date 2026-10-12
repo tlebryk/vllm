@@ -395,6 +395,11 @@ class Scheduler(SchedulerInterface):
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
         token_budget = self.max_num_scheduled_tokens
+        # Candidate work-unit shaping belongs to the launch policy. Engine
+        # buffers and scheduling capacity retain their full configured size.
+        step_budget = getattr(self, "_hb_step_token_budget", None)
+        if lane == "prefill" and step_budget is not None:
+            token_budget = min(token_budget, step_budget)
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
             token_budget = 0

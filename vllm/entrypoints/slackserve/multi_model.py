@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Native AsyncLLM/OpenAI integration for a shared two-model backend."""
+"""Native AsyncLLM/OpenAI integration for model-owned lane execution."""
 
 import json
 import os
@@ -55,6 +55,15 @@ async def build_multi_model_clients(args):
         step_trace=args.slackserve_step_trace,
         smctrl_mask=args.slackserve_smctrl_mask,
         smctrl_lib=args.slackserve_smctrl_lib,
+        smctrl_min_decode_requests=args.slackserve_smctrl_min_decode_requests,
+        dense_step_tokens=args.slackserve_dense_step_tokens,
+        adaptive_dense_steps=args.slackserve_dense_adaptive_step,
+        smctrl_indices=(
+            json.loads(args.slackserve_smctrl_indices)
+            if args.slackserve_smctrl_indices is not None
+            else None
+        ),
+        smctrl_max_dense_wait_ms=args.slackserve_smctrl_max_dense_wait_ms,
     )
     clients = {}
     try:

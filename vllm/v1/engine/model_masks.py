@@ -2,6 +2,8 @@
 """Explicit model/phase placement, owned by the multi-model launch thread."""
 
 import hashlib
+import math
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -26,7 +28,8 @@ class ModelMaskPlan:
 class ModelLaneMasks:
     """Restore the shared lane before B launches; never mutate a global mask.
 
-    A is restricted only while another model has resident or in-flight work.
+    Prefill can protect its own model's decode on the separate decode stream.
+    Decode restriction protects another model's resident or in-flight work.
     Decode uses separate masked/unmasked graph banks because replay-time stream
     masks do not override the mask baked into a graph at capture.
     """
@@ -42,6 +45,9 @@ class ModelLaneMasks:
         indices,
         *,
         activation="resident",
+        min_decode_requests=1,
+        max_dense_wait_ms=0,
+        clock=time.time,
     ):
         self.plan, self.models, self.workers = plan, models, workers
         self.streams, self.total_tpcs, self.ctrl = streams, total_tpcs, ctrl
@@ -51,17 +57,31 @@ class ModelLaneMasks:
             raise ValueError(
                 "mask model must exist and TPC count must be below full GPU"
             )
+        if (
+            len(indices) != plan.tpcs
+            or len(set(indices)) != len(indices)
+            or any(type(i) is not int or i < 0 or i >= total_tpcs for i in indices)
+        ):
+            raise ValueError(
+                "explicit mask must contain the requested number of distinct TPCs"
+            )
         self.indices = indices
         self.state = {}
         if activation not in ("resident", "decode"):
             raise ValueError("unknown mask activation policy")
         self.activation = activation
+        if min_decode_requests < 1:
+            raise ValueError("minimum decode requests must be positive")
+        self.min_decode_requests = min_decode_requests
+        if not math.isfinite(max_dense_wait_ms) or max_dense_wait_ms < 0:
+            raise ValueError("dense wait budget must be nonnegative")
+        self.max_dense_wait_ms, self.clock = max_dense_wait_ms, clock
 
     def before_dispatch(self, model, lane, pending_models, *, pending_tickets=()):
         partners = [
             m
             for m in self.models
-            if m.model_id != model.model_id or self.plan.model_id == "*"
+            if m.model_id != model.model_id or self.plan.lane == "prefill"
         ]
         partner_ids = {m.model_id for m in partners}
         partner_active = any(
@@ -69,12 +89,16 @@ class ModelLaneMasks:
             and (other.core.scheduler.running or other.model_id in pending_models)
             for other in self.models
         )
-        decode_ready = sum(
-            getattr(r, "num_computed_tokens", 0) >= getattr(r, "num_prompt_tokens", 0)
+        ready_by_model = {
+            other.model_id: sum(
+                getattr(r, "num_computed_tokens", 0)
+                >= getattr(r, "num_prompt_tokens", 1)
+                for r in other.core.scheduler.running
+            )
             for other in partners
             if getattr(other, "decode_enabled", True)
-            for r in other.core.scheduler.running
-        )
+        }
+        decode_ready = sum(ready_by_model.values())
         decode_tickets = [
             t
             for t in pending_tickets
@@ -82,15 +106,50 @@ class ModelLaneMasks:
             and t.lane == "decode"
             and t.step.scheduler_output.total_num_scheduled_tokens
         ]
+        # Pipeline tickets often contain the same requests. Count the largest
+        # live batch per model, not the sum of launch-ahead tickets.
+        decode_load = sum(
+            max(
+                ready,
+                max(
+                    (
+                        t.step.scheduler_output.total_num_scheduled_tokens
+                        for t in decode_tickets
+                        if t.model_id == mid
+                    ),
+                    default=0,
+                ),
+            )
+            for mid, ready in ready_by_model.items()
+        )
         protect = (
             partner_active
             if self.activation == "resident"
-            else bool(decode_ready or decode_tickets)
+            else decode_load >= self.min_decode_requests
+        )
+        dense_age_ms = 0.0
+        if not getattr(model, "decode_enabled", True):
+            sched = model.core.scheduler
+            now = self.clock()
+            dense_age_ms = max(
+                (
+                    1000 * max(0, now - getattr(r, "arrival_time", now))
+                    for r in [
+                        *sched.running,
+                        *getattr(sched, "waiting", ()),
+                        *getattr(sched, "skipped_waiting", ()),
+                    ]
+                ),
+                default=0.0,
+            )
+        age_override = bool(
+            self.max_dense_wait_ms and dense_age_ms >= self.max_dense_wait_ms
         )
         masked = (
             (model.model_id == self.plan.model_id or self.plan.model_id == "*")
             and lane == self.plan.lane
             and protect
+            and not age_override
         )
         if lane == self.plan.lane:
             stream = self.streams.get((model.model_id, lane), self.streams.get(lane))
@@ -108,6 +167,11 @@ class ModelLaneMasks:
             "partner_active": bool(partner_active),
             "activation": self.activation,
             "partner_decode_ready_requests": decode_ready,
+            "partner_decode_load": decode_load,
+            "min_decode_requests": self.min_decode_requests,
+            "oldest_dense_age_ms": dense_age_ms,
+            "max_dense_wait_ms": self.max_dense_wait_ms,
+            "dense_age_override": age_override,
             "partner_decode_tickets": len(decode_tickets),
             "partner_decode_scheduled_tokens": sum(
                 t.step.scheduler_output.total_num_scheduled_tokens

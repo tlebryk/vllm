@@ -160,7 +160,10 @@ class BaseFrontendArgs:
     This is intended for use in a Disaggregated Everything setup.
     """
     slackserve_models: str | None = None
-    """JSON configuration for two native generation or pooling models on one GPU."""
+    """JSON configuration for one or two native models on one GPU.
+
+    A single-model P/D run requires --slackserve-shared-kv private.
+    """
     slackserve_shared_kv: Literal["private", "head", "layer"] = "layer"
     """KV capacity layout for the native dual-model backend."""
     slackserve_kv_memory_bytes: int | None = None
@@ -191,11 +194,35 @@ class BaseFrontendArgs:
     """
     slackserve_smctrl_lib: str | None = None
     """libsmctrl shared library required by --slackserve-smctrl-mask."""
+    slackserve_smctrl_indices: str | None = None
+    """Optional JSON list of enabled physical TPC indices, replacing spread."""
+    slackserve_smctrl_max_dense_wait_ms: float = 0
+    """Restore full-GPU dense access once its oldest request reaches this age.
+
+    Zero disables the age guard. Generation prefill retains its decode gate.
+    """
+    slackserve_smctrl_min_decode_requests: int = 1
+    """Apply the prefill mask only at this many decode-ready requests.
+
+    This controls placement, not admission or scheduler batch capacity.
+    """
     slackserve_dense_model: str | None = None
     """Auxiliary pooling checkpoint for the native multi-model controller.
 
     Runs on the shared prefill stream, with generation prefill taking priority.
     Uses private KV and the same request transport as native dual LLM serving.
+    """
+    slackserve_dense_step_tokens: int = 0
+    """Candidate dense work-unit tokens per dispatch (0 uses full capacity).
+
+    Does not resize engine buffers or reduce scheduler capacity. Sequential
+    controls should leave this unset and tune the dense engine capacity.
+    """
+    slackserve_dense_adaptive_step: bool = False
+    """Use small dense work units only while its dispatch is masked.
+
+    Full capacity is restored with little decode demand or an age override.
+    Requires a mask and a positive --slackserve-dense-step-tokens.
     """
     slackserve_dense_served_model_name: str = "embed"
     """Public ``model`` name accepted by the Slack Serve dense endpoint."""

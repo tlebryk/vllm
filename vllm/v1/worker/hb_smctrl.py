@@ -36,8 +36,7 @@ def _disable_mask(lo: int, hi: int) -> int:
 
 
 def spread_indices(count: int, total: int) -> list[int]:
-    """``count`` TPC indices spread evenly across [0, total) — preserves
-    GPC/L2 locality spread that a contiguous range destroys."""
+    """Sample numerical TPC IDs evenly; this does not consult physical GPCs."""
     return [(j * total) // count for j in range(count)]
 
 

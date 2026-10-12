@@ -644,9 +644,14 @@ async def benchmark(
     # Reuses connections across requests to reduce TLS handshake overhead.
     # Use ssl_context if provided, otherwise default to True for https URLs
     ssl_setting = ssl_context if ssl_context is not None else ("https://" in api_url)
+    # PD-E/V logical requests hold generation and dense HTTP calls together.
+    # Both need a connection: parked dense replies in offline model-serial mode
+    # must not prevent the remaining generation requests from reaching the server.
+    connections_per_request = 2 if endpoint_type == "slackserve-pde" else 1
+    connection_limit = (max_concurrency or 0) * connections_per_request
     connector = aiohttp.TCPConnector(
-        limit=max_concurrency or 0,
-        limit_per_host=max_concurrency or 0,
+        limit=connection_limit,
+        limit_per_host=connection_limit,
         ttl_dns_cache=300,
         use_dns_cache=True,
         keepalive_timeout=60,

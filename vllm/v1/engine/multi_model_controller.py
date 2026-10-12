@@ -23,9 +23,13 @@ class ModelEndpoint:
     prefill_reserve_blocks: int = 0
     async_decode: bool = False
     decode_enabled: bool = True
+    prefill_step_tokens: int = 0
 
     def __post_init__(self) -> None:
-        if not self.model_id or self.prefill_reserve_blocks < 0:
+        if (
+            not self.model_id
+            or min(self.prefill_reserve_blocks, self.prefill_step_tokens) < 0
+        ):
             raise ValueError("invalid model ID or prefill KV reserve")
 
 
@@ -184,6 +188,7 @@ class MultiModelController:
         decode_streams: Any = None,
         record_steps: bool = True,
         step_observer: Callable[[dict], None] | None = None,
+        adaptive_dense_steps: bool = False,
     ) -> None:
         self.models = list(models)
         self.record_steps = record_steps
@@ -192,6 +197,9 @@ class MultiModelController:
         self._pending = {}
         self._waiting_futures = []
         self.lane_masks = lane_masks
+        if adaptive_dense_steps and lane_masks is None:
+            raise ValueError("adaptive dense steps require a live mask policy")
+        self.adaptive_dense_steps = adaptive_dense_steps
         self.independent_decode = independent_decode
         self.decode_streams = decode_streams
         if not self.models or len({m.model_id for m in models}) != len(models):
@@ -433,7 +441,10 @@ class MultiModelController:
                 else None
             )
             previous_guard = getattr(sched, "_hb_kv_admission_guard", None)
+            previous_budget = getattr(sched, "_hb_step_token_budget", None)
             sched._hb_kv_admission_guard = guard
+            if lane == "prefill" and model.prefill_step_tokens:
+                sched._hb_step_token_budget = model.prefill_step_tokens
             try:
                 if self.decode_streams is not None:
                     self.decode_streams.before_dispatch(model, lane)
@@ -447,11 +458,21 @@ class MultiModelController:
                     if self.lane_masks is not None
                     else None
                 )
+                if (
+                    self.adaptive_dense_steps
+                    and not model.decode_enabled
+                    and lane == "prefill"
+                    and not mask_record["masked"]
+                ):
+                    # Spend small units only while protecting decode. Full
+                    # capacity serves low load, urgent work, and the tail.
+                    sched._hb_step_token_budget = None
                 step = model.core.dispatch(lane)
                 if self.decode_streams is not None:
                     self.decode_streams.after_dispatch(model, lane)
             finally:
                 sched._hb_kv_admission_guard = previous_guard
+                sched._hb_step_token_budget = previous_budget
             ticket = ModelTicket(
                 model.model_id,
                 lane,

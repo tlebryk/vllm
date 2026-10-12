@@ -1,4 +1,4 @@
-"""Startup-known dense model configuration for the shared native backend."""
+"""Startup-known one/two-model configuration for the native lane backend."""
 
 import json
 from dataclasses import dataclass
@@ -30,6 +30,8 @@ class ModelSpec:
     compilation: dict | None = None
     prefill_custom_ops: str = ""
     prefill_reserve_fraction: float = 0.0
+    # Policy work unit, separate from the engine's scheduler capacity.
+    prefill_step_tokens: int = 0
 
     def __post_init__(self) -> None:
         if not self.model_id or not self.model:
@@ -66,6 +68,8 @@ class ModelSpec:
             raise ValueError("GPU memory utilization must be in (0, 1]")
         if min(self.prefill_reserve_blocks, self.prefill_sm_target) < 0:
             raise ValueError("KV reserve and SM target must be nonnegative")
+        if not 0 <= self.prefill_step_tokens <= self.max_num_batched_tokens:
+            raise ValueError("prefill step tokens must fit the engine token capacity")
         if self.dtype not in ("float16", "bfloat16", "auto"):
             raise ValueError("dense runners support FP16/BF16 or auto in private mode")
 
@@ -142,8 +146,8 @@ def load_specs(path: Path, n: int, warmup: int) -> list[ModelSpec]:
         if isinstance(path, (list, tuple))
         else [ModelSpec(**row) for row in json.loads(path.read_text())]
     )
-    if len(specs) != 2 or len({s.model_id for s in specs}) != 2:
-        raise ValueError("this verifier requires exactly two unique model IDs")
+    if not 1 <= len(specs) <= 2 or len({s.model_id for s in specs}) != len(specs):
+        raise ValueError("native serving requires one or two unique model IDs")
     if any(s.max_num_seqs < max(n, warmup) for s in specs):
         raise ValueError("max_num_seqs must cover each complete fixed queue")
     if sum(s.gpu_memory_utilization for s in specs) > 0.95:
