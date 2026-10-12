@@ -15,6 +15,7 @@ class MoEActivation(Enum):
     # and produce output of shape [..., d]
     SILU = "silu"
     GELU = "gelu"
+    GELU_TANH = "gelu_tanh"
     RELU2 = "relu2"
     SWIGLUOAI = "swigluoai"
     SWIGLUSTEP = "swiglustep"
@@ -24,6 +25,7 @@ class MoEActivation(Enum):
     # NOTE: Non-gated activations require the "_no_mul" suffix to be present.
     SILU_NO_MUL = "silu_no_mul"
     GELU_NO_MUL = "gelu_no_mul"
+    GELU_TANH_NO_MUL = "gelu_tanh_no_mul"
     RELU2_NO_MUL = "relu2_no_mul"
 
     @property
@@ -64,17 +66,20 @@ class MoEActivation(Enum):
 _CUSTOM_OP_NAMES: dict[MoEActivation, str] = {
     MoEActivation.SILU: "silu_and_mul",
     MoEActivation.GELU: "gelu_and_mul",
+    MoEActivation.GELU_TANH: "gelu_and_mul",
     MoEActivation.SWIGLUOAI: "swigluoai_and_mul",
     MoEActivation.SWIGLUSTEP: "swiglustep_and_mul",
     MoEActivation.RELU2: "relu2",
     MoEActivation.SILU_NO_MUL: "silu_and_mul",
     MoEActivation.GELU_NO_MUL: "gelu_and_mul",
+    MoEActivation.GELU_TANH_NO_MUL: "gelu_and_mul",
     MoEActivation.RELU2_NO_MUL: "relu2",
 }
 
 _WITHOUT_MUL: dict[MoEActivation, MoEActivation] = {
     MoEActivation.SILU: MoEActivation.SILU_NO_MUL,
     MoEActivation.GELU: MoEActivation.GELU_NO_MUL,
+    MoEActivation.GELU_TANH: MoEActivation.GELU_TANH_NO_MUL,
     MoEActivation.RELU2: MoEActivation.RELU2_NO_MUL,
 }
 
@@ -115,6 +120,8 @@ def apply_moe_activation(
         torch.ops._C.silu_and_mul(output, input)
     elif activation == MoEActivation.GELU:
         torch.ops._C.gelu_and_mul(output, input)
+    elif activation == MoEActivation.GELU_TANH:
+        torch.ops._C.gelu_tanh_and_mul(output, input)
     elif activation == MoEActivation.SWIGLUOAI:
         torch.ops._C.swigluoai_and_mul(output, input)
     elif activation == MoEActivation.SWIGLUSTEP:
@@ -127,6 +134,8 @@ def apply_moe_activation(
         output.copy_(F.silu(input))
     elif activation == MoEActivation.GELU_NO_MUL:
         output.copy_(F.gelu(input))
+    elif activation == MoEActivation.GELU_TANH_NO_MUL:
+        output.copy_(F.gelu(input, approximate="tanh"))
     elif activation == MoEActivation.RELU2_NO_MUL:
         F.relu(input, inplace=True)
         torch.square(input, out=output)

@@ -35,12 +35,16 @@ from vllm.v1.worker.gpu.model_runner import (
     pp_receive,
 )
 from vllm.v1.worker.slackserve_config import SlackServeConfig
+from vllm.v1.worker.workspace import WorkspaceManager, use_workspace_manager
 
 
 class SlackServeModelRunner(GPUModelRunner):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
         self.slackserve_config = SlackServeConfig.from_vllm_config(vllm_config)
+        # Expert scratch may be reused sequentially within a lane, never
+        # between an eager prefill and a concurrently replaying decode graph.
+        self.lane_workspaces: dict[str, WorkspaceManager] = {}
         unsupported = (
             self.lora_config is not None
             or self.speculative_config is not None
@@ -234,38 +238,85 @@ class SlackServeModelRunner(GPUModelRunner):
             sorted(names),
         )
 
+    @torch.inference_mode()
+    def _dummy_run(self, num_tokens: int, *args, **kwargs):
+        workspace_lane = kwargs.pop("workspace_lane", None)
+        if workspace_lane is None and num_tokens > self.max_num_reqs and not kwargs.get("uniform_decode", False):
+            budget = self.slackserve_config.prefill_step_tokens
+            if budget:
+                num_tokens = min(num_tokens, budget)
+        lane = workspace_lane or ("prefill" if num_tokens > self.max_num_reqs else "decode")
+        previous_lane = getattr(self, "_dummy_workspace_lane", None)
+        self._dummy_workspace_lane = workspace_lane
+        try:
+            return super()._dummy_run(num_tokens, *args, **kwargs)
+        finally:
+            # The base profiling helper clears its mirrored state, but
+            # SlackServe's lane-local mirror must also cease being pending.
+            self.contexts[lane].execute_model_state = None
+            self._dummy_workspace_lane = previous_lane
+
+    @torch.inference_mode()
+    def profile_run(self) -> None:
+        # The controller enforces this work unit; engine capacity remains
+        # unchanged. Profile the largest executable prefill, not a forbidden
+        # larger batch that would unnecessarily consume the KV budget.
+        self._profiling_prefill = True
+        try:
+            super().profile_run()
+        finally:
+            self._profiling_prefill = False
+        if self.model_config.is_moe:
+            # The main profile exercises the largest prefill work unit.
+            # Reserve decode scratch as well before calculating KV headroom.
+            # vLLM's post-KV warmup uses the default/decode lane for a
+            # two-token prompt per request. Exercise that maximum shape
+            # before KV sizing and locking graph-owned scratch pointers.
+            # Runtime decode remains one token per request; this is only
+            # an initialization reservation, not a scheduling limit.
+            self._dummy_run(
+                2 * self.max_num_reqs, skip_attn=True, workspace_lane="decode"
+            )
+            torch.accelerator.synchronize()
+            for workspace in self.lane_workspaces.values():
+                workspace.lock()
+
     def capture_model(self) -> int:
-        if not self._compile_prefill:
-            n = super().capture_model()
+        workspace = self.lane_workspaces.setdefault("decode", WorkspaceManager(self.device))
+        # Graph capture invokes the model directly, bypassing execute_model.
+        # Freeze pointers to the same runner-owned decode scratch it profiled.
+        with use_workspace_manager(workspace):
+            if not self._compile_prefill:
+                n = super().capture_model()
+                self._apply_prefill_custom_ops()
+                return n
+            # HB_P2_COMPILE_PREFILL=1: decode graphs must be captured over the
+            # ORIGINAL eager forward (decode never uses the compiled callable).
+            # support_torch_compile's __call__ returns self.forward whenever
+            # do_not_compile is True (decorators.py: `if self.do_not_compile ...`),
+            # so toggling it forces the capture warmup + capture passes eager. The
+            # decorator is applied to the compiled BACKBONE submodule (e.g.
+            # Qwen3Model), not the top-level model, so toggle every submodule that
+            # carries the attribute. The prefill lane keeps its compiled callable
+            # for runtime; it compiles lazily on the first real prefill forward
+            # (absorbed by warmup).
+            toggled: list = []
+            for mod in self.model.modules():
+                if "do_not_compile" in vars(mod):
+                    toggled.append((mod, mod.do_not_compile))
+                    mod.do_not_compile = True
+            if not toggled:
+                raise RuntimeError(
+                    "HB_P2_COMPILE_PREFILL: no submodule exposes do_not_compile; "
+                    "expected a support_torch_compile wrapper in mode 3."
+                )
+            try:
+                n = super().capture_model()
+            finally:
+                for mod, prev in toggled:
+                    mod.do_not_compile = prev
             self._apply_prefill_custom_ops()
             return n
-        # HB_P2_COMPILE_PREFILL=1: decode graphs must be captured over the
-        # ORIGINAL eager forward (decode never uses the compiled callable).
-        # support_torch_compile's __call__ returns self.forward whenever
-        # do_not_compile is True (decorators.py: `if self.do_not_compile ...`),
-        # so toggling it forces the capture warmup + capture passes eager. The
-        # decorator is applied to the compiled BACKBONE submodule (e.g.
-        # Qwen3Model), not the top-level model, so toggle every submodule that
-        # carries the attribute. The prefill lane keeps its compiled callable
-        # for runtime; it compiles lazily on the first real prefill forward
-        # (absorbed by warmup).
-        toggled: list = []
-        for mod in self.model.modules():
-            if "do_not_compile" in vars(mod):
-                toggled.append((mod, mod.do_not_compile))
-                mod.do_not_compile = True
-        if not toggled:
-            raise RuntimeError(
-                "HB_P2_COMPILE_PREFILL: no submodule exposes do_not_compile; "
-                "expected a support_torch_compile wrapper in mode 3."
-            )
-        try:
-            n = super().capture_model()
-        finally:
-            for mod, prev in toggled:
-                mod.do_not_compile = prev
-        self._apply_prefill_custom_ops()
-        return n
 
     def capture_decode_mask(self, ctrl, disable_mask: int) -> int:
         """Capture a second, model-owned graph bank with a fixed TPC mask.
@@ -296,7 +347,9 @@ class SlackServeModelRunner(GPUModelRunner):
         masked.capture_disable_mask = disable_mask
         self.cudagraph_manager = masked
         try:
-            size = super().capture_model()
+            workspace = self.lane_workspaces.setdefault("decode", WorkspaceManager(self.device))
+            with use_workspace_manager(workspace):
+                size = super().capture_model()
         finally:
             self.cudagraph_manager = original
         self._decode_mask_banks = {False: original, True: masked}
@@ -348,21 +401,38 @@ class SlackServeModelRunner(GPUModelRunner):
             yield
             return
 
-        builders = []
+        changed = []
         seen: set[int] = set()
         for group in self.attn_groups:
             for attention_group in group:
                 builder = attention_group.get_metadata_builder(0)
-                if id(builder) in seen or not hasattr(builder, "use_full_cuda_graph"):
+                if id(builder) in seen:
                     continue
                 seen.add(id(builder))
-                builders.append((builder, builder.use_full_cuda_graph))
-                builder.use_full_cuda_graph = False
+                if hasattr(builder, "use_full_cuda_graph"):
+                    changed.append((builder, "use_full_cuda_graph", builder.use_full_cuda_graph))
+                    builder.use_full_cuda_graph = False
+                # Triton's small-query attention writes persistent softmax
+                # intermediates. Even a final one-token prefill must never
+                # write the scratch captured by an in-flight decode graph.
+                fields = ("softmax_segm_output", "softmax_segm_max", "softmax_segm_expsum")
+                if all(hasattr(builder, name) for name in fields):
+                    banks = getattr(builder, "_slackserve_lane_scratch", None)
+                    if banks is None:
+                        banks = {}
+                        builder._slackserve_lane_scratch = banks
+                    scratch = banks.get(lane)
+                    if scratch is None:
+                        scratch = tuple(torch.empty_like(getattr(builder, name)) for name in fields)
+                        banks[lane] = scratch
+                    for name, private in zip(fields, scratch):
+                        changed.append((builder, name, getattr(builder, name)))
+                        setattr(builder, name, private)
         try:
             yield
         finally:
-            for builder, previous in builders:
-                builder.use_full_cuda_graph = previous
+            for builder, name, original in reversed(changed):
+                setattr(builder, name, original)
 
     @torch.inference_mode()
     def execute_model(
@@ -374,9 +444,18 @@ class SlackServeModelRunner(GPUModelRunner):
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         from vllm.v1.worker.embed_sm_linear_hook import model_sm_phase
 
+        lane = scheduler_output.execution_lane
+        if lane == "default":
+            lane = "decode"
+            if dummy_run:
+                lane = getattr(self, "_dummy_workspace_lane", None) or (
+                    "prefill" if scheduler_output.total_num_scheduled_tokens > self.max_num_reqs else "decode"
+                )
+                scheduler_output.execution_lane = lane
+        workspace = self.lane_workspaces.setdefault(lane, WorkspaceManager(self.device))
         try:
-            with model_sm_phase(
-                self.model, scheduler_output.execution_lane.startswith("prefill")
+            with use_workspace_manager(workspace), model_sm_phase(
+                self.model, lane.startswith("prefill")
             ):
                 return self._execute_model(
                     scheduler_output,

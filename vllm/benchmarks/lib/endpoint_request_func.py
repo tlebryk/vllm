@@ -5,6 +5,7 @@
 import asyncio
 import io
 import json
+import math
 import os
 import sys
 import time
@@ -98,6 +99,8 @@ class RequestFuncOutput:
     prompt_len: int = 0
     error: str = ""
     start_time: float = 0.0
+    pooling_data: list[dict[str, Any]] | None = None
+    output_token_ids: list[int] | None = None
     input_audio_duration: float = 0.0  # in seconds
     aux_success: bool | None = None
     aux_prompt_len: int = 0
@@ -231,6 +234,10 @@ async def async_request_openai_completions(
                                 # Note that text could be empty here
                                 # e.g. for special tokens
                                 text = choices[0].get("text")
+                                if token_ids := choices[0].get("token_ids"):
+                                    if output.output_token_ids is None:
+                                        output.output_token_ids = []
+                                    output.output_token_ids.extend(token_ids)
                                 timestamp = time.perf_counter()
                                 # First token
                                 if not first_chunk_received:
@@ -511,15 +518,28 @@ async def _run_pooling_request(
     try:
         async with session.post(url=api_url, headers=headers, json=payload) as response:
             if response.status == 200:
-                output.ttft = output.latency = time.perf_counter() - st
-
                 if payload.get("encoding_format", "float") == "bytes":
+                    await response.read()
                     metadata = json.loads(response.headers["metadata"])
                     usage = metadata.get("usage", {})
                 else:
                     data = await response.json()
                     usage = data.get("usage", {})
+                    output.pooling_data = data.get("data")
 
+                    def finite(value):
+                        if isinstance(value, (int, float)):
+                            return math.isfinite(value)
+                        if isinstance(value, dict):
+                            return all(finite(v) for v in value.values())
+                        if isinstance(value, list):
+                            return all(finite(v) for v in value)
+                        return True
+
+                    if not finite(output.pooling_data):
+                        raise ValueError("pooling response contains nonfinite values")
+
+                output.ttft = output.latency = time.perf_counter() - st
                 output.success = True
                 output.generated_text = ""
                 output.prompt_len = usage.get("prompt_tokens", 0)

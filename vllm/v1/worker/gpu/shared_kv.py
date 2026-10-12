@@ -11,7 +11,7 @@ from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor
 
 
 class SharedKVMapping:
-    def __init__(self, runner, manager, model_id):
+    def __init__(self, runner, manager, model_id, *, lanes=None, max_blocks=None):
         self.manager, self.model_id = manager, model_id
         self.layout = manager.layouts[model_id]
         self.layer_names = runner.kv_cache_config.kv_cache_groups[0].layer_names
@@ -36,8 +36,14 @@ class SharedKVMapping:
             if manager.mode == "head" and hasattr(runner, "model_config")
             else 0
         )
-        self.max_blocks = runner.block_tables.input_block_tables[0].shape[1]
-        for lane in runner.contexts:
+        self.max_blocks = (
+            runner.block_tables.input_block_tables[0].shape[1]
+            if max_blocks is None
+            else max_blocks
+        )
+        # Pooling has one eager lane and obtains its logical table width from
+        # the mature runner. Both runners use the same mapping kernels/storage.
+        for lane in runner.contexts if lanes is None else lanes:
             # Captured decode always uses these fixed addresses. Larger eager
             # batches get temporary scratch without replacing captured storage.
             tokens = (

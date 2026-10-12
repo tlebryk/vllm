@@ -161,7 +161,7 @@ class FlashAttentionBackend(AttentionBackend):
 
     @classmethod
     def supports_head_size(cls, head_size: int) -> bool:
-        return head_size % 8 == 0 and head_size <= 256
+        return head_size % 8 == 0 and head_size <= (512 if get_flash_attn_version(head_size=head_size) == 4 else 256)
 
     @classmethod
     def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
@@ -301,9 +301,9 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         self.num_heads_q = self.model_config.get_num_attention_heads(
             self.parallel_config
         )
-        self.num_heads_kv = self.model_config.get_num_kv_heads(self.parallel_config)
+        self.num_heads_kv = kv_cache_spec.num_kv_heads
         self.kv_cache_dtype = kv_cache_spec.dtype
-        self.headdim = self.model_config.get_head_size()
+        self.headdim = kv_cache_spec.head_size
         self.block_size = kv_cache_spec.block_size
 
         self.max_num_splits = 0  # No upper bound on the number of splits.

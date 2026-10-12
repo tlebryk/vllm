@@ -492,6 +492,7 @@ def safe_apply_chat_template(
         chat_template_kwargs=kwargs,
     )
 
+    resolved_kwargs["return_dict"] = False
     try:
         return tokenizer.apply_chat_template(
             conversation=conversation,  # type: ignore[arg-type]

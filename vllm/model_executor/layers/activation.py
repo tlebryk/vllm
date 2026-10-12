@@ -678,6 +678,8 @@ def get_act_fn(act_fn_name: str) -> nn.Module:
 _ACTIVATION_AND_MUL_REGISTRY = LazyDict(
     {
         "gelu": lambda: GeluAndMul(),
+        "gelu_pytorch_tanh": lambda: GeluAndMul(approximate="tanh"),
+        "gelu_tanh": lambda: GeluAndMul(approximate="tanh"),
         "silu": lambda: SiluAndMul(),
         "geglu": lambda: GeluAndMul(),
         "swigluoai": lambda *args, **kwargs: SwigluOAIAndMul(*args, **kwargs),
