@@ -120,6 +120,9 @@ class KVCacheManager:
         self.max_model_len = max_model_len
 
         self.enable_caching = enable_caching
+        # Opted into by the independent-stream controller. Stock's ordered
+        # execution stream does not require this additional lifetime guard.
+        self._hb_async_reclaim_guard = False
         self.use_eagle = use_eagle
         self.log_stats = log_stats
         self.metrics_collector = metrics_collector
@@ -336,7 +339,10 @@ class KVCacheManager:
         # Should call this function before allocating new blocks to reduce
         # the number of evicted blocks.
         self.coordinator.remove_skipped_blocks(
-            request.request_id, total_computed_tokens
+            request.request_id,
+            max(0, total_computed_tokens - request.num_output_placeholders)
+            if self._hb_async_reclaim_guard
+            else total_computed_tokens,
         )
 
         num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(

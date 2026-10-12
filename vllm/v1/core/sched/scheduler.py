@@ -109,6 +109,7 @@ class Scheduler(SchedulerInterface):
         # resumed on the prefill lane until every older decode ticket has
         # published.
         self._hb_async_decode_refs: dict[str, int] = defaultdict(int)
+        self._hb_deferred_finished: dict[str, tuple[Request, bool]] = {}
         self._hb_preemptions_by_lane: dict[str, int] = defaultdict(int)
 
         # Scheduling constraints.
@@ -1048,6 +1049,15 @@ class Scheduler(SchedulerInterface):
                 )
             if refs == 1:
                 self._hb_async_decode_refs.pop(request_id, None)
+                deferred = self._hb_deferred_finished.pop(request_id, None)
+                if deferred is not None:
+                    request, free_blocks = deferred
+                    self.encoder_cache_manager.free(request)
+                    self.finished_req_ids.add(request_id)
+                    if self.finished_req_ids_dict is not None:
+                        self.finished_req_ids_dict[request.client_index].add(request_id)
+                    if free_blocks:
+                        self._free_blocks(request)
             else:
                 self._hb_async_decode_refs[request_id] = refs - 1
 
@@ -1946,13 +1956,22 @@ class Scheduler(SchedulerInterface):
         assert request.is_finished()
 
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
+        delay_free_blocks |= connector_delay_free_blocks
+        if self.hb_has_async_decode_ref(request.request_id):
+            # The client may finish on an older look-ahead ticket while a
+            # younger ticket still reads/writes KV and per-request GPU state.
+            # Notify the worker and recycle storage only after its final
+            # reference retires. Connector-owned KV remains separately held.
+            self._hb_deferred_finished[request.request_id] = (
+                request, not delay_free_blocks
+            )
+            return kv_xfer_params
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
         self.finished_req_ids.add(request_id)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)
 
-        delay_free_blocks |= connector_delay_free_blocks
         if not delay_free_blocks:
             self._free_blocks(request)
 

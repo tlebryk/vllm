@@ -54,6 +54,7 @@ class DrainResult:
     waits: int = 0
     watermark_skips: int = 0
     idle_watermark_bypasses: int = 0
+    prefill_watermark_reclaimed_blocks: int = 0
     model_phases: list[dict[str, Any]] = field(default_factory=list)
     policy_transitions: list[dict[str, Any]] = field(default_factory=list)
 
@@ -246,6 +247,22 @@ class MultiModelController:
             for r in sched.running
         )
 
+    @staticmethod
+    def _reclaim_completed_prefill_history(model: ModelEndpoint) -> int:
+        sched = model.core.scheduler
+        manager = sched.kv_cache_manager
+        before = manager.block_pool.get_num_free_blocks()
+        for request in sched.running:
+            if (
+                request.num_computed_tokens < request.num_prompt_tokens
+                and not sched.is_hb_inflight(request.request_id)
+            ):
+                computed = request.num_computed_tokens - getattr(
+                    request, "num_output_placeholders", 0
+                )
+                manager.remove_skipped_blocks(request.request_id, computed)
+        return max(0, manager.block_pool.get_num_free_blocks() - before)
+
     def drain_model_serial(
         self, *, synchronize: Callable[[], None] | None = None
     ) -> DrainResult:
@@ -406,6 +423,7 @@ class MultiModelController:
                     "preemptions": len(
                         getattr(scheduled, "preempted_req_ids", ()) or ()
                     ),
+                    "prefill_watermark_reclaimed_blocks": result.prefill_watermark_reclaimed_blocks,
                     "kv_reclamation_needed_blocks": getattr(
                         scheduled, "kv_reclamation_needed_blocks", 0
                     ),
@@ -427,6 +445,9 @@ class MultiModelController:
 
         def dispatch(model: ModelEndpoint, lane: str) -> None:
             sched = model.core.scheduler
+            sched.kv_cache_manager._hb_async_reclaim_guard = bool(
+                self.decode_depth > 1 and model.async_decode and not self.serialized
+            )
             free = sched.kv_cache_manager.block_pool.get_num_free_blocks()
             running, waiting = len(sched.running), len(sched.waiting)
             started = time.perf_counter()
@@ -569,8 +590,18 @@ class MultiModelController:
                 if lane == "prefill" and not bypass_watermark:
                     pool = model.core.scheduler.kv_cache_manager.block_pool
                     if pool.get_num_free_blocks() < model.prefill_reserve_blocks:
-                        result.watermark_skips += 1
-                        continue
+                        # A completed partial prefill can retain historical
+                        # sliding blocks until its next allocation. Reclaim
+                        # them before applying the watermark, otherwise the
+                        # watermark prevents the allocation that would free
+                        # the request's own expired history. Never touch an
+                        # in-flight request or decode's look-ahead position.
+                        result.prefill_watermark_reclaimed_blocks += (
+                            self._reclaim_completed_prefill_history(model)
+                        )
+                        if pool.get_num_free_blocks() < model.prefill_reserve_blocks:
+                            result.watermark_skips += 1
+                            continue
                 cursor[lane] = (index + 1) % len(self.models)
                 return model
             return None
