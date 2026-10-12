@@ -32,6 +32,9 @@ class ModelSpec:
     prefill_reserve_fraction: float = 0.0
     # Policy work unit, separate from the engine's scheduler capacity.
     prefill_step_tokens: int = 0
+    # Optional activation-profile ceiling, allowing smaller runtime work units
+    # without increasing KV allocation or changing the measured capacity.
+    prefill_profile_tokens: int | None = None
     attention_backend: str = "FLASH_ATTN"
     flash_attn_version: int | None = None
 
@@ -72,6 +75,11 @@ class ModelSpec:
             raise ValueError("KV reserve and SM target must be nonnegative")
         if not 0 <= self.prefill_step_tokens <= self.max_num_batched_tokens:
             raise ValueError("prefill step tokens must fit the engine token capacity")
+        if self.prefill_profile_tokens is not None and not (
+            (self.prefill_step_tokens or self.max_num_batched_tokens)
+            <= self.prefill_profile_tokens <= self.max_num_batched_tokens
+        ):
+            raise ValueError("prefill profile tokens must cover the policy work unit")
         if self.dtype not in ("float16", "bfloat16", "auto"):
             raise ValueError("dense runners support FP16/BF16 or auto in private mode")
 
@@ -128,7 +136,9 @@ class ModelSpec:
                     "lane_staging": self.lane_staging,
                     "prefill_sm_target": self.prefill_sm_target,
                     "prefill_custom_ops": self.prefill_custom_ops,
-                    "prefill_step_tokens": self.prefill_step_tokens,
+                    "prefill_step_tokens": self.prefill_profile_tokens
+                    if self.prefill_profile_tokens is not None
+                    else self.prefill_step_tokens,
                 }
             },
         }

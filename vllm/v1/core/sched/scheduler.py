@@ -1979,6 +1979,11 @@ class Scheduler(SchedulerInterface):
 
     def _free_blocks(self, request: Request):
         assert request.is_finished()
+        if self.hb_has_async_decode_ref(request.request_id):
+            # A connector callback can release its hold before the final
+            # independent-stream consumer has retired.
+            self._hb_deferred_finished[request.request_id] = (request, True)
+            return
         self.kv_cache_manager.free(request)
         del self.requests[request.request_id]
 
