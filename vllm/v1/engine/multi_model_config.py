@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Startup-known one/two-model configuration for the native lane backend."""
 
 import json
@@ -32,6 +34,10 @@ class ModelSpec:
     prefill_reserve_fraction: float = 0.0
     # Policy work unit, separate from the engine's scheduler capacity.
     prefill_step_tokens: int = 0
+    # None preserves backend auto-selection. A100 replication can pin FA2.
+    flash_attn_version: int | None = None
+    # None preserves upstream behavior; FA-only replication can skip FI tuning.
+    enable_flashinfer_autotune: bool | None = None
 
     def __post_init__(self) -> None:
         if not self.model_id or not self.model:
@@ -72,12 +78,21 @@ class ModelSpec:
             raise ValueError("prefill step tokens must fit the engine token capacity")
         if self.dtype not in ("float16", "bfloat16", "auto"):
             raise ValueError("dense runners support FP16/BF16 or auto in private mode")
+        if self.flash_attn_version not in (None, 2, 3):
+            raise ValueError(
+                "native dense attention supports automatic selection, FA2 or FA3"
+            )
+        if (
+            self.enable_flashinfer_autotune is not None
+            and type(self.enable_flashinfer_autotune) is not bool
+        ):
+            raise ValueError("FlashInfer autotune must be a boolean or None")
 
     def engine_kwargs(self, *, eager: bool, decode_depth: int) -> dict[str, Any]:
         if eager and self.compile_decode:
             raise ValueError("compile_decode requires graph mode")
         pooling = self.runner == "pooling"
-        kwargs = {
+        kwargs: dict[str, Any] = {
             "model": self.model,
             "revision": self.revision,
             "runner": self.runner,
@@ -135,6 +150,12 @@ class ModelSpec:
             kwargs["hf_overrides"] = self.hf_overrides
         if self.tokenizer is not None:
             kwargs["tokenizer"] = self.tokenizer
+        if self.flash_attn_version is not None:
+            kwargs["attention_config"]["flash_attn_version"] = self.flash_attn_version
+        if self.enable_flashinfer_autotune is not None:
+            kwargs["kernel_config"] = {
+                "enable_flashinfer_autotune": self.enable_flashinfer_autotune
+            }
         if pooling:
             kwargs["convert"] = "embed" if self.pooling_task == "embed" else "classify"
         return kwargs
