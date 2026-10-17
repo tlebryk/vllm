@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Explicit model/phase placement, owned by the multi-model launch thread."""
 
 import hashlib
@@ -49,23 +50,43 @@ class ModelLaneMasks:
         max_dense_wait_ms=0,
         clock=time.time,
     ):
-        self.plan, self.models, self.workers = plan, models, workers
-        self.streams, self.total_tpcs, self.ctrl = streams, total_tpcs, ctrl
-        if (
-            plan.model_id not in workers and plan.model_id != "*"
-        ) or not 0 < plan.tpcs < total_tpcs:
-            raise ValueError(
-                "mask model must exist and TPC count must be below full GPU"
-            )
-        if (
-            len(indices) != plan.tpcs
-            or len(set(indices)) != len(indices)
-            or any(type(i) is not int or i < 0 or i >= total_tpcs for i in indices)
+        self.plans = tuple(plan) if isinstance(plan, (tuple, list)) else (plan,)
+        if not self.plans or len({p.model_id for p in self.plans}) != len(self.plans):
+            raise ValueError("mask plans need distinct model targets")
+        if len(self.plans) > 1 and (
+            any(p.model_id == "*" for p in self.plans)
+            or {p.lane for p in self.plans} != {"prefill"}
         ):
-            raise ValueError(
-                "explicit mask must contain the requested number of distinct TPCs"
-            )
-        self.indices = indices
+            raise ValueError("multiple mask plans require named prefill models")
+        self.plan, self.models, self.workers = self.plans[0], models, workers
+        self.streams, self.total_tpcs, self.ctrl = streams, total_tpcs, ctrl
+        if isinstance(indices, dict):
+            if set(indices) != {p.model_id for p in self.plans}:
+                raise ValueError("per-model mask indices must match mask targets")
+            self.indices_by_model = {
+                name: list(value) for name, value in indices.items()
+            }
+        elif len(self.plans) == 1:
+            self.indices_by_model = {self.plan.model_id: list(indices)}
+        else:
+            raise ValueError("multiple mask plans require per-model indices")
+        for current in self.plans:
+            selected = self.indices_by_model[current.model_id]
+            if (
+                current.model_id not in workers and current.model_id != "*"
+            ) or not 0 < current.tpcs < total_tpcs:
+                raise ValueError(
+                    "mask model must exist and TPC count must be below full GPU"
+                )
+            if (
+                len(selected) != current.tpcs
+                or len(set(selected)) != len(selected)
+                or any(type(i) is not int or i < 0 or i >= total_tpcs for i in selected)
+            ):
+                raise ValueError(
+                    "explicit mask must contain the requested number of distinct TPCs"
+                )
+        self.indices = self.indices_by_model[self.plan.model_id]
         self.state = {}
         if activation not in ("resident", "decode"):
             raise ValueError("unknown mask activation policy")
@@ -145,25 +166,45 @@ class ModelLaneMasks:
         age_override = bool(
             self.max_dense_wait_ms and dense_age_ms >= self.max_dense_wait_ms
         )
+        # Preserve the single-plan API's mutable `plan` used by local callers.
+        active_plans = (self.plan,) if len(self.plans) == 1 else self.plans
+        selected_plan = next(
+            (
+                p
+                for p in active_plans
+                if p.model_id == model.model_id or p.model_id == "*"
+            ),
+            None,
+        )
         masked = (
-            (model.model_id == self.plan.model_id or self.plan.model_id == "*")
-            and lane == self.plan.lane
+            selected_plan is not None
+            and lane == selected_plan.lane
             and protect
             and not age_override
         )
         if lane == self.plan.lane:
             stream = self.streams.get((model.model_id, lane), self.streams.get(lane))
-            if self.state.get(stream.cuda_stream) != masked:
+            selected_indices = (
+                (
+                    self.indices
+                    if len(active_plans) == 1
+                    else self.indices_by_model[selected_plan.model_id]
+                )
+                if masked
+                else ()
+            )
+            bits = sum(1 << i for i in selected_indices)
+            mask = (~bits & ((1 << 128) - 1)) if masked else 0
+            if self.state.get(stream.cuda_stream) != mask:
                 # Zero means completely unrestricted, including the upper TPCs.
-                bits = sum(1 << i for i in self.indices)
-                mask = (~bits & ((1 << 128) - 1)) if masked else 0
                 self.ctrl._set_mask(stream, mask, "model-owned mask", log=False)
-                self.state[stream.cuda_stream] = masked
+                self.state[stream.cuda_stream] = mask
             if lane == "decode" and model.model_id == self.plan.model_id:
                 self.workers[model.model_id].model_runner.select_decode_mask(masked)
         return {
             "masked": masked,
-            "enabled_tpcs": self.plan.tpcs if masked else self.total_tpcs,
+            "enabled_tpcs": selected_plan.tpcs if masked else self.total_tpcs,
+            "mask_model_id": selected_plan.model_id if masked else None,
             "partner_active": bool(partner_active),
             "activation": self.activation,
             "partner_decode_ready_requests": decode_ready,

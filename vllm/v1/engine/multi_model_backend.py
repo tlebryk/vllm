@@ -118,7 +118,12 @@ class MultiModelBackend:
         self.topology, self.decode_depth = topology, decode_depth
         self.max_requests = max_requests
         self.model_order = [s.model_id for s in specs]
-        self.mask_plan = ModelMaskPlan.parse(smctrl_mask) if smctrl_mask else None
+        self.mask_plans = (
+            tuple(ModelMaskPlan.parse(item.strip()) for item in smctrl_mask.split(","))
+            if smctrl_mask
+            else ()
+        )
+        self.mask_plan = self.mask_plans[0] if self.mask_plans else None
         if smctrl_min_decode_requests < 1:
             raise ValueError("minimum decode requests must be positive")
         self.smctrl_min_decode_requests = smctrl_min_decode_requests
@@ -137,11 +142,16 @@ class MultiModelBackend:
         self.mask_metadata = None
         if self.mask_plan is not None:
             if (
-                (
-                    self.mask_plan.model_id not in self.model_order
-                    and self.mask_plan.model_id != "*"
+                len({plan.model_id for plan in self.mask_plans}) != len(self.mask_plans)
+                or (
+                    len(self.mask_plans) > 1
+                    and any(plan.model_id == "*" for plan in self.mask_plans)
                 )
-                or self.mask_plan.lane != "prefill"
+                or any(
+                    (plan.model_id not in self.model_order and plan.model_id != "*")
+                    or plan.lane != "prefill"
+                    for plan in self.mask_plans
+                )
                 or topology == "single-stream"
                 or offline_serial_counts is not None
             ):
@@ -472,44 +482,72 @@ class MultiModelBackend:
             from vllm.v1.worker.hb_smctrl import SmCtrl, spread_indices
 
             total = torch.cuda.get_device_properties(0).multi_processor_count // 2
-            if not 0 < self.mask_plan.tpcs < total:
+            if any(not 0 < plan.tpcs < total for plan in self.mask_plans):
                 raise ValueError("mask TPC count must be below full GPU")
             # Prefill is eager; decode's captured placement is left intact.
             if not all(w.model_runner.decode_graphs_only for w in workers.values()):
                 raise ValueError("prefill stream masking requires eager prefill")
-            indices = (
-                list(self.smctrl_indices)
-                if self.smctrl_indices is not None
-                else spread_indices(self.mask_plan.tpcs, total)
-            )
+            if isinstance(self.smctrl_indices, dict):
+                if set(self.smctrl_indices) != {
+                    plan.model_id for plan in self.mask_plans
+                }:
+                    raise ValueError(
+                        "explicit per-model mask indices must match mask targets"
+                    )
+                indices_by_model = {
+                    name: list(values) for name, values in self.smctrl_indices.items()
+                }
+            elif len(self.mask_plans) == 1:
+                indices_by_model = {
+                    self.mask_plan.model_id: (
+                        list(self.smctrl_indices)
+                        if self.smctrl_indices is not None
+                        else spread_indices(self.mask_plan.tpcs, total)
+                    )
+                }
+            else:
+                if self.smctrl_indices is not None:
+                    raise ValueError("asymmetric masks require a JSON index map")
+                indices_by_model = {
+                    plan.model_id: spread_indices(plan.tpcs, total)
+                    for plan in self.mask_plans
+                }
             self.lane_masks = ModelLaneMasks(
-                self.mask_plan,
+                self.mask_plans if len(self.mask_plans) > 1 else self.mask_plan,
                 endpoints,
                 workers,
                 {"prefill": prefill},
                 total,
                 SmCtrl(str(self.smctrl_lib)),
-                indices,
+                indices_by_model
+                if len(self.mask_plans) > 1
+                else indices_by_model[self.mask_plan.model_id],
                 activation="decode",
                 min_decode_requests=self.smctrl_min_decode_requests,
                 max_dense_wait_ms=self.smctrl_max_dense_wait_ms,
             )
-            self.mask_metadata = {
-                "model_id": self.mask_plan.model_id,
-                "lane": "prefill",
-                "enabled_tpcs": self.mask_plan.tpcs,
-                "total_tpcs": total,
-                "geometry": "explicit" if self.smctrl_indices is not None else "spread",
-                "enabled_indices": indices,
-                "min_decode_requests": self.smctrl_min_decode_requests,
-                "max_dense_wait_ms": self.smctrl_max_dense_wait_ms,
-                "activation": (
-                    "decode-ready resident or pending batch load reaches "
-                    "min_decode_requests; pipeline tickets are not summed"
-                ),
-                "decode_graphs": "unchanged",
-                "library": library_provenance(self.smctrl_lib),
-            }
+            metadata = [
+                dict(
+                    model_id=plan.model_id,
+                    lane="prefill",
+                    enabled_tpcs=plan.tpcs,
+                    total_tpcs=total,
+                    geometry="explicit"
+                    if self.smctrl_indices is not None
+                    else "spread",
+                    enabled_indices=indices_by_model[plan.model_id],
+                    min_decode_requests=self.smctrl_min_decode_requests,
+                    max_dense_wait_ms=self.smctrl_max_dense_wait_ms,
+                    activation=(
+                        "decode-ready resident or pending batch load reaches "
+                        "min_decode_requests; pipeline tickets are not summed"
+                    ),
+                    decode_graphs="unchanged",
+                    library=library_provenance(self.smctrl_lib),
+                )
+                for plan in self.mask_plans
+            ]
+            self.mask_metadata = metadata[0] if len(metadata) == 1 else metadata
         stream_order = (
             None
             if self.topology in ("single-stream", "two-stream")
