@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Arrival-driven, single-owner backend for native async model clients."""
 
 import asyncio
@@ -460,6 +461,7 @@ class MultiModelBackend:
                     getattr(spec, "runner", "generate") == "generate",
                     spec.prefill_step_tokens
                     or (self.dense_step_tokens if spec.runner == "pooling" else 0),
+                    exclusive_execution=spec.exclusive_execution,
                 )
             )
         self.execution_stream_ids = {

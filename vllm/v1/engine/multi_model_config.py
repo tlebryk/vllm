@@ -38,6 +38,9 @@ class ModelSpec:
     flash_attn_version: int | None = None
     # None preserves upstream behavior; FA-only replication can skip FI tuning.
     enable_flashinfer_autotune: bool | None = None
+    # Dispatch this model only after other GPU tickets have completed. Other
+    # models keep their normal P/D overlap when this model is not executing.
+    exclusive_execution: bool = False
 
     def __post_init__(self) -> None:
         if not self.model_id or not self.model:
@@ -66,6 +69,10 @@ class ModelSpec:
             raise ValueError("pooling runner requires an embed/classify/score task")
         if self.runner == "generate" and self.pooling_task is not None:
             raise ValueError("generation runner cannot specify a pooling task")
+        if type(self.exclusive_execution) is not bool:
+            raise ValueError("exclusive_execution must be a boolean")
+        if self.exclusive_execution and self.runner != "pooling":
+            raise ValueError("exclusive_execution currently requires a pooling model")
         if self.runner == "pooling" and self.lane_staging:
             raise ValueError("lane_staging currently requires the generation runner")
         if not 0 <= self.prefill_reserve_fraction < 1:

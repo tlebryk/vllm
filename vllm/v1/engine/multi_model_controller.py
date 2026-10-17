@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Model-labelled round-robin control of shared prefill and decode lanes.
 
 All scheduler mutations and CPU model launches run on the calling thread.
@@ -24,6 +26,7 @@ class ModelEndpoint:
     async_decode: bool = False
     decode_enabled: bool = True
     prefill_step_tokens: int = 0
+    exclusive_execution: bool = False
 
     def __post_init__(self) -> None:
         if (
@@ -31,6 +34,8 @@ class ModelEndpoint:
             or min(self.prefill_reserve_blocks, self.prefill_step_tokens) < 0
         ):
             raise ValueError("invalid model ID or prefill KV reserve")
+        if self.exclusive_execution and self.decode_enabled:
+            raise ValueError("exclusive execution requires a pooling endpoint")
 
 
 @dataclass(frozen=True)
@@ -191,6 +196,7 @@ class MultiModelController:
         adaptive_dense_steps: bool = False,
     ) -> None:
         self.models = list(models)
+        self.has_exclusive_models = any(m.exclusive_execution for m in self.models)
         self.record_steps = record_steps
         self.step_observer = step_observer
         self._session = None
@@ -397,6 +403,7 @@ class MultiModelController:
                     "running_before": ticket.running_before,
                     "waiting_before": ticket.waiting_before,
                     "policy_phase": ticket.policy_phase,
+                    "exclusive_execution": model.exclusive_execution,
                     "kv_admission_policy": ticket.kv_admission_policy,
                     "smctrl_mask": ticket.smctrl_mask,
                     "kv_free_before": ticket.kv_free_before,
@@ -505,7 +512,9 @@ class MultiModelController:
                 if lane != "decode":
                     complete(ticket)
 
-        def choose(lane: str, *, bypass_watermark: bool = False):
+        def choose(
+            lane: str, *, bypass_watermark: bool = False, exclusive_only: bool = False
+        ):
             if bulk_tail is not None:
                 before = bulk_tail.phase
                 bulk_tail.update(
@@ -538,6 +547,8 @@ class MultiModelController:
                 indices.sort(key=lambda i: not self.models[i].decode_enabled)
             for index in indices:
                 model = self.models[index]
+                if model.exclusive_execution != exclusive_only:
+                    continue
                 if bulk_tail is not None and not bulk_tail.permits(model, lane):
                     continue
                 key = (model.model_id, lane)
@@ -599,7 +610,27 @@ class MultiModelController:
                     pending[lane] = deque(t for t in pending[lane] if t is not ready)
                     complete(ready)
                     progress = True
+            # Drain already-issued work before exclusive auxiliary execution.
+            # Stop decode launch-ahead while it waits, otherwise continuously
+            # ready decodes can starve embedding indefinitely. Completion is
+            # observed through existing futures; no device synchronization.
+            exclusive_pending = self.has_exclusive_models and any(
+                self.by_id[t.model_id].exclusive_execution
+                for fifo in pending.values()
+                for t in fifo
+            )
+            exclusive = (
+                None
+                if exclusive_pending or not self.has_exclusive_models
+                else choose("prefill", exclusive_only=True)
+            )
+            if exclusive is not None and not any(pending.values()):
+                dispatch(exclusive, "prefill")
+                progress = True
+                exclusive_pending = True
             for lane, capacity in (("decode", self.decode_depth), ("prefill", 1)):
+                if exclusive_pending or exclusive is not None:
+                    continue
                 if len(pending[lane]) >= capacity:
                     continue
                 if self.serialized and any(pending.values()):
@@ -639,10 +670,16 @@ class MultiModelController:
                 yield True
                 continue
             # With no active work, KV cannot recover without another prefill.
-            model = choose("prefill", bypass_watermark=True)
-            if model is not None:
+            idle_model = (
+                choose("prefill", bypass_watermark=True, exclusive_only=True)
+                if self.has_exclusive_models
+                else None
+            )
+            if idle_model is None:
+                idle_model = choose("prefill", bypass_watermark=True)
+            if idle_model is not None:
                 result.idle_watermark_bypasses += 1
-                dispatch(model, "prefill")
+                dispatch(idle_model, "prefill")
                 yield True
                 continue
             if reclamation_blocked or admission_blocked:
