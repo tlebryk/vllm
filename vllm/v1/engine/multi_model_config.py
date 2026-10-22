@@ -41,8 +41,12 @@ class ModelSpec:
     # Dispatch this model only after other GPU tickets have completed. Other
     # models keep their normal P/D overlap when this model is not executing.
     exclusive_execution: bool = False
+    # Opt-in session reuse, currently supported only with private KV pools.
+    enable_prefix_caching: bool = False
 
     def __post_init__(self) -> None:
+        if type(self.enable_prefix_caching) is not bool:
+            raise ValueError("enable_prefix_caching must be a boolean")
         if not self.model_id or not self.model:
             raise ValueError("each model needs an ID and checkpoint")
         if (
@@ -106,7 +110,7 @@ class ModelSpec:
             "dtype": self.dtype,
             "seed": 0,
             "trust_remote_code": self.trust_remote_code,
-            "enable_prefix_caching": False,
+            "enable_prefix_caching": self.enable_prefix_caching,
             "block_size": self.block_size,
             "gpu_memory_utilization": self.gpu_memory_utilization,
             "kv_cache_memory_bytes": self.kv_cache_memory_bytes,
@@ -168,7 +172,9 @@ class ModelSpec:
         return kwargs
 
 
-def load_specs(path: Path, n: int, warmup: int) -> list[ModelSpec]:
+def load_specs(
+    path: Path | list[ModelSpec] | tuple[ModelSpec, ...], n: int, warmup: int
+) -> list[ModelSpec]:
     specs = (
         list(path)
         if isinstance(path, (list, tuple))

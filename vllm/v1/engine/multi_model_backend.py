@@ -5,6 +5,7 @@
 import asyncio
 import json
 import logging
+import os
 import queue
 import threading
 from collections import deque
@@ -14,6 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from vllm import EngineArgs
+from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.engine.core_client import EngineCoreClient
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.engine.model_masks import ModelLaneMasks, ModelMaskPlan, library_provenance
@@ -27,6 +29,8 @@ logger = logging.getLogger(__name__)
 def prepare_models(path, *, mode, budget, decode_depth):
     """Validate model configurations before starting the CUDA owner thread."""
     specs = load_specs(path if isinstance(path, (list, tuple)) else Path(path), 0, 0)
+    if mode != "private" and any(s.enable_prefix_caching for s in specs):
+        raise ValueError("prefix caching currently requires private KV pools")
     if len(specs) == 1 and mode != "private":
         raise ValueError("single-model native serving requires private KV")
     if mode != "private" and any(
@@ -176,17 +180,21 @@ class MultiModelBackend:
         self.serial_index = 0
         self.serial_received = dict.fromkeys(self.model_order, 0)
         self.serial_completed = dict.fromkeys(self.model_order, 0)
-        self.parked = {mid: deque() for mid in self.model_order}
+        self.parked: dict[str, deque[Submission]] = {
+            mid: deque() for mid in self.model_order
+        }
         self.loop = asyncio.get_running_loop()
-        self.inputs = queue.Queue(maxsize=max_requests)
-        self.outputs = {s.model_id: queue.Queue(maxsize=output_capacity) for s in specs}
+        self.inputs: queue.Queue[Submission] = queue.Queue(maxsize=max_requests)
+        self.outputs: dict[str, queue.Queue[EngineCoreOutputs]] = {
+            s.model_id: queue.Queue(maxsize=output_capacity) for s in specs
+        }
         self.output_ready = {s.model_id: asyncio.Event() for s in specs}
         self.lock = threading.Lock()
         self.active = {}
         self.aborts = set()
         self.wakeup = threading.Event()
         self.stop = threading.Event()
-        self.ready = Future()
+        self.ready: Future[None] = Future()
         self.error = None
         self.cores = {}
         self.supported_tasks = {}
@@ -410,7 +418,7 @@ class MultiModelBackend:
 
                 core.dispatch = traced_dispatch
         endpoints, stream_order = self._bind_execution_streams()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         self.idle_free_blocks = {
             mid: core.scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
             for mid, core in self.cores.items()
@@ -430,6 +438,11 @@ class MultiModelBackend:
         )
 
     def _observe_step(self, record):
+        assert self.step_trace_file is not None
+        if os.environ.get("SLACKSERVE_PROFILE_WINDOW"):
+            from slackserve.profile_window import tick
+
+            tick()
         self.step_trace_file.write(json.dumps(record, separators=(",", ":")) + "\n")
 
     def _bind_execution_streams(self):
@@ -661,7 +674,7 @@ class MultiModelBackend:
                 if self.cores:
                     import torch
 
-                    torch.cuda.synchronize()
+                    torch.accelerator.synchronize()
                 if self.lane_masks is not None:
                     self.lane_masks.reset()
                 for core in self.cores.values():
