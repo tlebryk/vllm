@@ -37,7 +37,7 @@ DEFAULT_PROBE_TOKENS = 16384
 # Warmers decode at a context comparable to the served workload (long
 # prompts), so the measured dilation is that of attention-heavy decode steps.
 WARMER_PROMPT_TOKENS = 8192
-WARMER_OUTPUT_TOKENS = 1024
+WARMER_OUTPUT_TOKENS = 4096
 
 
 def normalize_candidates(raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -265,26 +265,19 @@ def run_calibration(
             for c in candidates
         ]
 
-        def measure(cand, result, n):
-            lane_masks.force_indices = None
-            warmers = [
-                submit(WARMER_PROMPT_TOKENS, WARMER_OUTPUT_TOKENS) for _ in range(n)
-            ]
-            driver.drive(lambda: driver.decode_ready() >= n, 120, f"warming n={n}")
-            t0 = time.perf_counter()
-            driver.drive(
-                lambda: len(driver.decode_periods(t0, time.perf_counter())) >= 12,
-                60,
-                f"timing decode alone n={n}",
-            )
-            alone = driver.decode_periods(t0, time.perf_counter())
+        def probe_cell(cand, result, n, alone_ms):
+            """One candidate against the warmers already decoding at size n."""
+            resident = driver.decode_ready()
+            if resident < n:
+                raise RuntimeError(
+                    f"calibration lost warmers before probing {cand['name']} "
+                    f"(n={n}, resident={resident}); raise WARMER_OUTPUT_TOKENS"
+                )
             lane_masks.force_indices = (
                 () if cand["indices"] is None else list(cand["indices"])
             )
             probe = submit(probe_tokens, 1)
-            driver.drive(
-                lambda: not driver.active(probe), 300, f"probing {cand['name']} n={n}"
-            )
+            wait_done(probe, f"probing {cand['name']} n={n}")
             lane_masks.force_indices = None
             tickets = [
                 r
@@ -299,7 +292,6 @@ def run_calibration(
             window_end = max(r["t_end"] for r in tickets)
             window_ms = (window_end - window_start) * 1000
             completions = driver.decode_completions(window_start, window_end)
-            alone_ms = statistics.median(alone)
             # Mean decode period inside the prefill window; zero completions
             # means decode was starved for the whole window.
             during_ms = window_ms / max(completions, 1)
@@ -323,6 +315,24 @@ def run_calibration(
                 alone_ms,
                 during_ms,
             )
+
+        def measure_size(n):
+            """Admit n warmers once, time decode alone once, probe every
+            candidate against the same warmers, then release them."""
+            lane_masks.force_indices = None
+            warmers = [
+                submit(WARMER_PROMPT_TOKENS, WARMER_OUTPUT_TOKENS) for _ in range(n)
+            ]
+            driver.drive(lambda: driver.decode_ready() >= n, 180, f"warming n={n}")
+            t0 = time.perf_counter()
+            driver.drive(
+                lambda: len(driver.decode_periods(t0, time.perf_counter())) >= 12,
+                60,
+                f"timing decode alone n={n}",
+            )
+            alone_ms = statistics.median(driver.decode_periods(t0, time.perf_counter()))
+            for cand, result in zip(candidates, results):
+                probe_cell(cand, result, n, alone_ms)
             backend.cancel(model_id, warmers)
             driver.drive(
                 lambda: (
@@ -344,8 +354,7 @@ def run_calibration(
             lane_masks.force_indices = None
             driver.records.clear()
         for n in decode_sizes:
-            for cand, result in zip(candidates, results):
-                measure(cand, result, n)
+            measure_size(n)
     finally:
         lane_masks.force_indices = None
         driver.close()
