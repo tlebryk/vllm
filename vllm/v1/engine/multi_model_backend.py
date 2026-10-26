@@ -540,6 +540,7 @@ class MultiModelBackend:
                 "mask calibration: saved %s (%.1f s)", path, table.data["elapsed_s"]
             )
         self.lane_masks.calibration = table
+        self.lane_masks.calibrated_model = model_id
         self.calibration_path = str(path)
         if isinstance(self.mask_metadata, dict):
             self.mask_metadata["calibration"] = table.summary()

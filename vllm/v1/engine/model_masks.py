@@ -110,6 +110,7 @@ class ModelLaneMasks:
         # the plan's index set and the tiers. ``force_indices`` ([] =
         # unrestricted) is set only by the calibration run itself.
         self.calibration = None
+        self.calibrated_model = None  # model whose prefill tickets the table governs
         self.force_indices = None
         self.state = {}
         if activation not in ("resident", "decode"):
@@ -239,6 +240,7 @@ class ModelLaneMasks:
                 self.calibration is not None
                 and selected_plan is not None
                 and selected_plan.model_id == self.plan.model_id
+                and model.model_id == (self.calibrated_model or model.model_id)
                 and not age_override
             ):
                 policy = "calibrated"
