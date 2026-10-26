@@ -194,14 +194,19 @@ class DecodeHeadroomGuard:
         )
         self.headroom = resident * max(1, growth_blocks)
 
-    def __call__(self, request) -> bool:
+    def _need(self, request) -> int:
         remaining = max(0, request.num_prompt_tokens - request.num_computed_tokens)
-        need = (
+        return (
             min(remaining, self.step_tokens) + self.block_size - 1
         ) // self.block_size
-        if self.free - need < self.headroom:
+
+    def can_admit(self, request) -> bool:
+        return self.free - self._need(request) >= self.headroom
+
+    def __call__(self, request) -> bool:
+        if not self.can_admit(request):
             return False
-        self.free -= need
+        self.free -= self._need(request)
         return True
 
 
@@ -649,8 +654,20 @@ class MultiModelController:
                     continue
                 key = (model.model_id, lane)
                 if key in admission_blocked:
-                    budget = SharedKVAdmissionBudget(self.models, model)
                     sched = model.core.scheduler
+                    if (
+                        getattr(
+                            sched.kv_cache_manager.block_pool, "shared_manager", None
+                        )
+                        is None
+                    ):
+                        budget = DecodeHeadroomGuard(
+                            sched,
+                            self._growth_blocks(sched.block_size),
+                            model.prefill_step_tokens,
+                        )
+                    else:
+                        budget = SharedKVAdmissionBudget(self.models, model)
                     inflight = set(sched._hb_inflight_req_ids)
                     inflight.update(getattr(sched, "_hb_async_decode_refs", ()))
                     request = next(
