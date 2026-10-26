@@ -57,6 +57,11 @@ async def build_multi_model_clients(args):
         smctrl_lib=args.slackserve_smctrl_lib,
         smctrl_min_decode_requests=args.slackserve_smctrl_min_decode_requests,
         hybrid_min_decode=args.slackserve_hybrid_min_decode,
+        mask_tiers=(
+            json.loads(args.slackserve_mask_tiers)
+            if args.slackserve_mask_tiers is not None
+            else None
+        ),
         dense_step_tokens=args.slackserve_dense_step_tokens,
         adaptive_dense_steps=args.slackserve_dense_adaptive_step,
         smctrl_indices=(

@@ -196,6 +196,11 @@ class BaseFrontendArgs:
     """libsmctrl shared library required by --slackserve-smctrl-mask."""
     slackserve_smctrl_indices: str | None = None
     """Optional JSON list of enabled physical TPC indices, replacing spread."""
+    slackserve_mask_tiers: str | None = None
+    """Optional JSON list of load tiers for the generation prefill mask:
+    [{"min_decode": N, "indices": [TPC...]}, ...]. While the mask is active,
+    the tier with the largest min_decode not above the decode load is applied.
+    """
     slackserve_smctrl_max_dense_wait_ms: float = 0
     """Restore full-GPU dense access once its oldest request reaches this age.
 

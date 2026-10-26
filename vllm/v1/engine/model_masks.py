@@ -49,6 +49,7 @@ class ModelLaneMasks:
         min_decode_requests=1,
         max_dense_wait_ms=0,
         clock=time.time,
+        tiers=None,
     ):
         self.plans = tuple(plan) if isinstance(plan, (tuple, list)) else (plan,)
         if not self.plans or len({p.model_id for p in self.plans}) != len(self.plans):
@@ -87,6 +88,21 @@ class ModelLaneMasks:
                     "explicit mask must contain the requested number of distinct TPCs"
                 )
         self.indices = self.indices_by_model[self.plan.model_id]
+        # Load-tiered masks for the primary plan: [{"min_decode": n, "indices":
+        # [...]}, ...]; at dispatch the tier with the largest min_decode that
+        # the partner decode load reaches replaces the plan's single index set.
+        self.tiers = []
+        for tier in tiers or ():
+            sel = [int(i) for i in tier["indices"]]
+            if (
+                int(tier["min_decode"]) < 0
+                or not sel
+                or len(set(sel)) != len(sel)
+                or any(i < 0 or i >= total_tpcs for i in sel)
+            ):
+                raise ValueError("mask tier needs a nonnegative min_decode and distinct TPC indices")
+            self.tiers.append({"min_decode": int(tier["min_decode"]), "indices": sel})
+        self.tiers.sort(key=lambda t: t["min_decode"])
         self.state = {}
         if activation not in ("resident", "decode"):
             raise ValueError("unknown mask activation policy")
@@ -193,6 +209,15 @@ class ModelLaneMasks:
                 if masked
                 else ()
             )
+            tier_min_decode = None
+            if masked and self.tiers and selected_plan.model_id == self.plan.model_id:
+                tier = next(
+                    (t for t in reversed(self.tiers) if decode_load >= t["min_decode"]),
+                    None,
+                )
+                if tier is not None:
+                    selected_indices = tier["indices"]
+                    tier_min_decode = tier["min_decode"]
             bits = sum(1 << i for i in selected_indices)
             mask = (~bits & ((1 << 128) - 1)) if masked else 0
             if self.state.get(stream.cuda_stream) != mask:
@@ -203,7 +228,10 @@ class ModelLaneMasks:
                 self.workers[model.model_id].model_runner.select_decode_mask(masked)
         return {
             "masked": masked,
-            "enabled_tpcs": selected_plan.tpcs if masked else self.total_tpcs,
+            "enabled_tpcs": (
+                len(selected_indices) if masked and self.tiers else selected_plan.tpcs
+            ) if masked else self.total_tpcs,
+            "tier_min_decode": locals().get("tier_min_decode"),
             "mask_model_id": selected_plan.model_id if masked else None,
             "partner_active": bool(partner_active),
             "activation": self.activation,

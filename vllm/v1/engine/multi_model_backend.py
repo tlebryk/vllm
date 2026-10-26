@@ -106,6 +106,7 @@ class MultiModelBackend:
         smctrl_max_dense_wait_ms=0,
         adaptive_dense_steps=False,
         hybrid_min_decode=0,
+        mask_tiers=None,
     ):
         if max_requests <= 0 or output_capacity <= decode_depth + 2:
             raise ValueError("invalid ingress/output capacity")
@@ -145,6 +146,7 @@ class MultiModelBackend:
         if hybrid_min_decode < 0:
             raise ValueError("hybrid minimum decode requests must be nonnegative")
         self.hybrid_min_decode = hybrid_min_decode
+        self.mask_tiers = mask_tiers
         self.smctrl_lib = Path(smctrl_lib).resolve() if smctrl_lib else None
         self.lane_masks = None
         self.mask_metadata = None
@@ -543,6 +545,7 @@ class MultiModelBackend:
                 activation="decode",
                 min_decode_requests=self.smctrl_min_decode_requests,
                 max_dense_wait_ms=self.smctrl_max_dense_wait_ms,
+                tiers=self.mask_tiers,
             )
             metadata = [
                 dict(
