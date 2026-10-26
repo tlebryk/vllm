@@ -105,6 +105,12 @@ class ModelLaneMasks:
                 )
             self.tiers.append({"min_decode": int(tier["min_decode"]), "indices": sel})
         self.tiers.sort(key=lambda t: t["min_decode"])
+        # Calibrated policy (mask_calibration.CalibrationTable): per prefill
+        # ticket, the candidate with the least estimated cost replaces both
+        # the plan's index set and the tiers. ``force_indices`` ([] =
+        # unrestricted) is set only by the calibration run itself.
+        self.calibration = None
+        self.force_indices = None
         self.state = {}
         if activation not in ("resident", "decode"):
             raise ValueError("unknown mask activation policy")
@@ -200,6 +206,10 @@ class ModelLaneMasks:
             and protect
             and not age_override
         )
+        policy = "gate"
+        candidate = None
+        estimated_tokens = None
+        cost_s = None
         if lane == self.plan.lane:
             stream = self.streams.get((model.model_id, lane), self.streams.get(lane))
             selected_indices = (
@@ -220,6 +230,24 @@ class ModelLaneMasks:
                 if tier is not None:
                     selected_indices = tier["indices"]
                     tier_min_decode = tier["min_decode"]
+            if self.force_indices is not None:
+                # Calibration run: measure exactly this candidate.
+                policy = "forced"
+                masked = bool(self.force_indices)
+                selected_indices = list(self.force_indices)
+            elif (
+                self.calibration is not None
+                and selected_plan is not None
+                and selected_plan.model_id == self.plan.model_id
+                and not age_override
+            ):
+                policy = "calibrated"
+                estimated_tokens = self._estimate_ticket_tokens(model)
+                candidate, indices, cost_s = self.calibration.choose(
+                    estimated_tokens, decode_load
+                )
+                masked = indices is not None
+                selected_indices = list(indices) if masked else ()
             if self.ctrl is None:
                 # Remote workers (TP>1) own the streams: the ticket carries the
                 # TPC set and each rank's worker applies it to its stream.
@@ -238,11 +266,17 @@ class ModelLaneMasks:
         return {
             "masked": masked,
             "enabled_tpcs": (
-                len(selected_indices) if masked and self.tiers else selected_plan.tpcs
+                len(selected_indices)
+                if masked and (self.tiers or policy != "gate")
+                else selected_plan.tpcs
             )
             if masked
             else self.total_tpcs,
             "tier_min_decode": locals().get("tier_min_decode"),
+            "policy": policy,
+            "candidate": candidate,
+            "estimated_tokens": estimated_tokens,
+            "cost_s": cost_s,
             "mask_model_id": selected_plan.model_id if masked else None,
             "partner_active": bool(partner_active),
             "activation": self.activation,
@@ -259,6 +293,25 @@ class ModelLaneMasks:
             ),
             "graph_bank": "masked" if masked and lane == "decode" else "unmasked",
         }
+
+    def _estimate_ticket_tokens(self, model) -> int:
+        """Prompt tokens the next prefill ticket will carry (budget-capped)."""
+        sched = model.core.scheduler
+        budget = getattr(sched, "_hb_step_token_budget", None) or getattr(
+            sched, "max_num_scheduled_tokens", 0
+        )
+        if not budget:
+            budget = 1 << 30
+        tokens = 0
+        for r in [*sched.running, *getattr(sched, "waiting", ())]:
+            remaining = getattr(r, "num_prompt_tokens", 0) - getattr(
+                r, "num_computed_tokens", 0
+            )
+            if remaining > 0:
+                tokens += remaining
+                if tokens >= budget:
+                    break
+        return int(min(budget, tokens)) if tokens else int(min(budget, 1 << 14))
 
     def reset(self):
         if self.ctrl is None:

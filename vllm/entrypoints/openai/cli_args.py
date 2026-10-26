@@ -201,6 +201,17 @@ class BaseFrontendArgs:
     [{"min_decode": N, "indices": [TPC...]}, ...]. While the mask is active,
     the tier with the largest min_decode not above the decode load is applied.
     """
+    slackserve_mask_candidates: str | None = None
+    """Optional JSON list of prefill-mask candidates for the calibrated policy:
+    [{"name": "spread48", "indices": [TPC...]}, {"name": "none", "indices": null}].
+    Defaults to the mask's own indices, every tier's indices, and unrestricted.
+    """
+    slackserve_mask_calibration: str = "off"
+    """Calibrated per-ticket mask policy: off, auto (reuse a cached table for
+    this deployment key, else measure at startup), or force (always measure).
+    """
+    slackserve_mask_calibration_dir: str | None = None
+    """Cache directory for calibration tables (default ~/.cache/slackserve)."""
     slackserve_smctrl_max_dense_wait_ms: float = 0
     """Restore full-GPU dense access once its oldest request reaches this age.
 

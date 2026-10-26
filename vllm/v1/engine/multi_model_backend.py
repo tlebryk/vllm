@@ -107,6 +107,9 @@ class MultiModelBackend:
         adaptive_dense_steps=False,
         hybrid_min_decode=0,
         mask_tiers=None,
+        mask_candidates=None,
+        mask_calibration="off",
+        mask_calibration_dir=None,
     ):
         if max_requests <= 0 or output_capacity <= decode_depth + 2:
             raise ValueError("invalid ingress/output capacity")
@@ -147,6 +150,21 @@ class MultiModelBackend:
             raise ValueError("hybrid minimum decode requests must be nonnegative")
         self.hybrid_min_decode = hybrid_min_decode
         self.mask_tiers = mask_tiers
+        if mask_calibration not in ("off", "auto", "force"):
+            raise ValueError("mask calibration must be off, auto or force")
+        if mask_calibration != "off" and smctrl_mask is None:
+            raise ValueError("mask calibration requires --slackserve-smctrl-mask")
+        self.mask_candidates = mask_candidates
+        self.mask_calibration = mask_calibration
+        self.mask_calibration_dir = (
+            Path(
+                mask_calibration_dir
+                or os.environ.get("SLACKSERVE_CACHE_DIR")
+                or Path.home() / ".cache" / "slackserve"
+            )
+            / "mask_calibration"
+        )
+        self.total_tpcs = None
         self.smctrl_lib = Path(smctrl_lib).resolve() if smctrl_lib else None
         self.lane_masks = None
         self.mask_metadata = None
@@ -454,6 +472,79 @@ class MultiModelBackend:
             else None,
         )
 
+    def _maybe_calibrate(self, controller):
+        """Load or measure the calibrated mask policy's table (see
+        mask_calibration.py); runs on the CUDA owner thread before ready."""
+        if self.mask_calibration == "off" or self.lane_masks is None:
+            return
+        import torch
+
+        from vllm.v1.engine.mask_calibration import (
+            CalibrationTable,
+            calibration_key,
+            normalize_candidates,
+            run_calibration,
+        )
+
+        model_id = self.mask_plan.model_id
+        if model_id == "*":
+            model_id = self.model_order[0]
+        spec = next(s for s in self.specs if s.model_id == model_id)
+        config = self.configs[self.model_order.index(model_id)]
+        raw = self.mask_candidates
+        if raw is None:
+            own = self.lane_masks.indices
+            raw = [{"name": f"tpc{len(own)}", "indices": own}]
+            raw += [
+                {"name": f"tier{t['min_decode']}", "indices": t["indices"]}
+                for t in self.lane_masks.tiers
+            ]
+            raw.append({"name": "none", "indices": None})
+        candidates = normalize_candidates(raw)
+        key = calibration_key(
+            {
+                "gpu": torch.cuda.get_device_properties(0).name,
+                "total_tpcs": self.total_tpcs,
+                "candidates": [c["indices"] for c in candidates],
+                "model": spec.model,
+                "revision": spec.revision,
+                "dtype": str(config.model_config.dtype),
+                "tp": config.parallel_config.tensor_parallel_size,
+                "block_size": spec.block_size,
+                "budget": spec.max_num_batched_tokens,
+                "prefill_step_tokens": spec.prefill_step_tokens,
+                "decode_depth": self.decode_depth,
+                "compile_decode": spec.compile_decode,
+                "prefill_custom_ops": spec.prefill_custom_ops,
+            }
+        )
+        path = self.mask_calibration_dir / f"{key}.json"
+        table = None
+        if self.mask_calibration == "auto" and path.is_file():
+            try:
+                table = CalibrationTable.load(path)
+                logger.info("mask calibration: loaded %s", path)
+            except (OSError, ValueError, KeyError) as exc:
+                logger.warning("mask calibration: ignoring %s (%s)", path, exc)
+        if table is None:
+            logger.info(
+                "mask calibration: measuring %d candidates (%s)",
+                len(candidates),
+                ", ".join(c["name"] for c in candidates),
+            )
+            table = run_calibration(
+                self, controller, self.lane_masks, model_id, candidates, key=key
+            )
+            table.save(path)
+            logger.info(
+                "mask calibration: saved %s (%.1f s)", path, table.data["elapsed_s"]
+            )
+        self.lane_masks.calibration = table
+        self.calibration_path = str(path)
+        if isinstance(self.mask_metadata, dict):
+            self.mask_metadata["calibration"] = table.summary()
+            self.mask_metadata["calibration_path"] = str(path)
+
     def _observe_step(self, record):
         assert self.step_trace_file is not None
         if os.environ.get("SLACKSERVE_PROFILE_WINDOW"):
@@ -527,6 +618,7 @@ class MultiModelBackend:
             from vllm.v1.worker.hb_smctrl import SmCtrl, spread_indices
 
             total = torch.cuda.get_device_properties(0).multi_processor_count // 2
+            self.total_tpcs = total
             if any(not 0 < plan.tpcs < total for plan in self.mask_plans):
                 raise ValueError("mask TPC count must be below full GPU")
             # Prefill is eager; decode's captured placement is left intact.
@@ -621,6 +713,7 @@ class MultiModelBackend:
                 self.step_trace.parent.mkdir(parents=True, exist_ok=True)
                 self.step_trace_file = self.step_trace.open("w", buffering=131072)
             controller = self._initialize()
+            self._maybe_calibrate(controller)
             self.ready.set_result(None)
             observed = set()
             while True:

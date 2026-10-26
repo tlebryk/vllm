@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Native AsyncLLM/OpenAI integration for model-owned lane execution."""
 
 import json
@@ -62,6 +63,13 @@ async def build_multi_model_clients(args):
             if args.slackserve_mask_tiers is not None
             else None
         ),
+        mask_candidates=(
+            json.loads(args.slackserve_mask_candidates)
+            if args.slackserve_mask_candidates is not None
+            else None
+        ),
+        mask_calibration=args.slackserve_mask_calibration,
+        mask_calibration_dir=args.slackserve_mask_calibration_dir,
         dense_step_tokens=args.slackserve_dense_step_tokens,
         adaptive_dense_steps=args.slackserve_dense_adaptive_step,
         smctrl_indices=(
