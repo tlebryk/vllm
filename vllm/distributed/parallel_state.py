@@ -132,6 +132,12 @@ def all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
     group = _groups[group_name]()
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
+    # Compiled graphs bake in the TP group name; a thread running the same
+    # compiled model on a SlackServe prefill stream redirects TP all-reduces
+    # to its own communicator via the per-thread override.
+    override = getattr(_TP_OVERRIDE, "group", None)
+    if override is not None and _TP is not None and group_name == _TP.unique_name:
+        group = override
     return group._all_reduce_out_place(tensor)
 
 
@@ -1214,9 +1220,17 @@ def _replace_active_groups(
 
 
 _TP: GroupCoordinator | None = None
+# Per-thread override so a SlackServe lane thread can run the same model with
+# its own TP communicator while the main thread keeps the default group.
+import threading as _threading
+
+_TP_OVERRIDE = _threading.local()
 
 
 def get_tp_group() -> GroupCoordinator:
+    override = getattr(_TP_OVERRIDE, "group", None)
+    if override is not None:
+        return override
     assert _TP is not None, "tensor model parallel group is not initialized"
     return _TP
 

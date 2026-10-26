@@ -244,20 +244,29 @@ class ForwardContext:
         )
 
 
-_forward_context: ForwardContext | None = None
+# Thread-local so a SlackServe lane may launch a forward from its own thread
+# while the worker's main thread launches another (each sees only its own).
+import threading as _threading
+
+_forward_context_tls = _threading.local()
+
+
+def _get_tls_forward_context() -> "ForwardContext | None":
+    return getattr(_forward_context_tls, "ctx", None)
 
 
 def get_forward_context() -> ForwardContext:
     """Get the current forward context."""
-    assert _forward_context is not None, (
+    ctx = _get_tls_forward_context()
+    assert ctx is not None, (
         "Forward context is not set. "
         "Please use `set_forward_context` to set the forward context."
     )
-    return _forward_context
+    return ctx
 
 
 def is_forward_context_available() -> bool:
-    return _forward_context is not None
+    return _get_tls_forward_context() is not None
 
 
 def create_forward_context(
@@ -296,13 +305,12 @@ def override_forward_context(forward_context: ForwardContext | None):
     This is used to override the forward context for a specific
     forward pass.
     """
-    global _forward_context
-    prev_context = _forward_context
-    _forward_context = forward_context
+    prev_context = _get_tls_forward_context()
+    _forward_context_tls.ctx = forward_context
     try:
         yield
     finally:
-        _forward_context = prev_context
+        _forward_context_tls.ctx = prev_context
 
 
 @contextmanager
