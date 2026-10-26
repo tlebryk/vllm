@@ -32,9 +32,11 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_DECODE_SIZES = (8, 32)
+DEFAULT_DECODE_SIZES = (2, 8, 32)
 DEFAULT_PROBE_TOKENS = 16384
-WARMER_PROMPT_TOKENS = 1024
+# Warmers decode at a context comparable to the served workload (long
+# prompts), so the measured dilation is that of attention-heavy decode steps.
+WARMER_PROMPT_TOKENS = 8192
 WARMER_OUTPUT_TOKENS = 1024
 
 
@@ -254,6 +256,9 @@ def run_calibration(
         backend.submit(model_id, _make_request(rid, prompt(prompt_tokens), max_tokens))
         return rid
 
+    def wait_done(rid: str, what: str) -> None:
+        driver.drive(lambda: not driver.active(rid), 300, what)
+
     try:
         results = [
             {"name": c["name"], "indices": c["indices"], "cells": []}
@@ -335,8 +340,7 @@ def run_calibration(
             lane_masks.force_indices = (
                 () if cand["indices"] is None else list(cand["indices"])
             )
-            warm = submit(probe_tokens, 1)
-            driver.drive(lambda: not driver.active(warm), 300, "warming up")
+            wait_done(submit(probe_tokens, 1), "warming up")
             lane_masks.force_indices = None
             driver.records.clear()
         for n in decode_sizes:
