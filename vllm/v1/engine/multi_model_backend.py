@@ -488,7 +488,11 @@ class MultiModelBackend:
 
         model_id = self.mask_plan.model_id
         if model_id == "*":
-            model_id = self.model_order[0]
+            # All-model plan: calibrate the generation model's prefill stream.
+            model_id = next(
+                (s.model_id for s in self.specs if s.runner == "generate"),
+                self.model_order[0],
+            )
         spec = next(s for s in self.specs if s.model_id == model_id)
         config = self.configs[self.model_order.index(model_id)]
         raw = self.mask_candidates
