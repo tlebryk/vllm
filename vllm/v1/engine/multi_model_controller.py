@@ -9,6 +9,7 @@ lane contexts protect its buffers; each model has a distinct runner/KV cache.
 
 from __future__ import annotations
 
+import math
 import time
 from collections import deque
 from collections.abc import Callable, Sequence
@@ -170,6 +171,40 @@ class SharedKVAdmissionBudget:
         return True
 
 
+class DecodeHeadroomGuard:
+    """Private-KV prefill admission that leaves room for decode to grow.
+
+    The prefill lane admits waiting requests on its own ticket, so without a
+    guard it can take the last free blocks and the next decode ticket preempts
+    a resident request (whose prompt is then recomputed). Admission keeps
+    ``growth_blocks`` free blocks per decode-ready request: the growth those
+    requests need while one prefill ticket runs, measured at run time from the
+    controller's prefill-ticket and decode-step durations.
+    """
+
+    name = "headroom"
+
+    def __init__(self, sched, growth_blocks: int, step_tokens: int | None):
+        pool = sched.kv_cache_manager.block_pool
+        self.free = pool.get_num_free_blocks()
+        self.block_size = sched.block_size
+        self.step_tokens = step_tokens or sched.max_num_scheduled_tokens
+        resident = sum(
+            1 for r in sched.running if r.num_computed_tokens >= r.num_prompt_tokens
+        )
+        self.headroom = resident * max(1, growth_blocks)
+
+    def __call__(self, request) -> bool:
+        remaining = max(0, request.num_prompt_tokens - request.num_computed_tokens)
+        need = (
+            min(remaining, self.step_tokens) + self.block_size - 1
+        ) // self.block_size
+        if self.free - need < self.headroom:
+            return False
+        self.free -= need
+        return True
+
+
 class MultiModelController:
     """One shared prefill ticket and a bounded set of decode tickets.
 
@@ -206,6 +241,12 @@ class MultiModelController:
         self.hybrid_min_decode = hybrid_min_decode
         self.hybrid_hysteresis = max(1, hybrid_min_decode // 4)
         self._stock_mode = False
+        # Run-time timing for the decode-headroom admission guard: EMA of the
+        # prefill ticket duration and of the decode step period (completion
+        # to completion, so launch-ahead queueing does not inflate it).
+        self._prefill_ticket_ms: float | None = None
+        self._decode_step_ms: float | None = None
+        self._last_decode_done: float | None = None
         self.has_exclusive_models = any(m.exclusive_execution for m in self.models)
         self.record_steps = record_steps
         self.step_observer = step_observer
@@ -313,6 +354,32 @@ class MultiModelController:
         for state in getattr(self, "_eligibility", ()):
             state.clear()
 
+    def _observe_timing(self, lane: str, dispatched_at: float) -> None:
+        now = time.perf_counter()
+        if lane == "decode":
+            if self._last_decode_done is not None:
+                period = (now - self._last_decode_done) * 1000
+                self._decode_step_ms = (
+                    period
+                    if self._decode_step_ms is None
+                    else 0.9 * self._decode_step_ms + 0.1 * period
+                )
+            self._last_decode_done = now
+        elif lane == "prefill":
+            elapsed = (now - dispatched_at) * 1000
+            self._prefill_ticket_ms = (
+                elapsed
+                if self._prefill_ticket_ms is None
+                else 0.8 * self._prefill_ticket_ms + 0.2 * elapsed
+            )
+
+    def _growth_blocks(self, block_size: int) -> int:
+        """Blocks one decoding request grows by during one prefill ticket."""
+        if not self._prefill_ticket_ms or not self._decode_step_ms:
+            return 1
+        steps = self._prefill_ticket_ms / self._decode_step_ms
+        return max(1, math.ceil(steps / block_size))
+
     def has_work(self) -> bool:
         if any(self._pending.values()):
             return True
@@ -398,6 +465,8 @@ class MultiModelController:
             outputs = core.complete(ticket.step, output)
             scheduled = ticket.step.scheduler_output
             productive = scheduled.total_num_scheduled_tokens > 0
+            if productive:
+                self._observe_timing(ticket.lane, ticket.dispatched_at)
             core.post_step(model_executed=productive)
             model.publish(outputs)
             if self.record_steps or self.step_observer is not None:
@@ -457,6 +526,18 @@ class MultiModelController:
                 )
                 else None
             )
+            if (
+                guard is None
+                and lane == "prefill"
+                and model.decode_enabled
+                and getattr(sched.kv_cache_manager.block_pool, "shared_manager", None)
+                is None
+            ):
+                guard = DecodeHeadroomGuard(
+                    sched,
+                    self._growth_blocks(sched.block_size),
+                    model.prefill_step_tokens,
+                )
             previous_guard = getattr(sched, "_hb_kv_admission_guard", None)
             previous_budget = getattr(sched, "_hb_step_token_budget", None)
             sched._hb_kv_admission_guard = guard
@@ -500,7 +581,9 @@ class MultiModelController:
                 running,
                 waiting,
                 bulk_tail.phase if bulk_tail is not None else "round-robin",
-                "full-output" if guard is not None else "current",
+                getattr(guard, "name", "full-output")
+                if guard is not None
+                else "current",
                 mask_record,
             )
             if lane == "decode":
@@ -657,7 +740,10 @@ class MultiModelController:
                         r.num_computed_tokens >= r.num_prompt_tokens
                         for r in sched.running
                     )
-                    enter, leave = self.hybrid_min_decode, self.hybrid_min_decode + self.hybrid_hysteresis
+                    enter, leave = (
+                        self.hybrid_min_decode,
+                        self.hybrid_min_decode + self.hybrid_hysteresis,
+                    )
                     if self._stock_mode and ready >= leave:
                         self._stock_mode = False
                     elif not self._stock_mode and ready < enter:
@@ -674,7 +760,12 @@ class MultiModelController:
                             hybrid_inflight = True
                     break
             for lane, capacity in (("decode", self.decode_depth), ("prefill", 1)):
-                if exclusive_pending or exclusive is not None or hybrid_inflight or stock_mode:
+                if (
+                    exclusive_pending
+                    or exclusive is not None
+                    or hybrid_inflight
+                    or stock_mode
+                ):
                     continue
                 if len(pending[lane]) >= capacity:
                     continue
