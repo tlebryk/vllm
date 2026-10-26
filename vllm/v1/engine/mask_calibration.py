@@ -178,6 +178,15 @@ class _Driver:
         with self.backend.lock:
             return (self.model_id, request_id) in self.backend.active
 
+    def decode_completions(self, t0: float, t1: float) -> int:
+        return sum(
+            1
+            for r in self.records
+            if r["lane"] == "decode"
+            and r["scheduled_tokens"]
+            and t0 <= r["t_end"] <= t1
+        )
+
     def decode_periods(self, t0: float, t1: float) -> list[float]:
         ends = sorted(
             r["t_end"]
@@ -281,11 +290,14 @@ def run_calibration(
                 raise RuntimeError("calibration probe produced no prefill ticket")
             tokens = sum(r["num_scheduled_tokens"][probe] for r in tickets)
             seconds = sum(r["t_end"] - r["t_start"] for r in tickets)
-            during = driver.decode_periods(
-                min(r["t_start"] for r in tickets), max(r["t_end"] for r in tickets)
-            )
+            window_start = min(r["t_start"] for r in tickets)
+            window_end = max(r["t_end"] for r in tickets)
+            window_ms = (window_end - window_start) * 1000
+            completions = driver.decode_completions(window_start, window_end)
             alone_ms = statistics.median(alone)
-            during_ms = statistics.median(during) if len(during) >= 3 else alone_ms
+            # Mean decode period inside the prefill window; zero completions
+            # means decode was starved for the whole window.
+            during_ms = window_ms / max(completions, 1)
             result["cells"].append(
                 {
                     "n": n,
@@ -293,7 +305,8 @@ def run_calibration(
                     "prefill_tickets": len(tickets),
                     "decode_alone_ms": alone_ms,
                     "decode_during_ms": during_ms,
-                    "decode_samples": len(during),
+                    "decode_samples": completions,
+                    "window_ms": window_ms,
                     "dilation": max(0.0, during_ms / alone_ms - 1.0),
                 }
             )
@@ -316,6 +329,16 @@ def run_calibration(
             )
             driver.records.clear()
 
+        for cand in candidates:
+            # Warm-up: the first forward under each candidate pays one-time
+            # allocations/lazy init that must not be charged to a cell.
+            lane_masks.force_indices = (
+                () if cand["indices"] is None else list(cand["indices"])
+            )
+            warm = submit(probe_tokens, 1)
+            driver.drive(lambda: not driver.active(warm), 300, "warming up")
+            lane_masks.force_indices = None
+            driver.records.clear()
         for n in decode_sizes:
             for cand, result in zip(candidates, results):
                 measure(cand, result, n)
