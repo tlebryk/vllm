@@ -646,6 +646,10 @@ class MultiModelController:
                 # Pooling fills dense-stream slack only when generation
                 # prefill cannot dispatch (including KV watermark blocking).
                 indices.sort(key=lambda i: not self.models[i].decode_enabled)
+                if self.lane_masks is not None and hasattr(
+                    self.lane_masks, "prefill_priority_indices"
+                ):
+                    indices = self.lane_masks.prefill_priority_indices(indices)
             for index in indices:
                 model = self.models[index]
                 if model.exclusive_execution != exclusive_only:

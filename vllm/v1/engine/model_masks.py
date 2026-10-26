@@ -279,6 +279,7 @@ class ModelLaneMasks:
             "candidate": candidate,
             "estimated_tokens": estimated_tokens,
             "waiting_behind": locals().get("waiting_behind"),
+            "shared_prefill_age_guard": getattr(self, "shared_prefill_age_guard", None),
             "cost_s": cost_s,
             "mask_model_id": selected_plan.model_id if masked else None,
             "partner_active": bool(partner_active),
@@ -297,31 +298,111 @@ class ModelLaneMasks:
             "graph_bank": "masked" if masked and lane == "decode" else "unmasked",
         }
 
-    def _estimate_ticket(self, model) -> tuple[int, int]:
-        """(prompt tokens the next prefill ticket will carry, budget-capped;
-        requests left waiting behind it on the prefill stream)."""
+    @staticmethod
+    def _pending_prefills(model):
         sched = model.core.scheduler
-        budget = getattr(sched, "_hb_step_token_budget", None) or getattr(
-            sched, "max_num_scheduled_tokens", 0
+        inflight = set(getattr(sched, "_hb_inflight_req_ids", ()))
+        # A request can occur in more than one scheduler collection. Completed
+        # prompts and already dispatched requests cannot wait behind this ticket.
+        pending = {}
+        for r in [
+            *sched.running,
+            *getattr(sched, "waiting", ()),
+            *getattr(sched, "skipped_waiting", ()),
+        ]:
+            rid = getattr(r, "request_id", id(r))
+            if rid not in inflight and (
+                getattr(r, "num_prompt_tokens", 0)
+                > getattr(r, "num_computed_tokens", 0)
+            ):
+                pending[rid] = r
+        return list(pending.values())
+
+    def _shares_prefill(self, first, second):
+        a = self.streams.get((first.model_id, "prefill"), self.streams.get("prefill"))
+        b = self.streams.get((second.model_id, "prefill"), self.streams.get("prefill"))
+        # Remote workers use one broadcast prefill stream per rank.
+        return a is b or (
+            a is not None and b is not None and a.cuda_stream == b.cuda_stream
         )
-        if not budget:
-            budget = 1 << 30
+
+    def _estimate_ticket(self, model) -> tuple[int, int]:
+        """Budget-capped tokens; all requests delayed on the same CUDA stream."""
+        sched = model.core.scheduler
+        budget = (
+            getattr(sched, "_hb_step_token_budget", None)
+            or getattr(sched, "max_num_scheduled_tokens", 0)
+            or (1 << 30)
+        )
+        pending = self._pending_prefills(model)
         tokens = 0
-        pending = [
-            r
-            for r in [*sched.running, *getattr(sched, "waiting", ())]
-            if getattr(r, "num_prompt_tokens", 0) - getattr(r, "num_computed_tokens", 0)
-            > 0
-        ]
-        included = 0
+        remaining = 0
         for r in pending:
-            if tokens >= budget:
-                break
-            tokens += r.num_prompt_tokens - r.num_computed_tokens
-            included += 1
-        waiting_behind = max(0, len(pending) - included)
-        estimate = int(min(budget, tokens)) if tokens else int(min(budget, 1 << 14))
-        return estimate, waiting_behind
+            work = r.num_prompt_tokens - r.num_computed_tokens
+            admitted = min(work, max(0, budget - tokens))
+            tokens += admitted
+            # A partially served prompt still waits behind this chunk.
+            remaining += int(admitted < work)
+        remaining += sum(
+            len(self._pending_prefills(other))
+            for other in self.models
+            if other.model_id != model.model_id and self._shares_prefill(model, other)
+        )
+        return int(tokens or min(budget, 1 << 14)), remaining
+
+    def prefill_priority_indices(self, indices):
+        """Bound partner waiting by one predicted generator-prefill service time.
+
+        This is dispatch fairness, separate from mask cost. Existing generation
+        priority is retained until a partner has waited that measured duration;
+        ready/KV checks still belong to the controller. No fixed age threshold.
+        """
+        self.shared_prefill_age_guard = None
+        if self.calibration is None or self.force_indices is not None:
+            return indices
+        primary = next(
+            (
+                m
+                for m in self.models
+                if m.model_id == (self.calibrated_model or self.plan.model_id)
+            ),
+            None,
+        )
+        if primary is None:
+            return indices
+        tokens, waiting = self._estimate_ticket(primary)
+        n = sum(
+            getattr(r, "num_computed_tokens", 0) >= getattr(r, "num_prompt_tokens", 1)
+            for m in self.models
+            if getattr(m, "decode_enabled", True)
+            for r in m.core.scheduler.running
+        )
+        candidate, _, _ = self.calibration.choose(tokens, n, waiting)
+        duration = self.calibration.duration(candidate, tokens, n)
+        now = self.clock()
+        urgent = {}
+        for i in indices:
+            other = self.models[i]
+            if other is primary or not self._shares_prefill(primary, other):
+                continue
+            age = max(
+                (
+                    max(0, now - getattr(r, "arrival_time", now))
+                    for r in self._pending_prefills(other)
+                ),
+                default=0,
+            )
+            if age >= duration:
+                urgent[i] = age
+        if urgent:
+            self.shared_prefill_age_guard = {
+                "threshold_s": duration,
+                "candidate": candidate,
+                "ages_s": {self.models[i].model_id: age for i, age in urgent.items()},
+                "rule": "partner age >= predicted next generator prefill duration",
+            }
+            return sorted(indices, key=lambda i: (i not in urgent, -urgent.get(i, 0)))
+        return indices
 
     def reset(self):
         if self.ctrl is None:

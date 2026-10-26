@@ -116,6 +116,11 @@ class CalibrationTable:
         duration = tokens / rate
         return duration * (1.0 + waiting + n * dilation)
 
+    def duration(self, name: str, tokens: int, n: int) -> float:
+        """Measured service time, without queue or decode-delay weighting."""
+        cand = self.by_name[name]
+        return tokens / max(1.0, _interp(cand["n"], cand["rate"], n))
+
     def choose(
         self, tokens: int, n: int, waiting: int = 0
     ) -> tuple[str, list[int] | None, float]:
