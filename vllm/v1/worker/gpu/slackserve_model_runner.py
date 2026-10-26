@@ -46,14 +46,13 @@ class SlackServeModelRunner(GPUModelRunner):
             or self.speculative_config is not None
             or self.supports_mm_inputs
             or self.use_pp
-            or self.parallel_config.tensor_parallel_size != 1
             or self.dp_size != 1
             or self.use_dcp
             or self.use_async_scheduling
         )
         if unsupported:
             raise ValueError(
-                "SlackServeModelRunner requires TP=1 text generation without "
+                "SlackServeModelRunner requires text generation without "
                 "LoRA, speculative decoding, MM, PP/DP/DCP, or async scheduling"
             )
         # HB_P2_COMPILE_DECODE=1 opts the DECODE lane into vLLM's inductor

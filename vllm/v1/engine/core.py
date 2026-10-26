@@ -481,6 +481,10 @@ class EngineCore:
             )
         scheduler_output = self.scheduler.schedule(lane=lane)
         scheduler_output.execution_lane = lane
+        if lane not in ("decode", "default"):
+            scheduler_output.execution_mask = getattr(
+                self.scheduler, "_hb_lane_mask", None
+            )
         request_ids = set(scheduler_output.num_scheduled_tokens)
         if async_decode and request_ids:
             self.scheduler.mark_hb_async_decode(request_ids)

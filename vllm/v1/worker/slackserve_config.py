@@ -27,6 +27,8 @@ class SlackServeConfig:
     legacy_env_masks: bool = False
     embed_sidecar: bool = False
     dense_lock: bool = True
+    # libsmctrl path for workers that apply ticket masks themselves (TP>1).
+    smctrl_lib: str = ""
 
     def __post_init__(self) -> None:
         if not self.model_id:

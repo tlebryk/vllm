@@ -43,6 +43,7 @@ class ModelSpec:
     exclusive_execution: bool = False
     # Opt-in session reuse, currently supported only with private KV pools.
     enable_prefix_caching: bool = False
+    tensor_parallel_size: int = 1
 
     def __post_init__(self) -> None:
         if type(self.enable_prefix_caching) is not bool:
@@ -81,6 +82,8 @@ class ModelSpec:
             raise ValueError("lane_staging currently requires the generation runner")
         if not 0 <= self.prefill_reserve_fraction < 1:
             raise ValueError("prefill reserve fraction must be in [0, 1)")
+        if type(self.tensor_parallel_size) is not int or self.tensor_parallel_size < 1:
+            raise ValueError("tensor_parallel_size must be a positive integer")
         if not 0 < self.gpu_memory_utilization <= 1:
             raise ValueError("GPU memory utilization must be in (0, 1]")
         if min(self.prefill_reserve_blocks, self.prefill_sm_target) < 0:
@@ -119,6 +122,10 @@ class ModelSpec:
             "max_num_batched_tokens": self.max_num_batched_tokens,
             "async_scheduling": False,
             "enforce_eager": eager,
+            "tensor_parallel_size": self.tensor_parallel_size,
+            "distributed_executor_backend": (
+                "mp" if self.tensor_parallel_size > 1 else None
+            ),
             "worker_cls": (
                 "vllm.v1.worker.slackserve_pooling_worker.SlackServePoolingWorker"
                 if pooling

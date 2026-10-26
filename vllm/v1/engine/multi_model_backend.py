@@ -209,6 +209,7 @@ class MultiModelBackend:
         self.last_engine_state = None
         self.idle_free_blocks = {}
         self.execution_stream_ids = None
+        self.distributed = False
         self.step_trace = Path(step_trace) if step_trace is not None else None
         self.step_trace_file = None
         self.thread = threading.Thread(
@@ -384,7 +385,15 @@ class MultiModelBackend:
                 for s, c in zip(self.specs, self.configs)
             ]
             self.manager = SharedKVManager(layouts, self.budget, self.mode)
+        # TP>1: each core's workers run in their own processes (mp executor).
+        # The controller cannot share CUDA streams with them, so lane streams,
+        # the prefill TP communicator and ticket masks live in the worker.
+        self.distributed = any(c.parallel_config.world_size > 1 for c in self.configs)
         for spec, config in zip(self.specs, self.configs):
+            if self.distributed and self.smctrl_lib is not None:
+                config.additional_config["slackserve"]["smctrl_lib"] = str(
+                    self.smctrl_lib
+                )
             if self.manager is not None:
                 config.additional_config["shared_kv"] = {
                     "pool_id": self.manager.pool_id,
@@ -424,7 +433,8 @@ class MultiModelBackend:
 
                 core.dispatch = traced_dispatch
         endpoints, stream_order = self._bind_execution_streams()
-        torch.accelerator.synchronize()
+        if not self.distributed:
+            torch.accelerator.synchronize()
         self.idle_free_blocks = {
             mid: core.scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
             for mid, core in self.cores.items()
@@ -456,22 +466,33 @@ class MultiModelBackend:
         import torch
 
         serial = self.topology == "single-stream"
-        prefill = torch.cuda.Stream()
-        shared_decode = prefill if serial else torch.cuda.Stream()
-        streams = {
-            s.model_id: shared_decode
-            if self.topology in ("single-stream", "two-stream")
-            else torch.cuda.Stream()
-            for s in self.specs
-        }
+        if self.distributed:
+            if serial or len(self.specs) != 1:
+                raise ValueError(
+                    "TP>1 native serving supports one model on separate streams"
+                )
+            prefill = None
+            streams = {}
+        else:
+            prefill = torch.cuda.Stream()
+            shared_decode = prefill if serial else torch.cuda.Stream()
+            streams = {
+                s.model_id: shared_decode
+                if self.topology in ("single-stream", "two-stream")
+                else torch.cuda.Stream()
+                for s in self.specs
+            }
         endpoints = []
         workers = {}
         for spec in self.specs:
             core = self.cores[spec.model_id]
-            wrapped = core.model_executor.driver_worker
-            worker = getattr(wrapped, "worker", wrapped)
-            workers[spec.model_id] = worker
-            worker.bind_lane_streams(prefill, streams[spec.model_id], serial=serial)
+            if self.distributed:
+                workers[spec.model_id] = None
+            else:
+                wrapped = core.model_executor.driver_worker
+                worker = getattr(wrapped, "worker", wrapped)
+                workers[spec.model_id] = worker
+                worker.bind_lane_streams(prefill, streams[spec.model_id], serial=serial)
             endpoints.append(
                 ModelEndpoint(
                     spec.model_id,
@@ -494,10 +515,14 @@ class MultiModelBackend:
                     exclusive_execution=spec.exclusive_execution,
                 )
             )
-        self.execution_stream_ids = {
-            "prefill": prefill.cuda_stream,
-            "decode": {mid: stream.cuda_stream for mid, stream in streams.items()},
-        }
+        self.execution_stream_ids = (
+            None
+            if self.distributed
+            else {
+                "prefill": prefill.cuda_stream,
+                "decode": {mid: stream.cuda_stream for mid, stream in streams.items()},
+            }
+        )
         if self.mask_plan is not None:
             from vllm.v1.worker.hb_smctrl import SmCtrl, spread_indices
 
@@ -505,7 +530,9 @@ class MultiModelBackend:
             if any(not 0 < plan.tpcs < total for plan in self.mask_plans):
                 raise ValueError("mask TPC count must be below full GPU")
             # Prefill is eager; decode's captured placement is left intact.
-            if not all(w.model_runner.decode_graphs_only for w in workers.values()):
+            if not self.distributed and not all(
+                w.model_runner.decode_graphs_only for w in workers.values()
+            ):
                 raise ValueError("prefill stream masking requires eager prefill")
             if isinstance(self.smctrl_indices, dict):
                 if set(self.smctrl_indices) != {
@@ -536,9 +563,9 @@ class MultiModelBackend:
                 self.mask_plans if len(self.mask_plans) > 1 else self.mask_plan,
                 endpoints,
                 workers,
-                {"prefill": prefill},
+                {} if self.distributed else {"prefill": prefill},
                 total,
-                SmCtrl(str(self.smctrl_lib)),
+                None if self.distributed else SmCtrl(str(self.smctrl_lib)),
                 indices_by_model
                 if len(self.mask_plans) > 1
                 else indices_by_model[self.mask_plan.model_id],
@@ -571,7 +598,7 @@ class MultiModelBackend:
             self.mask_metadata = metadata[0] if len(metadata) == 1 else metadata
         stream_order = (
             None
-            if self.topology in ("single-stream", "two-stream")
+            if self.topology in ("single-stream", "two-stream") or self.distributed
             else ModelDecodeStreams(
                 streams,
                 torch.cuda.Event,
@@ -679,7 +706,7 @@ class MultiModelBackend:
             for mid in self.outputs:
                 self._notify_outputs(mid)
             try:
-                if self.cores:
+                if self.cores and not getattr(self, "distributed", False):
                     import torch
 
                     torch.accelerator.synchronize()

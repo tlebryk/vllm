@@ -100,7 +100,9 @@ class ModelLaneMasks:
                 or len(set(sel)) != len(sel)
                 or any(i < 0 or i >= total_tpcs for i in sel)
             ):
-                raise ValueError("mask tier needs a nonnegative min_decode and distinct TPC indices")
+                raise ValueError(
+                    "mask tier needs a nonnegative min_decode and distinct TPC indices"
+                )
             self.tiers.append({"min_decode": int(tier["min_decode"]), "indices": sel})
         self.tiers.sort(key=lambda t: t["min_decode"])
         self.state = {}
@@ -218,19 +220,28 @@ class ModelLaneMasks:
                 if tier is not None:
                     selected_indices = tier["indices"]
                     tier_min_decode = tier["min_decode"]
-            bits = sum(1 << i for i in selected_indices)
-            mask = (~bits & ((1 << 128) - 1)) if masked else 0
-            if self.state.get(stream.cuda_stream) != mask:
-                # Zero means completely unrestricted, including the upper TPCs.
-                self.ctrl._set_mask(stream, mask, "model-owned mask", log=False)
-                self.state[stream.cuda_stream] = mask
+            if self.ctrl is None:
+                # Remote workers (TP>1) own the streams: the ticket carries the
+                # TPC set and each rank's worker applies it to its stream.
+                model.core.scheduler._hb_lane_mask = (
+                    list(selected_indices) if masked else None
+                )
+            else:
+                bits = sum(1 << i for i in selected_indices)
+                mask = (~bits & ((1 << 128) - 1)) if masked else 0
+                if self.state.get(stream.cuda_stream) != mask:
+                    # Zero means completely unrestricted, including the upper TPCs.
+                    self.ctrl._set_mask(stream, mask, "model-owned mask", log=False)
+                    self.state[stream.cuda_stream] = mask
             if lane == "decode" and model.model_id == self.plan.model_id:
                 self.workers[model.model_id].model_runner.select_decode_mask(masked)
         return {
             "masked": masked,
             "enabled_tpcs": (
                 len(selected_indices) if masked and self.tiers else selected_plan.tpcs
-            ) if masked else self.total_tpcs,
+            )
+            if masked
+            else self.total_tpcs,
             "tier_min_decode": locals().get("tier_min_decode"),
             "mask_model_id": selected_plan.model_id if masked else None,
             "partner_active": bool(partner_active),
@@ -250,6 +261,8 @@ class ModelLaneMasks:
         }
 
     def reset(self):
+        if self.ctrl is None:
+            return
         streams = {
             stream.cuda_stream: stream
             for key, stream in self.streams.items()

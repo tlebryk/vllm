@@ -3,15 +3,13 @@
 import multiprocessing
 import os
 import pickle
-import queue
 import signal
 import threading
 import time
 import traceback
 import weakref
-from collections import deque
-from collections.abc import Callable, Sequence
-from concurrent.futures import Future, InvalidStateError
+from collections.abc import Callable
+from concurrent.futures import Future, InvalidStateError, ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -64,33 +62,21 @@ from vllm.v1.worker.worker_base import WorkerWrapperBase
 logger = init_logger(__name__)
 
 
-class FutureWrapper(Future):
-    def __init__(
-        self,
-        futures_queue: deque[tuple["FutureWrapper", Callable]],
-        aggregate: Callable = lambda x: x,
-    ):
-        self.futures_queue = futures_queue
+class _PendingRpc:
+    """One in-flight RPC: the ranks expected to answer and their answers.
+
+    Workers answer out of order. A Slack Serve prefill ticket stays in flight
+    on its own CUDA stream while later decode tickets complete, so responses
+    are matched to their RPC by sequence number, never by FIFO position.
+    """
+
+    __slots__ = ("future", "aggregate", "ranks", "results")
+
+    def __init__(self, ranks: list[int], aggregate: Callable):
+        self.future: Future = Future()
         self.aggregate = aggregate
-        super().__init__()
-
-    def result(self, timeout=None):
-        if timeout is not None:
-            raise RuntimeError("timeout not implemented")
-        # Drain any futures ahead of us in the queue.
-        while not self.done():
-            future, get_response = self.futures_queue.pop()
-            future.wait_for_response(get_response)
-        return super().result()
-
-    def wait_for_response(self, get_response: Callable):
-        try:
-            response = self.aggregate(get_response())
-            with suppress(InvalidStateError):
-                self.set_result(response)
-        except Exception as e:
-            with suppress(InvalidStateError):
-                self.set_exception(e)
+        self.ranks = ranks
+        self.results: dict[int, Any] = {}
 
 
 class MultiprocExecutor(Executor):
@@ -218,7 +204,10 @@ class MultiprocExecutor(Executor):
             for response_mq in self.response_mqs:
                 response_mq.wait_until_ready()
 
-            self.futures_queue = deque[tuple[FutureWrapper, Callable]]()
+            self._rpc_lock = threading.Lock()
+            self._rpc_seq = 0
+            self._rpc_pending: dict[int, _PendingRpc] = {}
+            self._start_response_readers()
 
             self._post_init_executor()
 
@@ -250,6 +239,54 @@ class MultiprocExecutor(Executor):
 
     def _post_init_executor(self) -> None:
         pass
+
+    def _start_response_readers(self) -> None:
+        for rank, mq in enumerate(self.response_mqs):
+            Thread(
+                target=self._response_reader,
+                args=(rank, mq),
+                daemon=True,
+                name=f"MultiprocRpcReader-{rank}",
+            ).start()
+
+    def _response_reader(self, rank: int, mq: MessageQueue) -> None:
+        while True:
+            try:
+                status, result, seq = mq.dequeue(indefinite=True)
+            except Exception:
+                with self._rpc_lock:
+                    pending, self._rpc_pending = self._rpc_pending, {}
+                error = RuntimeError("worker response queue closed")
+                for entry in pending.values():
+                    with suppress(InvalidStateError):
+                        entry.future.set_exception(error)
+                return
+            with self._rpc_lock:
+                entry = self._rpc_pending.get(seq)
+                if entry is None:
+                    continue
+                if status != WorkerProc.ResponseStatus.SUCCESS:
+                    del self._rpc_pending[seq]
+                    failure: Exception | None = RuntimeError(
+                        f"Worker failed with error '{result}', please check the"
+                        " stack trace above for the root cause"
+                    )
+                else:
+                    entry.results[rank] = result
+                    if len(entry.results) < len(entry.ranks):
+                        continue
+                    del self._rpc_pending[seq]
+                    failure = None
+            if failure is None:
+                try:
+                    value = entry.aggregate([entry.results[r] for r in entry.ranks])
+                except Exception as e:
+                    failure = e
+            with suppress(InvalidStateError):
+                if failure is None:
+                    entry.future.set_result(value)
+                else:
+                    entry.future.set_exception(failure)
 
     def _is_driver_worker(self, rank: int) -> bool:
         return rank % self.parallel_config.tensor_parallel_size == 0
@@ -306,11 +343,21 @@ class MultiprocExecutor(Executor):
         )
 
     def sample_tokens(  # type: ignore[override]
-        self, grammar_output: GrammarOutput | None, non_block: bool = False
+        self,
+        grammar_output: GrammarOutput | None,
+        non_block: bool = False,
+        *,
+        lane: str | None = None,
     ) -> ModelRunnerOutput | Future[ModelRunnerOutput]:
+        # Slack Serve tickets name their lane; the stock worker takes none.
+        args = (
+            (grammar_output,)
+            if lane is None or lane == "default"
+            else (grammar_output, lane)
+        )
         return self.collective_rpc(
             "sample_tokens",
-            args=(grammar_output,),
+            args=args,
             unique_reply_rank=self.output_rank,
             non_block=non_block,
             timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS,
@@ -360,41 +407,31 @@ class MultiprocExecutor(Executor):
             send_method = method
         else:
             send_method = cloudpickle.dumps(method, protocol=pickle.HIGHEST_PROTOCOL)
-        self.rpc_broadcast_mq.enqueue((send_method, args, kwargs, output_rank))
 
-        response_mqs: Sequence[MessageQueue] = self.response_mqs
         if output_rank is not None:
-            response_mqs = (response_mqs[output_rank],)
-
-        def get_response():
-            responses = []
-            for mq in response_mqs:
-                dequeue_timeout = (
-                    None if deadline is None else (deadline - time.monotonic())
-                )
-                try:
-                    status, result = mq.dequeue(timeout=dequeue_timeout)
-                except TimeoutError as e:
-                    raise TimeoutError(f"RPC call to {method} timed out.") from e
-                if status != WorkerProc.ResponseStatus.SUCCESS:
-                    raise RuntimeError(
-                        f"Worker failed with error '{result}', please check the"
-                        " stack trace above for the root cause"
-                    )
-                responses.append(result)
-            return responses[0] if output_rank is not None else responses
+            ranks = [output_rank]
+            finish: Callable[[list[Any]], Any] = lambda rs: aggregate(rs[0])
+        else:
+            ranks = list(range(len(self.response_mqs)))
+            finish = aggregate
+        with self._rpc_lock:
+            seq = self._rpc_seq
+            self._rpc_seq += 1
+            pending = _PendingRpc(ranks, finish)
+            self._rpc_pending[seq] = pending
+            self.rpc_broadcast_mq.enqueue((send_method, args, kwargs, output_rank, seq))
 
         if non_block:
-            future = FutureWrapper(self.futures_queue, aggregate=aggregate)
-            self.futures_queue.appendleft((future, get_response))
-            return future
-
-        # First drain any pending futures in the queue.
-        while self.futures_queue:
-            future, get_fut_response = self.futures_queue.pop()
-            future.wait_for_response(get_fut_response)
-
-        return aggregate(get_response())
+            return pending.future
+        try:
+            remaining = (
+                None if deadline is None else max(0.0, deadline - time.monotonic())
+            )
+            return pending.future.result(timeout=remaining)
+        except TimeoutError as e:
+            with self._rpc_lock:
+                self._rpc_pending.pop(seq, None)
+            raise TimeoutError(f"RPC call to {method} timed out.") from e
 
     @staticmethod
     def _ensure_worker_termination(worker_procs: list[BaseProcess]):
@@ -611,16 +648,16 @@ class WorkerProc:
             )
             self.worker.load_model()
 
-        scheduler_config = vllm_config.scheduler_config
-        self.use_async_scheduling = scheduler_config.async_scheduling
-        if self.use_async_scheduling:
-            self.async_output_queue: queue.Queue = queue.Queue()
-            self.async_output_copy_thread = Thread(
-                target=self.async_output_busy_loop,
-                daemon=True,
-                name="WorkerAsyncOutputCopy",
-            )
-            self.async_output_copy_thread.start()
+        # Async outputs (stock async scheduling, Slack Serve lane tickets) are
+        # waited off the busy loop so a long prefill copy never blocks the next
+        # RPC. Responses carry their RPC sequence number, so completion order
+        # need not match dispatch order.
+        self._response_lock = threading.Lock()
+        self._async_output_pool = ThreadPoolExecutor(
+            max_workers=4,
+            thread_name_prefix="WorkerAsyncOutput",
+            initializer=self._init_output_thread,
+        )
 
         # Set block size based on the attention backends
         current_platform.update_block_size_for_backend(vllm_config)
@@ -884,7 +921,7 @@ class WorkerProc:
         SUCCESS = auto()
         FAILURE = auto()
 
-    def enqueue_output(self, output: Any):
+    def enqueue_output(self, output: Any, seq: int):
         """Prepares output from the worker and enqueues it to the
         worker_response_mq. If the output is an Exception, it is
         converted to a FAILURE response.
@@ -893,45 +930,43 @@ class WorkerProc:
             output = output.get_output()
 
         if isinstance(output, Exception):
-            result = (WorkerProc.ResponseStatus.FAILURE, str(output))
+            result = (WorkerProc.ResponseStatus.FAILURE, str(output), seq)
         else:
-            result = (WorkerProc.ResponseStatus.SUCCESS, output)
-        if (response_mq := self.worker_response_mq) is not None:
-            response_mq.enqueue(result)
+            result = (WorkerProc.ResponseStatus.SUCCESS, output, seq)
+        with self._response_lock:
+            if (response_mq := self.worker_response_mq) is not None:
+                response_mq.enqueue(result)
 
-    def handle_output(self, output: Any):
-        """Handles output from the worker. If async scheduling is enabled,
-        it is passed to the async_output_busy_loop thread. Otherwise, it is
-        enqueued directly to the worker_response_mq.
+    def handle_output(self, output: Any, seq: int):
+        """Handles output from the worker. An async output is finished on the
+        output thread pool; anything else is enqueued directly.
         """
-        if self.use_async_scheduling:
-            self.async_output_queue.put(output)
+        if isinstance(output, AsyncModelRunnerOutput):
+            self._async_output_pool.submit(self._finish_async_output, output, seq)
         else:
-            self.enqueue_output(output)
+            self.enqueue_output(output, seq)
 
-    def async_output_busy_loop(self):
-        """Entrypoint for the thread which handles outputs asynchronously."""
-
-        # set device to the worker device for the thread.
-        # a thread will not inherit the context of the main thread.
-        # when calling any cuda runtime functions, it will implicitly
-        # create a new cuda context on device 0, consuming extra memory.
-        # here we set the device to the worker device for the thread,
-        # enforcing the context to be the same as the main thread.
+    def _init_output_thread(self):
+        # A thread does not inherit the CUDA context; without set_device a
+        # runtime call would create a new context on device 0.
         from vllm.platforms import current_platform
 
         if hasattr(self.worker, "device"):
             current_platform.set_device(self.worker.device)
 
-        while True:
-            output = self.async_output_queue.get()
-            self.enqueue_output(output)
+    def _finish_async_output(self, output: AsyncModelRunnerOutput, seq: int):
+        try:
+            result: Any = output.get_output()
+        except Exception as e:
+            logger.exception("WorkerProc async output failed.")
+            result = e
+        self.enqueue_output(result, seq)
 
     def worker_busy_loop(self):
         """Main busy loop for Multiprocessing Workers"""
         assert self.rpc_broadcast_mq is not None
         while True:
-            method, args, kwargs, output_rank = self.rpc_broadcast_mq.dequeue(
+            method, args, kwargs, output_rank, seq = self.rpc_broadcast_mq.dequeue(
                 indefinite=True
             )
             try:
@@ -949,11 +984,11 @@ class WorkerProc:
                 # exception might not be serializable, so we convert it to
                 # string, only for logging purpose.
                 if output_rank is None or self.rank == output_rank:
-                    self.handle_output(e)
+                    self.handle_output(e, seq)
                 continue
 
             if output_rank is None or self.rank == output_rank:
-                self.handle_output(output)
+                self.handle_output(output, seq)
 
     @staticmethod
     def setup_proc_title_and_log_prefix(enable_ep: bool) -> None:
