@@ -105,6 +105,7 @@ class MultiModelBackend:
         smctrl_indices=None,
         smctrl_max_dense_wait_ms=0,
         adaptive_dense_steps=False,
+        hybrid_min_decode=0,
     ):
         if max_requests <= 0 or output_capacity <= decode_depth + 2:
             raise ValueError("invalid ingress/output capacity")
@@ -141,6 +142,9 @@ class MultiModelBackend:
                 "adaptive dense steps require a mask and a positive dense step size"
             )
         self.adaptive_dense_steps = adaptive_dense_steps
+        if hybrid_min_decode < 0:
+            raise ValueError("hybrid minimum decode requests must be nonnegative")
+        self.hybrid_min_decode = hybrid_min_decode
         self.smctrl_lib = Path(smctrl_lib).resolve() if smctrl_lib else None
         self.lane_masks = None
         self.mask_metadata = None
@@ -432,6 +436,7 @@ class MultiModelBackend:
             record_steps=False,
             lane_masks=self.lane_masks,
             adaptive_dense_steps=self.adaptive_dense_steps,
+            hybrid_min_decode=self.hybrid_min_decode,
             step_observer=self._observe_step
             if self.step_trace_file is not None
             else None,

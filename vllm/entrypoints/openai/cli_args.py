@@ -206,6 +206,13 @@ class BaseFrontendArgs:
 
     This controls placement, not admission or scheduler batch capacity.
     """
+    slackserve_hybrid_min_decode: int = 0
+    """Below this many decode-ready requests, run stock hybrid batching.
+
+    The controller dispatches the scheduler's merged batch (prefill chunks and
+    decodes in one forward) on the decode stream, unmasked, instead of split
+    prefill/decode steps. Zero disables the fallback.
+    """
     slackserve_dense_model: str | None = None
     """Auxiliary pooling checkpoint for the native multi-model controller.
 

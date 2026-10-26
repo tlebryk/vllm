@@ -59,6 +59,7 @@ class DrainResult:
     waits: int = 0
     watermark_skips: int = 0
     idle_watermark_bypasses: int = 0
+    hybrid_steps: int = 0
     model_phases: list[dict[str, Any]] = field(default_factory=list)
     policy_transitions: list[dict[str, Any]] = field(default_factory=list)
 
@@ -194,8 +195,17 @@ class MultiModelController:
         record_steps: bool = True,
         step_observer: Callable[[dict], None] | None = None,
         adaptive_dense_steps: bool = False,
+        hybrid_min_decode: int = 0,
     ) -> None:
         self.models = list(models)
+        # Stock-fallback policy: below this many decode-ready requests the
+        # generation model runs the scheduler's merged ("default") batch on the
+        # decode stream, unmasked, instead of split prefill/decode steps.
+        if hybrid_min_decode < 0:
+            raise ValueError("hybrid_min_decode must be nonnegative")
+        self.hybrid_min_decode = hybrid_min_decode
+        self.hybrid_hysteresis = max(1, hybrid_min_decode // 4)
+        self._stock_mode = False
         self.has_exclusive_models = any(m.exclusive_execution for m in self.models)
         self.record_steps = record_steps
         self.step_observer = step_observer
@@ -462,7 +472,7 @@ class MultiModelController:
                         {t.model_id for fifo in pending.values() for t in fifo},
                         pending_tickets=[t for fifo in pending.values() for t in fifo],
                     )
-                    if self.lane_masks is not None
+                    if self.lane_masks is not None and lane != "default"
                     else None
                 )
                 if (
@@ -495,10 +505,13 @@ class MultiModelController:
             )
             if lane == "decode":
                 model.core._hb_decode_fifo.append(step)
+            # Merged ("default") batches run on the decode stream and publish
+            # through the decode FIFO; they are synchronous inflight tickets.
+            publish_lane = "decode" if lane == "default" else lane
             if step.scheduler_output.total_num_scheduled_tokens or lane == "decode":
                 # Empty decode passes also mutate worker/request state. Publish
                 # them behind older tickets, not inline ahead of placeholders.
-                pending[lane].append(ticket)
+                pending[publish_lane].append(ticket)
             if not step.scheduler_output.total_num_scheduled_tokens:
                 # An empty pass can flush finished request IDs to the worker.
                 blocked.add((model.model_id, lane))
@@ -628,8 +641,40 @@ class MultiModelController:
                 dispatch(exclusive, "prefill")
                 progress = True
                 exclusive_pending = True
+            # Stock-mode policy (per step): below hybrid_min_decode decode-ready
+            # requests the generation model stops issuing split prefill/decode
+            # tickets, drains, and runs merged ("default") batches on the
+            # decode stream, unmasked, like stock. It leaves stock mode once
+            # the decode-ready count reaches hybrid_min_decode + hysteresis.
+            hybrid_inflight = any(t.lane == "default" for t in pending["decode"])
+            stock_mode = False
+            if self.hybrid_min_decode and not exclusive_pending and exclusive is None:
+                for model in self.models:
+                    if not model.decode_enabled:
+                        continue
+                    sched = model.core.scheduler
+                    ready = sum(
+                        r.num_computed_tokens >= r.num_prompt_tokens
+                        for r in sched.running
+                    )
+                    enter, leave = self.hybrid_min_decode, self.hybrid_min_decode + self.hybrid_hysteresis
+                    if self._stock_mode and ready >= leave:
+                        self._stock_mode = False
+                    elif not self._stock_mode and ready < enter:
+                        self._stock_mode = True
+                    stock_mode = self._stock_mode
+                    if stock_mode and not any(pending.values()):
+                        if (
+                            sched.has_requests()
+                            and (model.model_id, "default") not in blocked
+                        ):
+                            dispatch(model, "default")
+                            result.hybrid_steps += 1
+                            progress = True
+                            hybrid_inflight = True
+                    break
             for lane, capacity in (("decode", self.decode_depth), ("prefill", 1)):
-                if exclusive_pending or exclusive is not None:
+                if exclusive_pending or exclusive is not None or hybrid_inflight or stock_mode:
                     continue
                 if len(pending[lane]) >= capacity:
                     continue

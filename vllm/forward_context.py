@@ -249,10 +249,14 @@ class ForwardContext:
 import threading as _threading
 
 _forward_context_tls = _threading.local()
+# Global fallback: a thread that never set its own context (worker helper
+# threads, output threads) sees the context the main thread set.
+_forward_context_global: "ForwardContext | None" = None
 
 
 def _get_tls_forward_context() -> "ForwardContext | None":
-    return getattr(_forward_context_tls, "ctx", None)
+    ctx = getattr(_forward_context_tls, "ctx", None)
+    return ctx if ctx is not None else _forward_context_global
 
 
 def get_forward_context() -> ForwardContext:
@@ -305,12 +309,29 @@ def override_forward_context(forward_context: ForwardContext | None):
     This is used to override the forward context for a specific
     forward pass.
     """
-    prev_context = _get_tls_forward_context()
+    global _forward_context_global
+    prev_tls = getattr(_forward_context_tls, "ctx", None)
+    prev_global = _forward_context_global
     _forward_context_tls.ctx = forward_context
+    if _threading.current_thread() is _threading.main_thread() or not getattr(
+        _forward_context_tls, "private", False
+    ):
+        _forward_context_global = forward_context
     try:
         yield
     finally:
-        _forward_context_tls.ctx = prev_context
+        _forward_context_tls.ctx = prev_tls
+        if _threading.current_thread() is _threading.main_thread() or not getattr(
+            _forward_context_tls, "private", False
+        ):
+            _forward_context_global = prev_global
+
+
+def use_private_forward_context() -> None:
+    """Mark the calling thread as owning a private forward context: its
+    set_forward_context calls never touch the global fallback (used by the
+    SlackServe prefill-stream thread)."""
+    _forward_context_tls.private = True
 
 
 @contextmanager
