@@ -242,9 +242,9 @@ class ModelLaneMasks:
                 and not age_override
             ):
                 policy = "calibrated"
-                estimated_tokens = self._estimate_ticket_tokens(model)
+                estimated_tokens, waiting_behind = self._estimate_ticket(model)
                 candidate, indices, cost_s = self.calibration.choose(
-                    estimated_tokens, decode_load
+                    estimated_tokens, decode_load, waiting_behind
                 )
                 masked = indices is not None
                 selected_indices = list(indices) if masked else ()
@@ -276,6 +276,7 @@ class ModelLaneMasks:
             "policy": policy,
             "candidate": candidate,
             "estimated_tokens": estimated_tokens,
+            "waiting_behind": locals().get("waiting_behind"),
             "cost_s": cost_s,
             "mask_model_id": selected_plan.model_id if masked else None,
             "partner_active": bool(partner_active),
@@ -294,8 +295,9 @@ class ModelLaneMasks:
             "graph_bank": "masked" if masked and lane == "decode" else "unmasked",
         }
 
-    def _estimate_ticket_tokens(self, model) -> int:
-        """Prompt tokens the next prefill ticket will carry (budget-capped)."""
+    def _estimate_ticket(self, model) -> tuple[int, int]:
+        """(prompt tokens the next prefill ticket will carry, budget-capped;
+        requests left waiting behind it on the prefill stream)."""
         sched = model.core.scheduler
         budget = getattr(sched, "_hb_step_token_budget", None) or getattr(
             sched, "max_num_scheduled_tokens", 0
@@ -303,15 +305,21 @@ class ModelLaneMasks:
         if not budget:
             budget = 1 << 30
         tokens = 0
-        for r in [*sched.running, *getattr(sched, "waiting", ())]:
-            remaining = getattr(r, "num_prompt_tokens", 0) - getattr(
-                r, "num_computed_tokens", 0
-            )
-            if remaining > 0:
-                tokens += remaining
-                if tokens >= budget:
-                    break
-        return int(min(budget, tokens)) if tokens else int(min(budget, 1 << 14))
+        pending = [
+            r
+            for r in [*sched.running, *getattr(sched, "waiting", ())]
+            if getattr(r, "num_prompt_tokens", 0) - getattr(r, "num_computed_tokens", 0)
+            > 0
+        ]
+        included = 0
+        for r in pending:
+            if tokens >= budget:
+                break
+            tokens += r.num_prompt_tokens - r.num_computed_tokens
+            included += 1
+        waiting_behind = max(0, len(pending) - included)
+        estimate = int(min(budget, tokens)) if tokens else int(min(budget, 1 << 14))
+        return estimate, waiting_behind
 
     def reset(self):
         if self.ctrl is None:

@@ -9,9 +9,10 @@ for every candidate mask, the prefill rate while ``n`` requests decode and
 the slowdown those decodes suffer, at a few batch sizes ``n``. Per ticket the
 candidate with the smallest cost in seconds wins::
 
-    cost(m) = D * (1 + n * dilation(m, n)),  D = tokens / prefill_rate(m, n)
+    cost(m) = D * (1 + W + n * dilation(m, n)),  D = tokens / prefill_rate(m, n)
 
-``D`` is the TTFT the prefilled request pays; ``n * D * dilation`` is the
+``D`` is the TTFT the prefilled request pays, ``W * D`` the delay of the W
+requests queued behind it on the prefill stream, and ``n * D * dilation`` the
 aggregate delay of the resident decodes during that prefill. No tunables.
 
 Measurements are cached per deployment key (GPU, TPC topology, candidates,
@@ -104,16 +105,22 @@ class CalibrationTable:
         tmp.write_text(json.dumps(self.data, indent=1))
         tmp.replace(path)
 
-    def cost(self, name: str, tokens: int, n: int) -> float:
+    def cost(self, name: str, tokens: int, n: int, waiting: int = 0) -> float:
+        """Seconds of request latency this ticket adds under candidate ``name``:
+        its own prefill duration D (the prefilled request's TTFT), D again for
+        every request queued behind it on the prefill stream, and D × dilation
+        for each of the n resident decodes."""
         cand = self.by_name[name]
         rate = max(1.0, _interp(cand["n"], cand["rate"], n))
         dilation = max(0.0, _interp(cand["n"], cand["dilation"], n))
         duration = tokens / rate
-        return duration * (1.0 + n * dilation)
+        return duration * (1.0 + waiting + n * dilation)
 
-    def choose(self, tokens: int, n: int) -> tuple[str, list[int] | None, float]:
-        best = min(self.by_name, key=lambda name: self.cost(name, tokens, n))
-        return best, self.by_name[best]["indices"], self.cost(best, tokens, n)
+    def choose(
+        self, tokens: int, n: int, waiting: int = 0
+    ) -> tuple[str, list[int] | None, float]:
+        best = min(self.by_name, key=lambda name: self.cost(name, tokens, n, waiting))
+        return best, self.by_name[best]["indices"], self.cost(best, tokens, n, waiting)
 
     def summary(self) -> dict[str, Any]:
         return {
