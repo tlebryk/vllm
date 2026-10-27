@@ -183,42 +183,25 @@ class SharedKVAdmissionBudget:
 
 
 class DecodeHeadroomGuard:
-    """Private-KV prefill admission that leaves room for decode to grow.
-
-    The prefill lane admits waiting requests on its own ticket, so without a
-    guard it can take the last free blocks and the next decode ticket preempts
-    a resident request (whose prompt is then recomputed). Admission keeps
-    ``growth_blocks`` free blocks per decode-ready request: the growth those
-    requests need while one prefill ticket runs, measured at run time from the
-    controller's prefill-ticket and decode-step durations.
-    """
+    """Leave allocator-derived space for decode growth during one prefill."""
 
     name = "headroom"
 
-    def __init__(self, sched, growth_blocks: int, step_tokens: int | None):
-        pool = sched.kv_cache_manager.block_pool
-        self.free = pool.get_num_free_blocks()
-        self.block_size = sched.block_size
-        self.step_tokens = step_tokens or sched.max_num_scheduled_tokens
-        resident = sum(
-            1 for r in sched.running if r.num_computed_tokens >= r.num_prompt_tokens
-        )
-        self.headroom = resident * max(1, growth_blocks)
+    def __init__(self, sched, growth_tokens: int, step_tokens: int | None):
+        from vllm.v1.engine.kv_headroom import CacheHeadroom
 
-    def _need(self, request) -> int:
-        remaining = max(0, request.num_prompt_tokens - request.num_computed_tokens)
-        return (
-            min(remaining, self.step_tokens) + self.block_size - 1
-        ) // self.block_size
+        self.budget = CacheHeadroom(
+            sched.kv_cache_manager,
+            sched.running,
+            max(1, growth_tokens),
+            step_tokens or sched.max_num_scheduled_tokens,
+        )
 
     def can_admit(self, request) -> bool:
-        return self.free - self._need(request) >= self.headroom
+        return self.budget.can_admit(request)
 
     def __call__(self, request) -> bool:
-        if not self.can_admit(request):
-            return False
-        self.free -= self._need(request)
-        return True
+        return self.budget(request)
 
 
 class MultiModelController:
@@ -389,12 +372,12 @@ class MultiModelController:
                 else 0.8 * self._prefill_ticket_ms + 0.2 * elapsed
             )
 
-    def _growth_blocks(self, block_size: int) -> int:
-        """Blocks one decoding request grows by during one prefill ticket."""
+    def _growth_tokens(self) -> int:
+        """Tokens one decoding request grows by during one prefill ticket."""
         if not self._prefill_ticket_ms or not self._decode_step_ms:
             return 1
         steps = self._prefill_ticket_ms / self._decode_step_ms
-        return max(1, math.ceil(steps / block_size))
+        return max(1, math.ceil(steps))
 
     def has_work(self) -> bool:
         if any(self._pending.values()):
@@ -551,7 +534,7 @@ class MultiModelController:
             ):
                 guard = DecodeHeadroomGuard(
                     sched,
-                    self._growth_blocks(sched.block_size),
+                    self._growth_tokens(),
                     model.prefill_step_tokens,
                 )
             previous_guard = getattr(sched, "_hb_kv_admission_guard", None)
@@ -678,7 +661,7 @@ class MultiModelController:
                     ):
                         budget = DecodeHeadroomGuard(
                             sched,
-                            self._growth_blocks(sched.block_size),
+                            self._growth_tokens(),
                             model.prefill_step_tokens,
                         )
                     else:
