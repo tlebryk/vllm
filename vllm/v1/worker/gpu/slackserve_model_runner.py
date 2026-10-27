@@ -34,6 +34,7 @@ from vllm.v1.worker.gpu.model_runner import (
     pp_broadcast,
     pp_receive,
 )
+from vllm.v1.worker.gpu.pp_utils import pp_finish_ticket
 from vllm.v1.worker.slackserve_config import SlackServeConfig
 from vllm.v1.worker.workspace import WorkspaceManager, use_workspace_manager
 
@@ -836,6 +837,11 @@ class SlackServeModelRunner(GPUModelRunner):
                 input_batch.num_reqs, max_sample_len=self.num_speculative_steps + 1
             )
             self.postprocess(input_batch, sampled, num_sampled, num_rejected)
+            if self.lane_staging:
+                self.uva_fence_registry.fence(torch.cuda.current_stream(self.device))
+            pp_finish_ticket()
+            assert context.completion_event is not None
+            context.completion_event.record(torch.cuda.current_stream(self.device))
             return None
 
         # Last rank: sample tokens
@@ -923,6 +929,8 @@ class SlackServeModelRunner(GPUModelRunner):
             # Sampling also consumes UVA parameter snapshots. Record after
             # every consumer, including reads of snapshots without fresh copies.
             self.uva_fence_registry.fence(torch.cuda.current_stream(self.device))
+        if self.use_pp:
+            pp_finish_ticket()
         assert context.completion_event is not None
         context.completion_event.record(torch.cuda.current_stream(self.device))
         ticket_tail_event.record(torch.cuda.current_stream(self.device))
