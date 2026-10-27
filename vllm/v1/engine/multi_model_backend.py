@@ -436,10 +436,22 @@ class MultiModelBackend:
         # The controller cannot share CUDA streams with them, so lane streams,
         # the prefill TP communicator and ticket masks live in the worker.
         self.distributed = any(c.parallel_config.world_size > 1 for c in self.configs)
+        # Merged batches can occur under the fixed hybrid gate or when the
+        # calibrated candidates include the merged batch; the worker then
+        # reserves decode-lane workspace for a merged step of the prefill work
+        # unit (MoE expert scratch) before the memory profile locks it.
+        merged_possible = bool(self.hybrid_min_decode) or any(
+            isinstance(c, dict) and c.get("mode") == "merged"
+            for c in (self.mask_candidates or [])
+        )
         for spec, config in zip(self.specs, self.configs):
             if self.distributed and self.smctrl_lib is not None:
                 config.additional_config["slackserve"]["smctrl_lib"] = str(
                     self.smctrl_lib
+                )
+            if merged_possible and spec.runner == "generate":
+                config.additional_config["slackserve"]["merged_batch_tokens"] = int(
+                    spec.prefill_step_tokens or spec.max_num_batched_tokens
                 )
             if self.manager is not None:
                 config.additional_config["shared_kv"] = {

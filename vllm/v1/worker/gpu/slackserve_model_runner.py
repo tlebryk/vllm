@@ -288,8 +288,7 @@ class SlackServeModelRunner(GPUModelRunner):
             # expert workspace must exist before the lock (a 16K-token merged
             # probe needed 1.4 GB against a 352 MB decode workspace).
             merged_unit = min(
-                self.slackserve_config.prefill_step_tokens or self.max_num_tokens,
-                self.max_num_tokens,
+                self.slackserve_config.merged_batch_tokens, self.max_num_tokens
             )
             if merged_unit > 2 * self.max_num_reqs:
                 self._dummy_run(merged_unit, skip_attn=True, workspace_lane="decode")
