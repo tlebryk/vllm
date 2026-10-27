@@ -15,6 +15,15 @@ candidate with the smallest cost in seconds wins::
 requests queued behind it on the prefill stream, and ``n * D * dilation`` the
 aggregate delay of the resident decodes during that prefill. No tunables.
 
+The merged-batch candidate (``{"name": "merged", "mode": "merged"}``) is not a
+mask: the controller runs the scheduler's stock mixed batch on the decode
+stream instead of a prefill-stream ticket. Its progress pattern differs (the
+resident decodes make one step per merged forward instead of being slowed by
+a fraction), so its cost charges each resident decode the merged step's
+excess over the decode-alone period, ``n * (S - T_d)`` with ``S = tokens /
+merged_rate(n)``, instead of ``n * D * dilation``. Its cell records the
+probe's blocked fraction ``1 - alone / during`` as ``dilation`` for reference.
+
 Measurements are cached per deployment key (GPU, TPC topology, candidates,
 model, dtype, TP, block size, token budget) and reused across runs.
 """
@@ -42,22 +51,41 @@ WARMER_OUTPUT_TOKENS = 4096
 
 
 def normalize_candidates(raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """[{"name": str, "indices": [int...] | None}] with distinct index sets."""
-    seen: set[tuple[int, ...] | None] = set()
+    """[{"name": str, "indices": [int...] | None, "mode"?: "merged"}] with
+    distinct index sets; at most one merged-batch candidate."""
+    seen: set[Any] = set()
     out = []
     for item in raw:
+        mode = item.get("mode", "split")
+        if mode not in ("split", "merged"):
+            raise ValueError("candidate mode must be split or merged")
         indices = item.get("indices")
-        key = None if indices is None else tuple(sorted(int(i) for i in indices))
+        if mode == "merged":
+            if indices is not None:
+                raise ValueError("the merged-batch candidate takes no TPC set")
+            key: Any = "merged"
+        else:
+            key = None if indices is None else tuple(sorted(int(i) for i in indices))
         if key in seen:
             continue
         seen.add(key)
+        if mode == "merged":
+            name = str(item.get("name") or "merged")
+            out.append({"name": name, "indices": None, "mode": "merged"})
+            continue
         name = str(item.get("name") or ("none" if key is None else f"tpc{len(key)}"))
         out.append({"name": name, "indices": None if key is None else list(key)})
     if not out:
         raise ValueError("mask calibration needs at least one candidate")
     if all(c["indices"] is None for c in out):
         raise ValueError("mask calibration needs at least one TPC set candidate")
+    if len({c["name"] for c in out}) != len(out):
+        raise ValueError("mask calibration candidates need distinct names")
     return out
+
+
+def is_merged_candidate(cand: dict[str, Any]) -> bool:
+    return cand.get("mode") == "merged"
 
 
 def calibration_key(fields: dict[str, Any]) -> str:
@@ -88,12 +116,18 @@ class CalibrationTable:
             cells = sorted(cand["cells"], key=lambda c: c["n"])
             self.by_name[cand["name"]] = {
                 "indices": cand["indices"],
+                "mode": cand.get("mode", "split"),
                 "n": [float(c["n"]) for c in cells],
                 "rate": [float(c["prefill_tok_s"]) for c in cells],
                 "dilation": [float(c["dilation"]) for c in cells],
+                "alone_ms": [float(c["decode_alone_ms"]) for c in cells],
             }
         if not self.by_name:
             raise ValueError("empty calibration table")
+        self.has_merged = any(c["mode"] == "merged" for c in self.by_name.values())
+
+    def is_merged(self, name: str) -> bool:
+        return self.by_name[name]["mode"] == "merged"
 
     @classmethod
     def load(cls, path: Path) -> CalibrationTable:
@@ -112,8 +146,15 @@ class CalibrationTable:
         for each of the n resident decodes."""
         cand = self.by_name[name]
         rate = max(1.0, _interp(cand["n"], cand["rate"], n))
-        dilation = max(0.0, _interp(cand["n"], cand["dilation"], n))
         duration = tokens / rate
+        if cand["mode"] == "merged":
+            # Blocked progress: the resident decodes make one step during the
+            # merged step instead of one per decode-alone period, so each
+            # loses (step - alone); this depends on the ticket's length, not
+            # on the probe's blocked fraction.
+            alone = self.decode_alone_ms(n) / 1000
+            return duration * (1.0 + waiting) + n * max(0.0, duration - alone)
+        dilation = max(0.0, _interp(cand["n"], cand["dilation"], n))
         return duration * (1.0 + waiting + n * dilation)
 
     def duration(self, name: str, tokens: int, n: int) -> float:
@@ -121,10 +162,88 @@ class CalibrationTable:
         cand = self.by_name[name]
         return tokens / max(1.0, _interp(cand["n"], cand["rate"], n))
 
+    def decode_alone_ms(self, n: float) -> float:
+        """Decode step period with n resident requests and no prefill (the
+        warmers' baseline, one per batch size, shared by all candidates)."""
+        cand = next(iter(self.by_name.values()))
+        return max(1e-3, _interp(cand["n"], cand["alone_ms"], n))
+
+    def progress(self, tokens: int, n: int, *, horizon_s: float | None = None):
+        """Paper Section 2: output tokens each candidate produces over one
+        common window, for B = n resident decodes and an incoming prefill of
+        ``tokens``. Spatial sharing under mask m: B rounds of concurrent decode
+        at T_d^par(m) during its prefill T_x^par(m), the new request's first
+        token, then (B+1)-request decode at T_d(B+1) for the rest of the
+        window. Merged batching: one hybrid step T_m, then (B+1)-request
+        decode. Fractional rounds; the window is the slowest candidate's
+        prefill unless ``horizon_s`` is given. Returns {name: tokens} plus
+        the per-candidate timings used."""
+        alone_now = self.decode_alone_ms(n) / 1000
+        t_next = self.decode_alone_ms(n + 1) / 1000
+        timings = {}
+        for name, cand in self.by_name.items():
+            rate = max(1.0, _interp(cand["n"], cand["rate"], n))
+            prefill_s = tokens / rate
+            if cand["mode"] == "merged":
+                timings[name] = {"mode": "merged", "step_s": prefill_s}
+            else:
+                dilation = max(0.0, _interp(cand["n"], cand["dilation"], n))
+                timings[name] = {
+                    "mode": "split",
+                    "prefill_s": prefill_s,
+                    "decode_par_s": alone_now * (1.0 + dilation),
+                }
+        window = horizon_s
+        if window is None:
+            window = max(
+                t.get("prefill_s", t.get("step_s", 0.0)) for t in timings.values()
+            )
+        out = {}
+        for name, t in timings.items():
+            if t["mode"] == "merged":
+                remaining = max(0.0, window - t["step_s"])
+                out[name] = (n + 1) * (1.0 + remaining / t_next)
+            else:
+                remaining = max(0.0, window - t["prefill_s"])
+                out[name] = (
+                    n * t["prefill_s"] / t["decode_par_s"]
+                    + 1.0
+                    + (n + 1) * remaining / t_next
+                )
+        return out, {"window_s": window, "decode_next_s": t_next, **timings}
+
     def choose(
-        self, tokens: int, n: int, waiting: int = 0
+        self,
+        tokens: int,
+        n: int,
+        waiting: int = 0,
+        *,
+        exclude_merged: bool = False,
+        rule: str = "queue",
     ) -> tuple[str, list[int] | None, float]:
-        best = min(self.by_name, key=lambda name: self.cost(name, tokens, n, waiting))
+        """Best candidate name, its TPC set (None for unrestricted and for the
+        merged batch; see ``is_merged``) and its score: seconds of cost under
+        the ``queue`` rule (D × (1 + W + n × dilation)), output tokens over
+        the common window under the ``progress`` rule (Section 2; W unused)."""
+        names = [
+            name
+            for name, cand in self.by_name.items()
+            if not (exclude_merged and cand["mode"] == "merged")
+        ]
+        if rule == "progress":
+            gains, timings = self.progress(tokens, n)
+            # Ties go to the sooner first token.
+            best = max(
+                names,
+                key=lambda name: (
+                    gains[name],
+                    -timings[name].get("prefill_s", timings[name].get("step_s", 0.0)),
+                ),
+            )
+            return best, self.by_name[best]["indices"], gains[best]
+        if rule != "queue":
+            raise ValueError("mask policy rule must be queue or progress")
+        best = min(names, key=lambda name: self.cost(name, tokens, n, waiting))
         return best, self.by_name[best]["indices"], self.cost(best, tokens, n, waiting)
 
     def summary(self) -> dict[str, Any]:
@@ -140,6 +259,7 @@ class CalibrationTable:
                         "decode_alone_ms": round(c["decode_alone_ms"], 2),
                         "decode_during_ms": round(c["decode_during_ms"], 2),
                         "dilation": round(c["dilation"], 3),
+                        "progress": c.get("progress", "dilated"),
                     }
                     for c in cand["cells"]
                 ]
@@ -193,10 +313,12 @@ class _Driver:
             return (self.model_id, request_id) in self.backend.active
 
     def decode_completions(self, t0: float, t1: float) -> int:
+        # A merged ("default") ticket advances every resident decode by one
+        # step too, so it counts as one decode completion.
         return sum(
             1
             for r in self.records
-            if r["lane"] == "decode"
+            if r["lane"] in ("decode", "default")
             and r["scheduled_tokens"]
             and t0 <= r["t_end"] <= t1
         )
@@ -292,6 +414,21 @@ def run_calibration(
             for c in candidates
         ]
 
+        def force(cand):
+            """Pin the controller to exactly this candidate for the probe."""
+            if is_merged_candidate(cand):
+                lane_masks.force_indices = None
+                lane_masks.force_merged = True
+            else:
+                lane_masks.force_merged = False
+                lane_masks.force_indices = (
+                    () if cand["indices"] is None else list(cand["indices"])
+                )
+
+        def release():
+            lane_masks.force_indices = None
+            lane_masks.force_merged = None
+
         def probe_cell(cand, result, n, alone_ms):
             """One candidate against the warmers already decoding at size n."""
             resident = driver.decode_ready()
@@ -300,20 +437,22 @@ def run_calibration(
                     f"calibration lost warmers before probing {cand['name']} "
                     f"(n={n}, resident={resident}); raise WARMER_OUTPUT_TOKENS"
                 )
-            lane_masks.force_indices = (
-                () if cand["indices"] is None else list(cand["indices"])
-            )
+            merged = is_merged_candidate(cand)
+            force(cand)
             probe = submit(probe_tokens, 1)
             wait_done(probe, f"probing {cand['name']} n={n}")
-            lane_masks.force_indices = None
+            release()
+            lane = "default" if merged else "prefill"
             tickets = [
                 r
                 for r in driver.records
-                if r["lane"] == "prefill" and probe in r["num_scheduled_tokens"]
+                if r["lane"] == lane and probe in r["num_scheduled_tokens"]
             ]
             if not tickets:
-                raise RuntimeError("calibration probe produced no prefill ticket")
+                raise RuntimeError(f"calibration probe produced no {lane} ticket")
             tokens = sum(r["num_scheduled_tokens"][probe] for r in tickets)
+            # Merged tickets also carry the n decode tokens; their duration is
+            # the real cost of prefilling in that mode.
             seconds = sum(r["t_end"] - r["t_start"] for r in tickets)
             window_start = min(r["t_start"] for r in tickets)
             window_end = max(r["t_end"] for r in tickets)
@@ -322,6 +461,11 @@ def run_calibration(
             # Mean decode period inside the prefill window; zero completions
             # means decode was starved for the whole window.
             during_ms = window_ms / max(completions, 1)
+            if merged:
+                # Blocked progress: decodes make one step per merged forward.
+                dilation = max(0.0, 1.0 - alone_ms / max(during_ms, 1e-6))
+            else:
+                dilation = max(0.0, during_ms / alone_ms - 1.0)
             result["cells"].append(
                 {
                     "n": n,
@@ -331,7 +475,8 @@ def run_calibration(
                     "decode_during_ms": during_ms,
                     "decode_samples": completions,
                     "window_ms": window_ms,
-                    "dilation": max(0.0, during_ms / alone_ms - 1.0),
+                    "dilation": dilation,
+                    "progress": "blocked" if merged else "dilated",
                 }
             )
             logger.info(
@@ -346,7 +491,7 @@ def run_calibration(
         def measure_size(n):
             """Admit n warmers once, time decode alone once, probe every
             candidate against the same warmers, then release them."""
-            lane_masks.force_indices = None
+            release()
             warmers = [submit(warmer_prompt, warmer_output) for _ in range(n)]
             driver.drive(lambda: driver.decode_ready() >= n, 180, f"warming n={n}")
             t0 = time.perf_counter()
@@ -372,16 +517,15 @@ def run_calibration(
         for cand in candidates:
             # Warm-up: the first forward under each candidate pays one-time
             # allocations/lazy init that must not be charged to a cell.
-            lane_masks.force_indices = (
-                () if cand["indices"] is None else list(cand["indices"])
-            )
+            force(cand)
             wait_done(submit(probe_tokens, 1), "warming up")
-            lane_masks.force_indices = None
+            release()
             driver.records.clear()
         for n in decode_sizes:
             measure_size(n)
     finally:
         lane_masks.force_indices = None
+        lane_masks.force_merged = None
         driver.close()
     return CalibrationTable(
         {
@@ -390,6 +534,9 @@ def run_calibration(
             "elapsed_s": time.time() - started,
             "probe_tokens": probe_tokens,
             "decode_sizes": list(decode_sizes),
-            "candidates": results,
+            "candidates": [
+                {**r, "mode": "merged"} if is_merged_candidate(c) else r
+                for c, r in zip(candidates, results)
+            ],
         }
     )

@@ -70,6 +70,7 @@ async def build_multi_model_clients(args):
         ),
         mask_calibration=args.slackserve_mask_calibration,
         mask_calibration_dir=args.slackserve_mask_calibration_dir,
+        mask_rule=args.slackserve_mask_rule,
         dense_step_tokens=args.slackserve_dense_step_tokens,
         adaptive_dense_steps=args.slackserve_dense_adaptive_step,
         smctrl_indices=(

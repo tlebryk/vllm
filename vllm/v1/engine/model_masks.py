@@ -111,7 +111,15 @@ class ModelLaneMasks:
         # unrestricted) is set only by the calibration run itself.
         self.calibration = None
         self.calibrated_model = None  # model whose prefill tickets the table governs
+        # Decision rule over the calibrated table: "queue" (measured cost
+        # D × (1 + W + n × dilation)) or "progress" (paper Section 2 token
+        # progress over a common window; see CalibrationTable.progress).
+        self.rule = "queue"
         self.force_indices = None
+        # Calibration probe of the merged-batch candidate: True pins the
+        # controller to merged batches, False to split execution, None lets
+        # the policy decide (see merged_choice).
+        self.force_merged = None
         self.state = {}
         if activation not in ("resident", "decode"):
             raise ValueError("unknown mask activation policy")
@@ -123,18 +131,16 @@ class ModelLaneMasks:
             raise ValueError("dense wait budget must be nonnegative")
         self.max_dense_wait_ms, self.clock = max_dense_wait_ms, clock
 
-    def before_dispatch(self, model, lane, pending_models, *, pending_tickets=()):
+    def _decode_load(self, model, pending_tickets):
+        """Decode-ready partner requests, their live decode load (largest
+        in-flight batch per model, launch-ahead tickets not summed) and the
+        in-flight decode tickets counted."""
         partners = [
             m
             for m in self.models
             if m.model_id != model.model_id or self.plan.lane == "prefill"
         ]
         partner_ids = {m.model_id for m in partners}
-        partner_active = any(
-            other.model_id != model.model_id
-            and (other.core.scheduler.running or other.model_id in pending_models)
-            for other in self.models
-        )
         ready_by_model = {
             other.model_id: sum(
                 getattr(r, "num_computed_tokens", 0)
@@ -144,29 +150,120 @@ class ModelLaneMasks:
             for other in partners
             if getattr(other, "decode_enabled", True)
         }
-        decode_ready = sum(ready_by_model.values())
         decode_tickets = [
             t
             for t in pending_tickets
             if t.model_id in partner_ids
-            and t.lane == "decode"
+            and t.lane in ("decode", "default")
             and t.step.scheduler_output.total_num_scheduled_tokens
         ]
-        # Pipeline tickets often contain the same requests. Count the largest
-        # live batch per model, not the sum of launch-ahead tickets.
+
+        def batch(t):
+            # Decode tickets schedule one token per request; a merged ticket
+            # also carries prefill tokens, so count its requests.
+            out = t.step.scheduler_output
+            if t.lane == "default":
+                return len(out.num_scheduled_tokens)
+            return out.total_num_scheduled_tokens
+
         decode_load = sum(
             max(
                 ready,
                 max(
-                    (
-                        t.step.scheduler_output.total_num_scheduled_tokens
-                        for t in decode_tickets
-                        if t.model_id == mid
-                    ),
+                    (batch(t) for t in decode_tickets if t.model_id == mid),
                     default=0,
                 ),
             )
             for mid, ready in ready_by_model.items()
+        )
+        return sum(ready_by_model.values()), decode_load, decode_tickets
+
+    def _governs(self, model) -> bool:
+        """Whether the calibrated table decides this model's prefill tickets."""
+        if self.calibration is None:
+            return False
+        active_plans = (self.plan,) if len(self.plans) == 1 else self.plans
+        selected = next(
+            (p for p in active_plans if p.model_id in (model.model_id, "*")), None
+        )
+        return (
+            selected is not None
+            and selected.model_id == self.plan.model_id
+            and model.model_id == (self.calibrated_model or model.model_id)
+        )
+
+    def has_merged_candidate(self, model) -> bool:
+        return self._governs(model) and bool(self.calibration.has_merged)
+
+    def merged_choice(self, model, pending_tickets=()):
+        """Calibrated choice for the model's pending prefill: (merged?, record)
+        or None when no prefill work is pending (split execution then)."""
+        if not self._pending_prefills(model):
+            return None
+        tokens, waiting = self._estimate_ticket(model)
+        decode_ready, decode_load, decode_tickets = self._decode_load(
+            model, pending_tickets
+        )
+        candidate, _, score = self.calibration.choose(
+            tokens, decode_load, waiting, rule=self.rule
+        )
+        merged = self.calibration.is_merged(candidate)
+        return merged, self.merged_record(
+            model,
+            policy="calibrated",
+            candidate=candidate,
+            estimated_tokens=tokens,
+            waiting_behind=waiting,
+            cost_s=score if self.rule == "queue" else None,
+            partner_decode_ready_requests=decode_ready,
+            partner_decode_load=decode_load,
+            partner_decode_tickets=len(decode_tickets),
+            **self._prediction(tokens, decode_load),
+        )
+
+    def _prediction(self, tokens, n):
+        """Per-candidate predictions behind a calibrated choice: the Section 2
+        progress (tokens over the common window) under the progress rule, the
+        cost in seconds under the queue rule."""
+        if self.rule == "progress":
+            gains, timings = self.calibration.progress(tokens, n)
+            return {
+                "rule": "progress",
+                "predicted_progress": {k: round(v, 2) for k, v in gains.items()},
+                "window_s": timings["window_s"],
+                "decode_next_s": timings["decode_next_s"],
+            }
+        return {
+            "rule": "queue",
+            "predicted_cost_s": {
+                name: round(self.calibration.cost(name, tokens, n), 4)
+                for name in self.calibration.by_name
+            },
+        }
+
+    def merged_record(self, model, *, policy, **fields):
+        """Step-record entry for a merged ("default") ticket: no mask, the
+        decode stream is never restricted by a prefill plan."""
+        return {
+            "masked": False,
+            "enabled_tpcs": self.total_tpcs,
+            "policy": policy,
+            "candidate": fields.pop("candidate", "merged"),
+            "mode": "merged",
+            "mask_model_id": None,
+            "activation": self.activation,
+            "graph_bank": "unmasked",
+            **fields,
+        }
+
+    def before_dispatch(self, model, lane, pending_models, *, pending_tickets=()):
+        partner_active = any(
+            other.model_id != model.model_id
+            and (other.core.scheduler.running or other.model_id in pending_models)
+            for other in self.models
+        )
+        decode_ready, decode_load, decode_tickets = self._decode_load(
+            model, pending_tickets
         )
         protect = (
             partner_active
@@ -245,9 +342,17 @@ class ModelLaneMasks:
             ):
                 policy = "calibrated"
                 estimated_tokens, waiting_behind = self._estimate_ticket(model)
-                candidate, indices, cost_s = self.calibration.choose(
-                    estimated_tokens, decode_load, waiting_behind
+                # A prefill-stream ticket: the controller already decided
+                # against the merged batch for it (MultiModelController).
+                candidate, indices, score = self.calibration.choose(
+                    estimated_tokens,
+                    decode_load,
+                    waiting_behind,
+                    exclude_merged=True,
+                    rule=self.rule,
                 )
+                cost_s = score if self.rule == "queue" else None
+                prediction = self._prediction(estimated_tokens, decode_load)
                 masked = indices is not None
                 selected_indices = list(indices) if masked else ()
             if self.ctrl is None:
@@ -276,7 +381,9 @@ class ModelLaneMasks:
             else self.total_tpcs,
             "tier_min_decode": locals().get("tier_min_decode"),
             "policy": policy,
+            "mode": "split",
             "candidate": candidate,
+            **(locals().get("prediction") or {}),
             "estimated_tokens": estimated_tokens,
             "waiting_behind": locals().get("waiting_behind"),
             "shared_prefill_age_guard": getattr(self, "shared_prefill_age_guard", None),
@@ -377,7 +484,7 @@ class ModelLaneMasks:
             if getattr(m, "decode_enabled", True)
             for r in m.core.scheduler.running
         )
-        candidate, _, _ = self.calibration.choose(tokens, n, waiting)
+        candidate, _, _ = self.calibration.choose(tokens, n, waiting, rule=self.rule)
         duration = self.calibration.duration(candidate, tokens, n)
         now = self.clock()
         urgent = {}

@@ -473,12 +473,20 @@ class EngineCore:
         # placeholder accounting makes re-scheduling the same decode requests
         # safe, so neither the single-flight guard nor the inflight-id mark
         # applies to decode in that mode.
-        async_decode = getattr(self, "_hb_decode_depth", 1) > 1 and lane == "decode"
+        # The merged ("default") batch runs on the decode stream; with
+        # launch-ahead it joins the decode FIFO and placeholder accounting so
+        # stock-style hybrid batches pipeline like decode tickets do.
+        async_decode = getattr(self, "_hb_decode_depth", 1) > 1 and lane in (
+            "decode",
+            "default",
+        )
         inflight_lanes: set[str] = getattr(self, "_hb_inflight_lanes", set())
         if lane in inflight_lanes and not async_decode:
             raise RuntimeError(
                 f"Slack Serve lane already has an in-flight ticket: {lane}"
             )
+        if lane == "default":
+            self.scheduler._hb_async_default = async_decode
         scheduler_output = self.scheduler.schedule(lane=lane)
         scheduler_output.execution_lane = lane
         if lane not in ("decode", "default"):
@@ -520,7 +528,10 @@ class EngineCore:
     def complete(self, ticket: StepTicket, model_output: ModelRunnerOutput):
         """Publish one finished ticket and make its request ids schedulable."""
         lane = ticket.scheduler_output.execution_lane
-        async_decode = getattr(self, "_hb_decode_depth", 1) > 1 and lane == "decode"
+        async_decode = getattr(self, "_hb_decode_depth", 1) > 1 and lane in (
+            "decode",
+            "default",
+        )
         try:
             self._process_aborts_queue()
             return self.scheduler.update_from_output(

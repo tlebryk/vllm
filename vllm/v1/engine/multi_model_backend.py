@@ -116,6 +116,7 @@ class MultiModelBackend:
         mask_candidates=None,
         mask_calibration="off",
         mask_calibration_dir=None,
+        mask_rule="queue",
     ):
         if max_requests <= 0 or output_capacity <= decode_depth + 2:
             raise ValueError("invalid ingress/output capacity")
@@ -162,6 +163,9 @@ class MultiModelBackend:
             raise ValueError("mask calibration requires --slackserve-smctrl-mask")
         self.mask_candidates = mask_candidates
         self.mask_calibration = mask_calibration
+        if mask_rule not in ("queue", "progress"):
+            raise ValueError("mask policy rule must be queue or progress")
+        self.mask_rule = mask_rule
         self.mask_calibration_dir = (
             Path(
                 mask_calibration_dir
@@ -392,8 +396,8 @@ class MultiModelBackend:
     def _initialize(self):
         import torch
 
-        from vllm.v1.engine.colocated_model_config import validate_colocated_models
         from vllm.v1.core.shared_kv import SharedKVLayout, SharedKVManager
+        from vllm.v1.engine.colocated_model_config import validate_colocated_models
         from vllm.v1.engine.core import EngineCore
         from vllm.v1.executor import Executor
 
@@ -529,11 +533,14 @@ class MultiModelBackend:
             ]
             raw.append({"name": "none", "indices": None})
         candidates = normalize_candidates(raw)
+        merged = [c["name"] for c in candidates if c.get("mode") == "merged"]
         key = calibration_key(
             {
                 "gpu": torch.cuda.get_device_properties(0).name,
                 "total_tpcs": self.total_tpcs,
                 "candidates": [c["indices"] for c in candidates],
+                # Keys of tables without a merged-batch candidate are unchanged.
+                **({"merged": merged} if merged else {}),
                 "model": spec.model,
                 "revision": spec.revision,
                 "dtype": str(config.model_config.dtype),
@@ -569,10 +576,12 @@ class MultiModelBackend:
             )
         self.lane_masks.calibration = table
         self.lane_masks.calibrated_model = model_id
+        self.lane_masks.rule = self.mask_rule
         self.calibration_path = str(path)
         if isinstance(self.mask_metadata, dict):
             self.mask_metadata["calibration"] = table.summary()
             self.mask_metadata["calibration_path"] = str(path)
+            self.mask_metadata["calibration_rule"] = self.mask_rule
 
     def _observe_step(self, record):
         assert self.step_trace_file is not None

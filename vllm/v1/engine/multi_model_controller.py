@@ -52,6 +52,7 @@ class ModelTicket:
     policy_phase: str = "round-robin"
     kv_admission_policy: str = "current"
     smctrl_mask: dict | None = None
+    mode_switch: bool = False
 
 
 @dataclass
@@ -61,6 +62,7 @@ class DrainResult:
     watermark_skips: int = 0
     idle_watermark_bypasses: int = 0
     hybrid_steps: int = 0
+    merged_switches: int = 0
     model_phases: list[dict[str, Any]] = field(default_factory=list)
     policy_transitions: list[dict[str, Any]] = field(default_factory=list)
 
@@ -238,14 +240,20 @@ class MultiModelController:
         hybrid_min_decode: int = 0,
     ) -> None:
         self.models = list(models)
-        # Stock-fallback policy: below this many decode-ready requests the
-        # generation model runs the scheduler's merged ("default") batch on the
-        # decode stream, unmasked, instead of split prefill/decode steps.
+        # Merged-batch ("default" lane) execution: the generation model runs
+        # the scheduler's stock mixed batch (prefill chunks and decodes in one
+        # forward) on the decode stream, unmasked, with the same launch-ahead
+        # depth as decode tickets. Entered either below ``hybrid_min_decode``
+        # decode-ready requests (fixed gate with hysteresis) or when the
+        # calibrated policy's merged candidate has the least cost for the
+        # pending prefill (see ModelLaneMasks.merged_choice).
         if hybrid_min_decode < 0:
             raise ValueError("hybrid_min_decode must be nonnegative")
         self.hybrid_min_decode = hybrid_min_decode
         self.hybrid_hysteresis = max(1, hybrid_min_decode // 4)
         self._stock_mode = False
+        self._merged_mode: dict[str, bool] = {}
+        self._merged_record: dict[str, dict | None] = {}
         # Run-time timing for the decode-headroom admission guard: EMA of the
         # prefill ticket duration and of the decode step period (completion
         # to completion, so launch-ahead queueing does not inflate it).
@@ -295,6 +303,13 @@ class MultiModelController:
         sched = model.core.scheduler
         # Prefill must also exclude requests owned by async decode tickets.
         inflight = set(sched._hb_inflight_req_ids)
+        if lane == "default":
+            # Merged batch on the decode stream: any request not owned by a
+            # prefill-stream ticket (requests in older decode-stream tickets
+            # are rescheduled behind them, like decode launch-ahead).
+            return any(
+                r.request_id not in inflight for r in (*sched.waiting, *sched.running)
+            )
         if lane == "prefill":
             inflight.update(getattr(sched, "_hb_async_decode_refs", ()))
             return any(r.request_id not in inflight for r in sched.waiting) or any(
@@ -377,6 +392,58 @@ class MultiModelController:
                 if self._prefill_ticket_ms is None
                 else 0.8 * self._prefill_ticket_ms + 0.2 * elapsed
             )
+
+    def _merged_now(self, model: ModelEndpoint, pending) -> bool:
+        """Whether ``model``'s next decode-stream ticket is a merged batch.
+
+        Precedence: a calibration probe forcing the mode; the calibrated
+        policy's per-ticket choice when its table has a merged candidate and
+        prefill work is pending (no pending prefill means split: a merged
+        batch without prefill is a decode ticket); else the fixed
+        ``hybrid_min_decode`` gate with hysteresis.
+        """
+        masks = self.lane_masks
+        mid = model.model_id
+        forced = getattr(masks, "force_merged", None) if masks is not None else None
+        if forced is not None:
+            self._merged_record[mid] = (
+                masks.merged_record(model, policy="forced") if forced else None
+            )
+            return bool(forced)
+        if masks is not None and masks.has_merged_candidate(model):
+            tickets = [t for fifo in pending.values() for t in fifo]
+            decision = masks.merged_choice(model, tickets)
+            if decision is None:
+                self._merged_record[mid] = None
+                return False
+            merged, record = decision
+            self._merged_record[mid] = record if merged else None
+            return merged
+        if not self.hybrid_min_decode:
+            self._merged_record[mid] = None
+            return False
+        sched = model.core.scheduler
+        ready = sum(r.num_computed_tokens >= r.num_prompt_tokens for r in sched.running)
+        enter = self.hybrid_min_decode
+        leave = self.hybrid_min_decode + self.hybrid_hysteresis
+        if self._stock_mode and ready >= leave:
+            self._stock_mode = False
+        elif not self._stock_mode and ready < enter:
+            self._stock_mode = True
+        self._merged_record[mid] = (
+            {
+                "masked": False,
+                "policy": "gate",
+                "candidate": "merged",
+                "mode": "merged",
+                "partner_decode_ready_requests": ready,
+                "hybrid_min_decode": enter,
+                "hybrid_leave": leave,
+            }
+            if self._stock_mode
+            else None
+        )
+        return self._stock_mode
 
     def _growth_blocks(self, block_size: int) -> int:
         """Blocks one decoding request grows by during one prefill ticket."""
@@ -462,7 +529,9 @@ class MultiModelController:
         def complete(ticket: ModelTicket) -> None:
             model = self.by_id[ticket.model_id]
             core = model.core
-            if ticket.lane == "decode":
+            if ticket.lane == "decode" or (
+                ticket.lane == "default" and model.async_decode
+            ):
                 owned = core._hb_decode_fifo.popleft()
                 if owned is not ticket.step:
                     raise RuntimeError("per-model decode publication is out of order")
@@ -471,13 +540,24 @@ class MultiModelController:
             scheduled = ticket.step.scheduler_output
             productive = scheduled.total_num_scheduled_tokens > 0
             if productive:
-                self._observe_timing(ticket.lane, ticket.dispatched_at)
+                # A merged step without prefill tokens is a decode period.
+                lane = ticket.lane
+                if lane == "default":
+                    lane = (
+                        "decode"
+                        if scheduled.total_num_scheduled_tokens
+                        == len(scheduled.num_scheduled_tokens)
+                        else "merged"
+                    )
+                self._observe_timing(lane, ticket.dispatched_at)
             core.post_step(model_executed=productive)
             model.publish(outputs)
             if self.record_steps or self.step_observer is not None:
                 record = {
                     "model_id": ticket.model_id,
                     "lane": ticket.lane,
+                    "execution_mode": "merged" if ticket.lane == "default" else "split",
+                    "mode_switch": ticket.mode_switch,
                     "t_start": ticket.dispatched_at,
                     "t_end": time.perf_counter(),
                     "dispatch_ms": ticket.dispatch_ms,
@@ -516,6 +596,8 @@ class MultiModelController:
                 reclamation_blocked.clear()
                 admission_blocked.clear()
 
+        last_mode: dict[str, str] = {}
+
         def dispatch(model: ModelEndpoint, lane: str) -> None:
             sched = model.core.scheduler
             free = sched.kv_cache_manager.block_pool.get_num_free_blocks()
@@ -546,7 +628,10 @@ class MultiModelController:
             previous_guard = getattr(sched, "_hb_kv_admission_guard", None)
             previous_budget = getattr(sched, "_hb_step_token_budget", None)
             sched._hb_kv_admission_guard = guard
-            if lane == "prefill" and model.prefill_step_tokens:
+            # Merged batches take the prefill stream's work unit too: the
+            # engine's memory profile covers that unit, not a full-budget
+            # merged step on the decode stream (131K-token steps OOM'd).
+            if lane in ("prefill", "default") and model.prefill_step_tokens:
                 sched._hb_step_token_budget = model.prefill_step_tokens
             try:
                 if self.decode_streams is not None:
@@ -559,7 +644,7 @@ class MultiModelController:
                         pending_tickets=[t for fifo in pending.values() for t in fifo],
                     )
                     if self.lane_masks is not None and lane != "default"
-                    else None
+                    else self._merged_record.get(model.model_id)
                 )
                 if (
                     self.adaptive_dense_steps
@@ -576,6 +661,20 @@ class MultiModelController:
             finally:
                 sched._hb_kv_admission_guard = previous_guard
                 sched._hb_step_token_budget = previous_budget
+            # Execution mode of this ticket on the generation model: the first
+            # productive ticket after a merged<->split change is marked so the
+            # switching cost (empty passes, drained pipelines) can be read off
+            # the trace. Empty flush passes do not change the mode.
+            mode = "merged" if lane == "default" else "split"
+            mode_switch = False
+            if (
+                model.decode_enabled
+                and step.scheduler_output.total_num_scheduled_tokens
+            ):
+                mode_switch = last_mode.get(model.model_id, mode) != mode
+                if mode_switch:
+                    result.merged_switches += 1
+                last_mode[model.model_id] = mode
             ticket = ModelTicket(
                 model.model_id,
                 lane,
@@ -590,13 +689,17 @@ class MultiModelController:
                 if guard is not None
                 else "current",
                 mask_record,
+                mode_switch,
             )
-            if lane == "decode":
-                model.core._hb_decode_fifo.append(step)
             # Merged ("default") batches run on the decode stream and publish
-            # through the decode FIFO; they are synchronous inflight tickets.
+            # through the decode FIFO. With launch-ahead they are pipelined
+            # exactly like decode tickets (placeholders, FIFO publication);
+            # without it they are synchronous inflight tickets.
+            pipelined = lane == "decode" or (lane == "default" and model.async_decode)
+            if pipelined:
+                model.core._hb_decode_fifo.append(step)
             publish_lane = "decode" if lane == "default" else lane
-            if step.scheduler_output.total_num_scheduled_tokens or lane == "decode":
+            if step.scheduler_output.total_num_scheduled_tokens or pipelined:
                 # Empty decode passes also mutate worker/request state. Publish
                 # them behind older tickets, not inline ahead of placeholders.
                 pending[publish_lane].append(ticket)
@@ -610,8 +713,10 @@ class MultiModelController:
                     reclamation_blocked[model.model_id, lane] = needed
                 if getattr(step.scheduler_output, "kv_admission_deferred", False):
                     admission_blocked.add((model.model_id, lane))
-                if lane != "decode":
+                if not pipelined:
                     complete(ticket)
+
+        merged_models: set[str] = set()
 
         def choose(
             lane: str, *, bypass_watermark: bool = False, exclusive_only: bool = False
@@ -656,7 +761,11 @@ class MultiModelController:
                     continue
                 if bulk_tail is not None and not bulk_tail.permits(model, lane):
                     continue
-                key = (model.model_id, lane)
+                merged = model.model_id in merged_models
+                if merged and lane == "prefill":
+                    # This model's prefill rides in its merged batches.
+                    continue
+                key = (model.model_id, "default" if merged else lane)
                 if key in admission_blocked:
                     sched = model.core.scheduler
                     if (
@@ -692,7 +801,7 @@ class MultiModelController:
                         # normal scheduling/preemption rather than deadlock.
                         blocked.discard(key)
                         del reclamation_blocked[key]
-                if (model.model_id, lane) in blocked or not self._ready(model, lane):
+                if key in blocked or not self._ready(model, key[1]):
                     continue
                 if lane == "prefill" and not bypass_watermark:
                     pool = model.core.scheduler.kv_cache_manager.block_pool
@@ -745,48 +854,21 @@ class MultiModelController:
                 dispatch(exclusive, "prefill")
                 progress = True
                 exclusive_pending = True
-            # Stock-mode policy (per step): below hybrid_min_decode decode-ready
-            # requests the generation model stops issuing split prefill/decode
-            # tickets, drains, and runs merged ("default") batches on the
-            # decode stream, unmasked, like stock. It leaves stock mode once
-            # the decode-ready count reaches hybrid_min_decode + hysteresis.
-            hybrid_inflight = any(t.lane == "default" for t in pending["decode"])
-            stock_mode = False
-            if self.hybrid_min_decode and not exclusive_pending and exclusive is None:
+            # Merged-batch mode, decided per pass for each generation model
+            # (fixed gate or calibrated choice, see _merged_now). In merged
+            # mode the model's next decode-stream ticket is the scheduler's
+            # stock mixed batch ("default" lane: resident decodes plus waiting
+            # prefill chunks), pipelined to the same depth as decode tickets;
+            # its prefill stream stays idle. Switching needs no drain: a
+            # request is owned by at most one stream at a time (prefill-stream
+            # tickets mark their ids; decode-stream tickets share FIFO order).
+            merged_models.clear()
+            if not exclusive_pending and exclusive is None:
                 for model in self.models:
-                    if not model.decode_enabled:
-                        continue
-                    sched = model.core.scheduler
-                    ready = sum(
-                        r.num_computed_tokens >= r.num_prompt_tokens
-                        for r in sched.running
-                    )
-                    enter, leave = (
-                        self.hybrid_min_decode,
-                        self.hybrid_min_decode + self.hybrid_hysteresis,
-                    )
-                    if self._stock_mode and ready >= leave:
-                        self._stock_mode = False
-                    elif not self._stock_mode and ready < enter:
-                        self._stock_mode = True
-                    stock_mode = self._stock_mode
-                    if stock_mode and not any(pending.values()):
-                        if (
-                            sched.has_requests()
-                            and (model.model_id, "default") not in blocked
-                        ):
-                            dispatch(model, "default")
-                            result.hybrid_steps += 1
-                            progress = True
-                            hybrid_inflight = True
-                    break
+                    if model.decode_enabled and self._merged_now(model, pending):
+                        merged_models.add(model.model_id)
             for lane, capacity in (("decode", self.decode_depth), ("prefill", 1)):
-                if (
-                    exclusive_pending
-                    or exclusive is not None
-                    or hybrid_inflight
-                    or stock_mode
-                ):
+                if exclusive_pending or exclusive is not None:
                     continue
                 if len(pending[lane]) >= capacity:
                     continue
@@ -794,7 +876,11 @@ class MultiModelController:
                     continue
                 model = choose(lane)
                 if model is not None:
-                    dispatch(model, lane)
+                    if lane == "decode" and model.model_id in merged_models:
+                        dispatch(model, "default")
+                        result.hybrid_steps += 1
+                    else:
+                        dispatch(model, lane)
                     progress = True
             if progress:
                 yield True

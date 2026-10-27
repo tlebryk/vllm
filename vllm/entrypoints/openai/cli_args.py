@@ -212,6 +212,11 @@ class BaseFrontendArgs:
     """
     slackserve_mask_calibration_dir: str | None = None
     """Cache directory for calibration tables (default ~/.cache/slackserve)."""
+    slackserve_mask_rule: str = "queue"
+    """Decision rule over the calibrated table: queue (measured cost
+    D × (1 + W + n × dilation)) or progress (token progress over a common
+    window, comparing masks and the merged-batch candidate; W unused).
+    """
     slackserve_smctrl_max_dense_wait_ms: float = 0
     """Restore full-GPU dense access once its oldest request reaches this age.
 

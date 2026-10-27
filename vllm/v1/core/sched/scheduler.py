@@ -109,6 +109,10 @@ class Scheduler(SchedulerInterface):
         # resumed on the prefill lane until every older decode ticket has
         # published.
         self._hb_async_decode_refs: dict[str, int] = defaultdict(int)
+        # Set by EngineCore.dispatch when the merged ("default") lane runs
+        # with decode launch-ahead: it then shares the decode stream, FIFO and
+        # placeholder accounting, so async-decode refs do not exclude requests.
+        self._hb_async_default = False
         self._hb_preemptions_by_lane: dict[str, int] = defaultdict(int)
 
         # Scheduling constraints.
@@ -374,10 +378,16 @@ class Scheduler(SchedulerInterface):
         # constrains its otherwise normal admission policy to that phase.
         # A request becomes decode-ready after its prompt KV has been computed.
         # The default path is intentionally unchanged.
+        # Lanes that run on the decode stream with launch-ahead may reschedule
+        # requests an older ticket of that stream still owns (FIFO order).
+        shares_async_refs = lane == "decode" or (
+            lane == "default" and self._hb_async_default
+        )
+
         def lane_accepts(request: Request) -> bool:
             if self.is_hb_inflight(
                 request.request_id,
-                include_async_decode=lane != "decode",
+                include_async_decode=not shares_async_refs,
             ):
                 return False
             if lane == "default":
@@ -398,7 +408,7 @@ class Scheduler(SchedulerInterface):
         # Candidate work-unit shaping belongs to the launch policy. Engine
         # buffers and scheduling capacity retain their full configured size.
         step_budget = getattr(self, "_hb_step_token_budget", None)
-        if lane == "prefill" and step_budget is not None:
+        if lane in ("prefill", "default") and step_budget is not None:
             token_budget = min(token_budget, step_budget)
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
@@ -650,7 +660,7 @@ class Scheduler(SchedulerInterface):
 
                 if self.is_hb_inflight(
                     request_id,
-                    include_async_decode=lane != "decode",
+                    include_async_decode=not shares_async_refs,
                 ):
                     request_queue.pop_request()
                     step_skipped_waiting.prepend_request(request)
