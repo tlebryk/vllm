@@ -178,6 +178,8 @@ class CalibrationTable:
         queued_tokens: int = 0,
         queued_requests: int = 0,
         work_unit: int | None = None,
+        remaining_output_tokens: float | None = None,
+        incoming_output_tokens: float = 0.0,
     ):
         """Paper Section 2: output tokens each candidate produces over one
         common window, for B = n resident decodes and an incoming prefill of
@@ -195,8 +197,14 @@ class CalibrationTable:
         each add a first token and grow the batch (mean batch B + (k-1)/2
         while busy, B + k after), and the merged batch serves R in
         ceil(R / work_unit) steps, each advancing every resident decode once.
-        With no queue this is exactly the single-ticket rule. Returns
-        {name: tokens} plus the per-candidate timings used."""
+        With no queue this is exactly the single-ticket rule.
+
+        ``remaining_output_tokens`` (the residents' remaining prescribed output,
+        max_tokens minus generated) bounds the decode credit: Section 2 assumes
+        no departures, but short outputs finish during a long prefill, after
+        which no candidate earns decode progress from them. The incoming
+        prefill's requests add ``incoming_output_tokens`` after their first
+        token. Returns {name: tokens} plus the per-candidate timings used."""
         alone_now = self.decode_alone_ms(n) / 1000
         k = 1 + max(0, int(queued_requests))
         total = tokens + max(0, int(queued_tokens))
@@ -225,23 +233,31 @@ class CalibrationTable:
             window = max(
                 t.get("prefill_s", t.get("step_s", 0.0)) for t in timings.values()
             )
+        pool_busy = pool_post = math.inf
+        if remaining_output_tokens is not None:
+            # Decode work that exists: residents' remaining tokens while the
+            # prefill runs (plus half the queued requests' outputs as they
+            # join), then everything including the incoming requests' outputs.
+            pool_busy = remaining_output_tokens + (k - 1) / 2.0 * incoming_output_tokens
+            pool_post = remaining_output_tokens + k * incoming_output_tokens
         out = {}
         for name, t in timings.items():
             if t["mode"] == "merged":
                 remaining = max(0.0, window - t["step_s"])
-                out[name] = busy_batch * t["steps"] + k + (n + k) * remaining / t_next
+                busy = busy_batch * t["steps"]
             else:
                 remaining = max(0.0, window - t["prefill_s"])
-                out[name] = (
-                    busy_batch * t["prefill_s"] / t["decode_par_s"]
-                    + k
-                    + (n + k) * remaining / t_next
-                )
+                busy = busy_batch * t["prefill_s"] / t["decode_par_s"]
+            busy = min(busy, pool_busy)
+            after = min((n + k) * remaining / t_next, max(0.0, pool_post - busy))
+            out[name] = busy + k + after
         return out, {
             "window_s": window,
             "decode_next_s": t_next,
             "queued_tokens": max(0, int(queued_tokens)),
             "queued_requests": max(0, int(queued_requests)),
+            "remaining_output_tokens": remaining_output_tokens,
+            "incoming_output_tokens": incoming_output_tokens,
             **timings,
         }
 
@@ -255,6 +271,8 @@ class CalibrationTable:
         rule: str = "queue",
         queued_tokens: int = 0,
         work_unit: int | None = None,
+        remaining_output_tokens: float | None = None,
+        incoming_output_tokens: float = 0.0,
     ) -> tuple[str, list[int] | None, float]:
         """Best candidate name, its TPC set (None for unrestricted and for the
         merged batch; see ``is_merged``) and its score: seconds of cost under
@@ -274,6 +292,8 @@ class CalibrationTable:
                 queued_tokens=queued_tokens if rule == "progress_queue" else 0,
                 queued_requests=waiting if rule == "progress_queue" else 0,
                 work_unit=work_unit,
+                remaining_output_tokens=remaining_output_tokens,
+                incoming_output_tokens=incoming_output_tokens,
             )
             # Ties go to the sooner first token.
             best = max(

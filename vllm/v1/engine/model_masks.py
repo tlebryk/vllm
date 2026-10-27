@@ -231,17 +231,12 @@ class ModelLaneMasks:
         progress (tokens over the common window) under the progress rules, the
         cost in seconds under the queue rule."""
         if self.rule in ("progress", "progress_queue"):
-            queued, unit = (
-                self._queue_context(model, tokens)
-                if self.rule == "progress_queue"
-                else (0, None)
-            )
+            kwargs = self._progress_kwargs(model, tokens, waiting)
             gains, timings = self.calibration.progress(
                 tokens,
                 n,
-                queued_tokens=queued,
                 queued_requests=waiting if self.rule == "progress_queue" else 0,
-                work_unit=unit,
+                **kwargs,
             )
             return {
                 "rule": self.rule,
@@ -250,6 +245,8 @@ class ModelLaneMasks:
                 "decode_next_s": timings["decode_next_s"],
                 "queued_tokens": timings["queued_tokens"],
                 "queued_requests": timings["queued_requests"],
+                "remaining_output_tokens": timings["remaining_output_tokens"],
+                "incoming_output_tokens": timings["incoming_output_tokens"],
             }
         return {
             "rule": "queue",
@@ -495,13 +492,54 @@ class ModelLaneMasks:
         )
         return max(0, int(pending) - int(tokens)), unit
 
-    def _choose(self, model, tokens, n, waiting, *, exclude_merged=False):
-        """calibration.choose under this policy's rule, with the queued work
-        the progress_queue rule needs."""
+    def _output_context(self, model) -> tuple[float, float]:
+        """Remaining prescribed output tokens of the resident decodes (the
+        models whose decode load the choice counts) and the prescribed output
+        of the pending prefills: both public request limits, never observed
+        or predicted natural lengths."""
+        partners = [
+            m
+            for m in self.models
+            if (m.model_id != model.model_id or self.plan.lane == "prefill")
+            and getattr(m, "decode_enabled", True)
+        ]
+        remaining = 0.0
+        for other in partners:
+            for r in other.core.scheduler.running:
+                if getattr(r, "num_computed_tokens", 0) >= getattr(
+                    r, "num_prompt_tokens", 1
+                ):
+                    remaining += max(
+                        0,
+                        getattr(r, "max_tokens", 0) - getattr(r, "num_output_tokens", 0),
+                    )
+        incoming = float(
+            sum(getattr(r, "max_tokens", 0) for r in self._pending_prefills(model))
+        )
+        return remaining, incoming
+
+    def _progress_kwargs(self, model, tokens, waiting):
+        """Known-state inputs of the progress rules."""
         queued, unit = (
             self._queue_context(model, tokens)
             if self.rule == "progress_queue"
             else (0, None)
+        )
+        remaining, incoming = self._output_context(model)
+        return dict(
+            queued_tokens=queued,
+            work_unit=unit,
+            remaining_output_tokens=remaining,
+            incoming_output_tokens=incoming,
+        )
+
+    def _choose(self, model, tokens, n, waiting, *, exclude_merged=False):
+        """calibration.choose under this policy's rule, with the known-state
+        inputs the progress rules need."""
+        kwargs = (
+            self._progress_kwargs(model, tokens, waiting)
+            if self.rule in ("progress", "progress_queue")
+            else {}
         )
         return self.calibration.choose(
             tokens,
@@ -509,8 +547,7 @@ class ModelLaneMasks:
             waiting,
             exclude_merged=exclude_merged,
             rule=self.rule,
-            queued_tokens=queued,
-            work_unit=unit,
+            **kwargs,
         )
 
     def prefill_priority_indices(self, indices):
