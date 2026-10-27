@@ -386,10 +386,20 @@ class MultiModelBackend:
     def _initialize(self):
         import torch
 
+        from vllm.v1.engine.colocated_model_config import validate_colocated_models
         from vllm.v1.core.shared_kv import SharedKVLayout, SharedKVManager
         from vllm.v1.engine.core import EngineCore
         from vllm.v1.executor import Executor
 
+        self.colocated_pooling = validate_colocated_models(
+            self.specs, self.mode, self.topology
+        )
+        if (
+            self.colocated_pooling
+            and self.topology == "single-stream"
+            and self.mask_plans
+        ):
+            raise ValueError("colocated serial control must not apply stream masks")
         if self.mode != "private":
             layouts = [
                 SharedKVLayout(
@@ -425,9 +435,17 @@ class MultiModelBackend:
                 if self.manager is not None
                 else nullcontext()
             ):
+                executor_class = Executor.get_class(config)
+                if self.colocated_pooling and spec.runner == "pooling":
+                    from vllm.v1.executor.colocated_pooling_executor import (
+                        colocated_pooling_executor,
+                    )
+
+                    owner = self.cores[self.specs[0].model_id].model_executor
+                    executor_class = colocated_pooling_executor(owner, spec.model_id)
                 core = EngineCore(
                     config,
-                    Executor.get_class(config),
+                    executor_class,
                     log_stats=True,
                     include_finished_set=True,
                 )
@@ -563,9 +581,15 @@ class MultiModelBackend:
 
         serial = self.topology == "single-stream"
         if self.distributed:
-            if serial or len(self.specs) != 1:
+            colocated = getattr(self, "colocated_pooling", False)
+            if not colocated and (serial or len(self.specs) != 1):
                 raise ValueError(
                     "TP>1 native serving supports one model on separate streams"
+                )
+            if colocated:
+                owner = self.cores[self.specs[0].model_id].model_executor
+                self.colocated_worker_streams = owner.collective_rpc(
+                    "configure_colocated_streams", kwargs={"serial": serial}
                 )
             prefill = None
             streams = {}
@@ -810,7 +834,9 @@ class MultiModelBackend:
                     torch.accelerator.synchronize()
                 if self.lane_masks is not None:
                     self.lane_masks.reset()
-                for core in self.cores.values():
+                # Auxiliary models borrow the first core's transport/context.
+                # Drop them before shutting down their owner processes.
+                for core in reversed(list(self.cores.values())):
                     core.shutdown()
             except BaseException:
                 logger.exception("multi-model backend teardown failed")
@@ -856,6 +882,7 @@ class MultiModelBackend:
             "admission": self.admission,
             "topology": self.topology,
             "execution_stream_ids": self.execution_stream_ids,
+            "colocated_worker_streams": getattr(self, "colocated_worker_streams", None),
             "offline_model_serial": serial,
             "step_trace": str(self.step_trace) if self.step_trace is not None else None,
             "smctrl_mask": self.mask_metadata,

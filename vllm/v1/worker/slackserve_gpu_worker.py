@@ -25,6 +25,34 @@ def prefill_lane_names() -> list[str]:
 
 
 class SlackServeGPUWorker(GPUWorker):
+    def init_colocated_pooling(self, model_id, config):
+        from vllm.v1.worker.colocated_pooling import initialize
+
+        return initialize(self, model_id, config)
+
+    def colocated_pooling_rpc(self, model_id, method, args, kwargs):
+        from vllm.v1.worker.colocated_pooling import dispatch
+
+        return dispatch(self, model_id, method, args, kwargs)
+
+    def drop_colocated_pooling(self, model_id):
+        from vllm.v1.worker.colocated_pooling import drop
+
+        drop(self, model_id)
+
+    def configure_colocated_streams(self, serial=False):
+        if serial:
+            self.bind_lane_streams(self.decode_stream, self.decode_stream, serial=True)
+        for worker in getattr(self, "_colocated_pooling", {}).values():
+            worker.prefill_stream = self.lane_streams["prefill"]
+        return dict(
+            rank=self.rank,
+            pid=os.getpid(),
+            prefill=self.lane_streams["prefill"].cuda_stream,
+            decode=self.decode_stream.cuda_stream,
+            pooling_models=list(getattr(self, "_colocated_pooling", {})),
+        )
+
     def init_device(self) -> None:
         self.slackserve_config = SlackServeConfig.from_vllm_config(self.vllm_config)
         super().init_device()
