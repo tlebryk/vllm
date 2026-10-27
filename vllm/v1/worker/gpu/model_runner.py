@@ -1044,6 +1044,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             model_inputs["inputs_embeds"] = None
             assert intermediate_tensors is not None
 
+        # Piecewise wrappers do not copy inputs. Their captured PP activation
+        # addresses must be populated just as for full-graph replay.
+        if batch_desc.cg_mode == CUDAGraphMode.PIECEWISE:
+            model_inputs["intermediate_tensors"] = (
+                self.cudagraph_manager.prepare_pp_inputs(
+                    batch_desc, intermediate_tensors
+                )
+            )
+
         # Run model.
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.

@@ -702,6 +702,12 @@ class SlackServeModelRunner(GPUModelRunner):
         )
 
         # Run model.
+        if batch_desc.cg_mode == CUDAGraphMode.PIECEWISE:
+            model_inputs["intermediate_tensors"] = (
+                self.cudagraph_manager.prepare_pp_inputs(
+                    batch_desc, intermediate_tensors
+                )
+            )
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
             # NOTE(woosuk): Here, we don't need to pass the input tensors,

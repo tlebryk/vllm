@@ -399,12 +399,12 @@ class ModelCudaGraphManager(CudaGraphManager):
 
         super().capture(create_forward_fn, progress_bar_desc)
 
-    def run_fullgraph(
+    def prepare_pp_inputs(
         self,
         desc: BatchExecutionDescriptor,
-        intermediate_tensors: IntermediateTensors | None = None,
-    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
-        """Copy received PP activations into graph-owned inputs, then replay."""
+        intermediate_tensors: IntermediateTensors | None,
+    ) -> IntermediateTensors | None:
+        """Use the same activation addresses for capture and either replay mode."""
         if desc in self.pp_inputs:
             assert intermediate_tensors is not None
             target = self.pp_inputs[desc]
@@ -415,6 +415,16 @@ class ModelCudaGraphManager(CudaGraphManager):
                     raise ValueError("PP activations exceed captured input size")
                 buffer[:count].copy_(value)
                 buffer[count:].zero_()
+            return target
+        return intermediate_tensors
+
+    def run_fullgraph(
+        self,
+        desc: BatchExecutionDescriptor,
+        intermediate_tensors: IntermediateTensors | None = None,
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+        """Copy received PP activations into graph-owned inputs, then replay."""
+        self.prepare_pp_inputs(desc, intermediate_tensors)
         super().run_fullgraph(desc)
         if desc in self.pp_outputs:
             return self.pp_outputs[desc]
