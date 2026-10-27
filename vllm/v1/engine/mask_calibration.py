@@ -120,7 +120,7 @@ class CalibrationTable:
                 "n": [float(c["n"]) for c in cells],
                 "rate": [float(c["prefill_tok_s"]) for c in cells],
                 "dilation": [float(c["dilation"]) for c in cells],
-                "alone_ms": [float(c["decode_alone_ms"]) for c in cells],
+                "alone_ms": [float(c.get("decode_alone_ms", 0.0)) for c in cells],
             }
         if not self.by_name:
             raise ValueError("empty calibration table")
