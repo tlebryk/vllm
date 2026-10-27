@@ -127,17 +127,22 @@ def _register_group(group: "GroupCoordinator") -> None:
     _groups[group.unique_name] = weakref.ref(group)
 
 
+def _stream_collective_group(group):
+    # Compiled operators retain the original group name. Eager prefill uses
+    # separate communicators from decode, including MoE reductions.
+    for default, state in ((_TP, _TP_OVERRIDE), (_EP, _EP_OVERRIDE)):
+        override = getattr(state, "group", None)
+        if override is not None and default is not None and group is default:
+            return override
+    return group
+
+
 def all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
     assert group_name in _groups, f"Group {group_name} is not found."
     group = _groups[group_name]()
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
-    # Compiled graphs bake in the TP group name; a thread running the same
-    # compiled model on a SlackServe prefill stream redirects TP all-reduces
-    # to its own communicator via the per-thread override.
-    override = getattr(_TP_OVERRIDE, "group", None)
-    if override is not None and _TP is not None and group_name == _TP.unique_name:
-        group = override
+    group = _stream_collective_group(group)
     return group._all_reduce_out_place(tensor)
 
 
@@ -152,6 +157,7 @@ def reduce_scatter(
     group = _groups[group_name]()
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
+    group = _stream_collective_group(group)
     return group._reduce_scatter_out_place(tensor, dim)
 
 
@@ -170,6 +176,7 @@ def all_gather(
     group = _groups[group_name]()
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
+    group = _stream_collective_group(group)
     return group._all_gather_out_place(tensor, dim)
 
 
@@ -1225,6 +1232,8 @@ _TP: GroupCoordinator | None = None
 import threading as _threading
 
 _TP_OVERRIDE = _threading.local()
+_PP_OVERRIDE = _threading.local()
+_EP_OVERRIDE = _threading.local()
 
 
 def get_tp_group() -> GroupCoordinator:
@@ -1250,6 +1259,9 @@ _PP: GroupCoordinator | None = None
 
 
 def get_pp_group() -> GroupCoordinator:
+    override = getattr(_PP_OVERRIDE, "group", None)
+    if override is not None:
+        return override
     assert _PP is not None, "pipeline model parallel group is not initialized"
     return _PP
 
@@ -1266,6 +1278,9 @@ _EP: GroupCoordinator | None = None
 
 
 def get_ep_group() -> GroupCoordinator:
+    override = getattr(_EP_OVERRIDE, "group", None)
+    if override is not None:
+        return override
     assert _EP is not None, (
         "expert parallel group is not initialized. "
         "EP group is only created for MoE models with num_experts > 0. "

@@ -1058,7 +1058,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # NOTE(woosuk): Here, we don't need to pass the input tensors,
             # because they are already copied to the CUDA graph input buffers.
             self.kv_connector.pre_forward(scheduler_output)
-            model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
+            model_output = self.cudagraph_manager.run_fullgraph(
+                batch_desc, intermediate_tensors
+            )
             if self.use_aux_hidden_state_outputs:
                 hidden_states, aux_hidden_states = model_output
             else:

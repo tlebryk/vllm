@@ -21,6 +21,7 @@ class SlackServeConfig:
     fa_sm_margin_decode: int = 0
     fa_sm_margin_prefill: int = 0
     prefill_custom_ops: str = ""
+    prefill_step_tokens: int = 0
     prefill_sm_target: int = 0
     sm_target_min_m: int = 256
     # Explicit multi-model configurations use controller-owned lane masks.

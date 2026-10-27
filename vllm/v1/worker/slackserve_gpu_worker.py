@@ -111,6 +111,9 @@ class SlackServeGPUWorker(GPUWorker):
         from vllm.distributed import parallel_state
 
         self._prefill_tp_group = None
+        self._prefill_pp_group = None
+        self._prefill_ep_group = None
+        self._lane_pp_send_work = {}
         self._mask_ctrl = None
         self._applied_mask: tuple[int, ...] | None = None
         tp = parallel_state.get_tp_group()
@@ -126,6 +129,37 @@ class SlackServeGPUWorker(GPUWorker):
                 "nccl",
                 group_name="slackserve_prefill",
             )
+        pp = parallel_state.get_pp_group()
+        if pp.world_size > 1:
+            world = torch.distributed.get_world_size()
+            stage_width = tp.world_size
+            groups = [
+                [base + offset + stage * stage_width for stage in range(pp.world_size)]
+                for base in range(0, world, stage_width * pp.world_size)
+                for offset in range(stage_width)
+            ]
+            self._prefill_pp_group = parallel_state.init_model_parallel_group(
+                groups,
+                parallel_state.get_world_group().local_rank,
+                "nccl",
+                group_name="slackserve_prefill_pp",
+            )
+        if self.parallel_config.enable_expert_parallel:
+            if self.parallel_config.data_parallel_size != 1:
+                raise ValueError("native EP currently supports one DP replica")
+            ep = parallel_state.get_ep_group()
+            if ep.world_size > 1:
+                world = torch.distributed.get_world_size()
+                groups = [
+                    list(range(start, start + ep.world_size))
+                    for start in range(0, world, ep.world_size)
+                ]
+                self._prefill_ep_group = parallel_state.init_model_parallel_group(
+                    groups,
+                    parallel_state.get_world_group().local_rank,
+                    "nccl",
+                    group_name="slackserve_prefill_ep",
+                )
         if self.slackserve_config.smctrl_lib:
             from vllm.v1.worker.hb_smctrl import SmCtrl
 
@@ -134,6 +168,8 @@ class SlackServeGPUWorker(GPUWorker):
     def _remote_lane(self, lane: str) -> bool:
         return lane not in ("decode", "default") and (
             getattr(self, "_prefill_tp_group", None) is not None
+            or getattr(self, "_prefill_pp_group", None) is not None
+            or getattr(self, "_prefill_ep_group", None) is not None
             or getattr(self, "_mask_ctrl", None) is not None
         )
 
@@ -141,6 +177,13 @@ class SlackServeGPUWorker(GPUWorker):
         from vllm.distributed import parallel_state
 
         parallel_state._TP_OVERRIDE.group = group
+
+    def _set_prefill_parallel_overrides(self, active):
+        from vllm.distributed import parallel_state
+
+        self._set_tp_override(self._prefill_tp_group if active else None)
+        parallel_state._PP_OVERRIDE.group = self._prefill_pp_group if active else None
+        parallel_state._EP_OVERRIDE.group = self._prefill_ep_group if active else None
 
     def _apply_ticket_mask(self, lane: str, mask: list[int] | None) -> None:
         if self._mask_ctrl is None:
@@ -213,6 +256,10 @@ class SlackServeGPUWorker(GPUWorker):
     @torch.inference_mode()
     def execute_model(self, scheduler_output):
         lane = scheduler_output.execution_lane
+        # Retain each stream's outgoing activation buffers until its own send
+        # finishes, without introducing a cross-stream wait in the base worker.
+        send_lane = "decode" if lane == "default" else lane
+        self._pp_send_work = self._lane_pp_send_work.get(send_lane, [])
         dense_lock = self._hb_dense_lock
         record_prefill_tail = self._hb_record_prefill_tail
         locked = dense_lock is not None and lane not in ("decode", "default")
@@ -237,7 +284,7 @@ class SlackServeGPUWorker(GPUWorker):
             self._apply_ticket_mask(
                 lane, getattr(scheduler_output, "execution_mask", None)
             )
-            self._set_tp_override(self._prefill_tp_group)
+            self._set_prefill_parallel_overrides(True)
         try:
             with (
                 torch.cuda.stream(self._lane_stream(lane)),
@@ -257,8 +304,9 @@ class SlackServeGPUWorker(GPUWorker):
                     record_prefill_tail(self._lane_stream(lane))
                 return output
         finally:
+            self._lane_pp_send_work[send_lane] = self._pp_send_work
             if remote:
-                self._set_tp_override(None)
+                self._set_prefill_parallel_overrides(False)
             if locked:
                 assert dense_lock is not None
                 dense_lock[1]()
@@ -281,7 +329,7 @@ class SlackServeGPUWorker(GPUWorker):
             dense_lock[0]()
         remote = self._remote_lane(lane)
         if remote:
-            self._set_tp_override(self._prefill_tp_group)
+            self._set_prefill_parallel_overrides(True)
         try:
             with (
                 torch.cuda.stream(self._lane_stream(lane)),
@@ -294,7 +342,7 @@ class SlackServeGPUWorker(GPUWorker):
                 return output
         finally:
             if remote:
-                self._set_tp_override(None)
+                self._set_prefill_parallel_overrides(False)
             if locked:
                 assert dense_lock is not None
                 dense_lock[1]()

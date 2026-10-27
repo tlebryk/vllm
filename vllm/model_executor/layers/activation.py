@@ -639,15 +639,17 @@ _ACTIVATION_REGISTRY = LazyDict(
         "gelu_fast": lambda: FastGELU(),
         "gelu_new": lambda: NewGELU(),
         "gelu_pytorch_tanh": lambda: (
-            # TODO:[ROCm] PyTorch native GELU with tanh is unstable with torch.compile
-            logger.warning_once(
-                "[ROCm] PyTorch's native GELU with tanh approximation is unstable. "
-                "Falling back to GELU(approximate='none')."
-            ),
-            nn.GELU(approximate="none"),
-        )[1]
-        if current_platform.is_rocm()
-        else nn.GELU(approximate="tanh"),
+            (
+                # TODO:[ROCm] PyTorch native GELU with tanh is unstable with torch.compile
+                logger.warning_once(
+                    "[ROCm] PyTorch's native GELU with tanh approximation is unstable. "
+                    "Falling back to GELU(approximate='none')."
+                ),
+                nn.GELU(approximate="none"),
+            )[1]
+            if current_platform.is_rocm()
+            else nn.GELU(approximate="tanh")
+        ),
         "relu": lambda: nn.ReLU(),
         "relu2": lambda: ReLUSquaredActivation(),
         "silu": lambda: nn.SiLU(),
@@ -678,6 +680,8 @@ def get_act_fn(act_fn_name: str) -> nn.Module:
 _ACTIVATION_AND_MUL_REGISTRY = LazyDict(
     {
         "gelu": lambda: GeluAndMul(),
+        "gelu_pytorch_tanh": lambda: GeluAndMul(approximate="tanh"),
+        "gelu_tanh": lambda: GeluAndMul(approximate="tanh"),
         "silu": lambda: SiluAndMul(),
         "geglu": lambda: GeluAndMul(),
         "swigluoai": lambda *args, **kwargs: SwigluOAIAndMul(*args, **kwargs),

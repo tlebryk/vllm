@@ -5,7 +5,8 @@
 
 def validate_colocated_models(specs, mode, topology):
     sizes = [getattr(s, "tensor_parallel_size", 1) for s in specs]
-    if not any(n > 1 for n in sizes):
+    pp_sizes = [getattr(s, "pipeline_parallel_size", 1) for s in specs]
+    if not any(t * p > 1 for t, p in zip(sizes, pp_sizes)):
         return False
     if mode != "private":
         raise ValueError("TP native serving currently requires private KV pools")
@@ -15,6 +16,8 @@ def validate_colocated_models(specs, mode, topology):
         if topology == "single-stream":
             raise ValueError("single-model TP serial mode is not implemented")
         return False
+    if any(p > 1 for p in pp_sizes):
+        raise ValueError("colocated pooling does not yet support pipeline parallelism")
     if len(specs) != 2 or [s.runner for s in specs] != ["generate", "pooling"]:
         raise ValueError(
             "colocated TP requires generator first, then one pooling model"

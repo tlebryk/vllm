@@ -36,6 +36,7 @@ class ModelSpec:
     prefill_step_tokens: int = 0
     # None preserves backend auto-selection. A100 replication can pin FA2.
     flash_attn_version: int | None = None
+    attention_backend: str = "FLASH_ATTN"
     # None preserves upstream behavior; FA-only replication can skip FI tuning.
     enable_flashinfer_autotune: bool | None = None
     # Dispatch this model only after other GPU tickets have completed. Other
@@ -44,6 +45,8 @@ class ModelSpec:
     # Opt-in session reuse, currently supported only with private KV pools.
     enable_prefix_caching: bool = False
     tensor_parallel_size: int = 1
+    pipeline_parallel_size: int = 1
+    enable_expert_parallel: bool = False
 
     def __post_init__(self) -> None:
         if type(self.enable_prefix_caching) is not bool:
@@ -84,6 +87,13 @@ class ModelSpec:
             raise ValueError("prefill reserve fraction must be in [0, 1)")
         if type(self.tensor_parallel_size) is not int or self.tensor_parallel_size < 1:
             raise ValueError("tensor_parallel_size must be a positive integer")
+        if (
+            type(self.pipeline_parallel_size) is not int
+            or self.pipeline_parallel_size < 1
+        ):
+            raise ValueError("pipeline_parallel_size must be a positive integer")
+        if type(self.enable_expert_parallel) is not bool:
+            raise ValueError("enable_expert_parallel must be a boolean")
         if not 0 < self.gpu_memory_utilization <= 1:
             raise ValueError("GPU memory utilization must be in (0, 1]")
         if min(self.prefill_reserve_blocks, self.prefill_sm_target) < 0:
@@ -92,9 +102,9 @@ class ModelSpec:
             raise ValueError("prefill step tokens must fit the engine token capacity")
         if self.dtype not in ("float16", "bfloat16", "auto"):
             raise ValueError("dense runners support FP16/BF16 or auto in private mode")
-        if self.flash_attn_version not in (None, 2, 3):
+        if self.flash_attn_version not in (None, 2, 3, 4):
             raise ValueError(
-                "native dense attention supports automatic selection, FA2 or FA3"
+                "native attention supports automatic selection, FA2, FA3 or FA4"
             )
         if (
             self.enable_flashinfer_autotune is not None
@@ -123,8 +133,12 @@ class ModelSpec:
             "async_scheduling": False,
             "enforce_eager": eager,
             "tensor_parallel_size": self.tensor_parallel_size,
+            "pipeline_parallel_size": self.pipeline_parallel_size,
+            "enable_expert_parallel": self.enable_expert_parallel,
             "distributed_executor_backend": (
-                "mp" if self.tensor_parallel_size > 1 else None
+                "mp"
+                if self.tensor_parallel_size * self.pipeline_parallel_size > 1
+                else None
             ),
             "worker_cls": (
                 "vllm.v1.worker.slackserve_pooling_worker.SlackServePoolingWorker"
@@ -138,7 +152,7 @@ class ModelSpec:
             ),
             # Dense FP16/BF16 Llama + FlashAttention avoids global FlashInfer,
             # MLA and MoE workspaces; those backends require a separate audit.
-            "attention_config": {"backend": "FLASH_ATTN"},
+            "attention_config": {"backend": self.attention_backend},
             "compilation_config": {
                 "mode": 3 if self.compile_decode or pooling else 0,
                 "cudagraph_mode": "NONE" if eager or pooling else "FULL",
@@ -158,6 +172,7 @@ class ModelSpec:
                     "compile_decode": self.compile_decode,
                     "lane_staging": self.lane_staging,
                     "prefill_sm_target": self.prefill_sm_target,
+                    "prefill_step_tokens": self.prefill_step_tokens,
                     "prefill_custom_ops": self.prefill_custom_ops,
                 }
             },

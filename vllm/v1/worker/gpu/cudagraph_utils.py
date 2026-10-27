@@ -11,9 +11,14 @@ from tqdm import tqdm
 
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
-from vllm.distributed.parallel_state import graph_capture, is_global_first_rank
+from vllm.distributed.parallel_state import (
+    graph_capture,
+    is_global_first_rank,
+    get_pp_group,
+)
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
+from vllm.sequence import IntermediateTensors
 from vllm.model_executor.offloader.base import get_offloader
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
@@ -284,6 +289,8 @@ class ModelCudaGraphManager(CudaGraphManager):
         decode_query_len: int,
     ):
         super().__init__(vllm_config, device, cudagraph_mode, decode_query_len)
+        self.pp_inputs = {}
+        self.pp_outputs = {}
         self.hidden_states: torch.Tensor | None = None
         self.aux_hidden_states: list[torch.Tensor] = []
         self.use_aux_hidden_state_outputs = False
@@ -328,6 +335,15 @@ class ModelCudaGraphManager(CudaGraphManager):
                     "decode", attn_metadata, slot_mappings
                 )
 
+            pp_input = None
+            if not get_pp_group().is_first_rank:
+                pp_input = model.make_empty_intermediate_tensors(
+                    num_tokens,
+                    dtype=self.vllm_config.model_config.dtype,
+                    device=self.device,
+                )
+                self.pp_inputs[desc] = pp_input
+
             def forward_fn(cg_mode: CUDAGraphMode) -> None:
                 batch_descriptor = (
                     BatchDescriptor(num_tokens=num_tokens)
@@ -346,17 +362,29 @@ class ModelCudaGraphManager(CudaGraphManager):
                     model_inputs = {
                         "input_ids": input_buffers.input_ids[:num_tokens],
                         "positions": input_buffers.positions[:num_tokens],
-                        # TODO: Pass intermediate_tensors for PP CUDA graph
-                        # support (https://github.com/vllm-project/vllm/pull/35162).
-                        "intermediate_tensors": None,
+                        "intermediate_tensors": pp_input,
                         **model_state.prepare_dummy_inputs(num_reqs, num_tokens),
                     }
+                    if pp_input is not None:
+                        model_inputs["input_ids"] = None
+                        model_inputs["inputs_embeds"] = None
                     model_output = model(**model_inputs)
                     if self.use_aux_hidden_state_outputs:
                         hidden_states, aux_hidden_states = model_output
                     else:
                         hidden_states = model_output
                         aux_hidden_states = []
+                    if isinstance(hidden_states, IntermediateTensors):
+                        if desc not in self.pp_outputs:
+                            self.pp_outputs[desc] = IntermediateTensors(
+                                {
+                                    k: torch.empty_like(v)
+                                    for k, v in hidden_states.items()
+                                }
+                            )
+                        for k, v in hidden_states.items():
+                            self.pp_outputs[desc][k].copy_(v)
+                        return
                     if self.hidden_states is None:
                         self.hidden_states = torch.empty_like(hidden_states)
                     if self.use_aux_hidden_state_outputs and not self.aux_hidden_states:
@@ -372,10 +400,24 @@ class ModelCudaGraphManager(CudaGraphManager):
         super().capture(create_forward_fn, progress_bar_desc)
 
     def run_fullgraph(
-        self, desc: BatchExecutionDescriptor
-    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
-        """Replay a captured FULL cudagraph and return hidden states."""
+        self,
+        desc: BatchExecutionDescriptor,
+        intermediate_tensors: IntermediateTensors | None = None,
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+        """Copy received PP activations into graph-owned inputs, then replay."""
+        if desc in self.pp_inputs:
+            assert intermediate_tensors is not None
+            target = self.pp_inputs[desc]
+            for name, buffer in target.items():
+                value = intermediate_tensors[name]  # waits for asynchronous recv
+                count = value.shape[0]
+                if count > buffer.shape[0]:
+                    raise ValueError("PP activations exceed captured input size")
+                buffer[:count].copy_(value)
+                buffer[count:].zero_()
         super().run_fullgraph(desc)
+        if desc in self.pp_outputs:
+            return self.pp_outputs[desc]
         assert self.hidden_states is not None
         hidden_states = self.hidden_states[: desc.num_tokens]
         if not self.use_aux_hidden_state_outputs:

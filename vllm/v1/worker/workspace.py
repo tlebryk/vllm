@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from contextlib import contextmanager
+from contextvars import ContextVar
+
 import inspect
 import os
 from itertools import accumulate
@@ -26,6 +29,18 @@ _GiB = 1024**3
 
 # Global workspace manager instance
 _manager: "WorkspaceManager | None" = None
+_override: ContextVar["WorkspaceManager | None"] = ContextVar(
+    "slackserve_workspace", default=None
+)
+
+
+@contextmanager
+def use_workspace_manager(manager: "WorkspaceManager"):
+    token = _override.set(manager)
+    try:
+        yield
+    finally:
+        _override.reset(token)
 
 
 class WorkspaceManager:
@@ -207,11 +222,12 @@ def current_workspace_manager() -> "WorkspaceManager":
     Raises:
         AssertionError: If workspace manager has not been initialized.
     """
-    assert _manager is not None, (
+    manager = _override.get() or _manager
+    assert manager is not None, (
         "WorkspaceManager not initialized. Call init_workspace_manager() "
         "with a device before using workspace functions."
     )
-    return _manager
+    return manager
 
 
 def init_workspace_manager(
