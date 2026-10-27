@@ -84,7 +84,7 @@ from vllm.v1.worker.gpu.lora_utils import LoraState
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states import init_model_state
 from vllm.v1.worker.gpu.pool.pooling_runner import PoolingRunner
-from vllm.v1.worker.gpu.pp_utils import pp_broadcast, pp_finish_ticket, pp_receive
+from vllm.v1.worker.gpu.pp_utils import pp_broadcast, pp_receive
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
 from vllm.v1.worker.gpu.sample.sampler import Sampler
@@ -1128,7 +1128,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 input_batch.num_reqs, max_sample_len=self.num_speculative_steps + 1
             )
             self.postprocess(input_batch, sampled, num_sampled, num_rejected)
-            pp_finish_ticket()
             return None
 
         # Last rank: sample tokens
@@ -1162,15 +1161,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
             kv_connector_output=kv_connector_output,
         )
-        pp_tail_event = torch.cuda.Event() if self.use_pp else None
         async_output = AsyncOutput(
             model_runner_output=model_runner_output,
             sampler_output=sampler_output,
             num_sampled_tokens=num_sampled,
             main_stream=self.main_stream,
             copy_stream=self.output_copy_stream,
-            copy_event=torch.cuda.Event() if self.use_pp else self.output_copy_event,
-            completion_event=pp_tail_event,
+            copy_event=self.output_copy_event,
         )
 
         # Postprocess results and update request states.
@@ -1201,12 +1198,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
             self.draft_tokens_handler.set_draft_tokens(input_batch, draft_tokens)
 
-        if self.use_pp:
-            # Apply the same retirement rule as native execution: publish the
-            # output only after every pipeline stage applies its sampled token.
-            pp_finish_ticket()
-            assert pp_tail_event is not None
-            pp_tail_event.record(torch.cuda.current_stream(self.device))
         if self.use_async_scheduling:
             return async_output
         return async_output.get_output()
