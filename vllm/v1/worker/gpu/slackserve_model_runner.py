@@ -283,6 +283,16 @@ class SlackServeModelRunner(GPUModelRunner):
             self._dummy_run(
                 2 * self.max_num_reqs, skip_attn=True, workspace_lane="decode"
             )
+            # Merged batches (stock hybrid steps) also run on the decode lane
+            # and carry up to the prefill work unit of prompt tokens; their
+            # expert workspace must exist before the lock (a 16K-token merged
+            # probe needed 1.4 GB against a 352 MB decode workspace).
+            merged_unit = min(
+                self.slackserve_config.prefill_step_tokens or self.max_num_tokens,
+                self.max_num_tokens,
+            )
+            if merged_unit > 2 * self.max_num_reqs:
+                self._dummy_run(merged_unit, skip_attn=True, workspace_lane="decode")
             torch.accelerator.synchronize()
             for workspace in self.lane_workspaces.values():
                 workspace.lock()
