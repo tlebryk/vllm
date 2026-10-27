@@ -9,7 +9,11 @@ import torch
 
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.kv_cache_manager import KVCacheManager
-from vllm.v1.engine.kv_headroom import CacheHeadroom, additional_blocks
+from vllm.v1.engine.kv_headroom import (
+    CacheHeadroom,
+    additional_blocks,
+    calibration_warmer_shape,
+)
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -83,3 +87,16 @@ def test_decode_growth_counts_groups_and_existing_allocations():
     free = manager.block_pool.get_num_free_blocks()
     assert manager.allocate_slots(resident, 16) is not None
     assert free - manager.block_pool.get_num_free_blocks() == predicted == 2
+
+
+def test_calibration_warmers_fit_all_cache_groups_with_probe_headroom():
+    manager = cache([attention(), attention()], 400)
+    free = manager.block_pool.get_num_free_blocks()
+    prompt, output = calibration_warmer_shape(manager, 4, 128, 8192, 4096)
+    assert manager.block_pool.get_num_free_blocks() == free
+    for i in range(4):
+        warmer = request(f"warmer{i}", prompt)
+        assert manager.allocate_slots(warmer, prompt + output) is not None
+    used = free - manager.block_pool.get_num_free_blocks()
+    assert used <= int(0.6 * free)
+    assert manager.allocate_slots(request("probe", 128), 129) is not None

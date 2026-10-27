@@ -271,14 +271,18 @@ def run_calibration(
     # Warmers must stay resident for a whole size: size them from the KV the
     # engine actually has (their prompts + outputs take at most 60% of it at
     # the largest n, leaving room for the probe), capped at the defaults.
-    pool = core.scheduler.kv_cache_manager.block_pool
-    kv_tokens = pool.get_num_free_blocks() * core.scheduler.block_size
-    per_warmer = int(0.6 * kv_tokens / max(decode_sizes))
-    warmer_prompt = max(256, min(WARMER_PROMPT_TOKENS, per_warmer * 2 // 3))
-    warmer_output = max(128, min(WARMER_OUTPUT_TOKENS, per_warmer - warmer_prompt))
+    from vllm.v1.engine.kv_headroom import calibration_warmer_shape
+
+    warmer_prompt, warmer_output = calibration_warmer_shape(
+        core.scheduler.kv_cache_manager,
+        max(decode_sizes),
+        probe_tokens,
+        WARMER_PROMPT_TOKENS,
+        WARMER_OUTPUT_TOKENS,
+    )
     logger.info(
-        "mask calibration: KV %d tokens -> warmers %d prompt + %d output tokens",
-        kv_tokens,
+        "mask calibration: group-aware cache budget -> "
+        "warmers %d prompt + %d output tokens",
         warmer_prompt,
         warmer_output,
     )

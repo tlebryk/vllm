@@ -4,6 +4,7 @@
 
 from collections.abc import Iterable
 
+from vllm.sampling_params import SamplingParams
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.request import Request
 
@@ -23,6 +24,54 @@ def additional_blocks(cache: KVCacheManager, request: Request, tokens: int) -> i
         apply_admission_cap=True,
         prefill_end=max(request.num_prompt_tokens, request.num_tokens - 1),
     )
+
+
+def calibration_warmer_shape(
+    cache: KVCacheManager,
+    count: int,
+    probe_tokens: int,
+    prompt_limit: int,
+    output_limit: int,
+) -> tuple[int, int]:
+    """Fit warmers plus a probe using physical group demand, without allocation.
+
+    Keep the existing 60% warmer reservation and 2:1 prompt/output preference.
+    Recurrent state consumes blocks per request, not per scheduler token block.
+    """
+    if probe_tokens + 1 > cache.max_model_len:
+        raise ValueError("Calibration probe exceeds model context length")
+
+    def demand(prompt_tokens: int, output_tokens: int) -> int:
+        request = Request(
+            "__native_calibration_capacity_probe__",
+            [1] * prompt_tokens,
+            SamplingParams(max_tokens=output_tokens),
+            None,
+        )
+        if (
+            request.request_id
+            in cache.coordinator.single_type_managers[0].req_to_blocks
+        ):
+            raise RuntimeError("Calibration capacity probe request ID is already live")
+        return additional_blocks(cache, request, prompt_tokens + output_tokens)
+
+    free = cache.block_pool.get_num_free_blocks()
+    budget = min(int(0.6 * free), free - demand(probe_tokens, 1))
+
+    def shape(total: int) -> tuple[int, int]:
+        prompt = min(prompt_limit, total * 2 // 3)
+        return prompt, min(output_limit, total - prompt)
+
+    low, high = 384, min(prompt_limit + output_limit, cache.max_model_len)
+    if count <= 0 or high < low or count * demand(*shape(low)) > budget:
+        raise ValueError("Calibration warmers and probe exceed physical cache capacity")
+    while low < high:
+        middle = (low + high + 1) // 2
+        if count * demand(*shape(middle)) <= budget:
+            low = middle
+        else:
+            high = middle - 1
+    return shape(low)
 
 
 class CacheHeadroom:
