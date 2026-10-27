@@ -570,14 +570,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             return 0
 
-        # TODO (zhanqiu): support CUDA graph for PP.
-        if self.use_pp:
-            logger.warning_once(
-                "Skipping CUDA graph capture because pipeline parallel is "
-                "enabled. Pipeline parallel is currently eager-only.",
-            )
-            return 0
-
         start_time = time.perf_counter()
         gc.collect()
         torch.accelerator.empty_cache()
