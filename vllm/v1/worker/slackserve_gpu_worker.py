@@ -25,6 +25,38 @@ def prefill_lane_names() -> list[str]:
 
 
 class SlackServeGPUWorker(GPUWorker):
+    def compile_or_warm_up_model(self):
+        result = super().compile_or_warm_up_model()
+        if os.environ.get("HB_MODERN_WARM_LOGITS") != "1":
+            return result
+        runner = self.model_runner
+        if not self.use_v2_model_runner or not runner.is_last_pp_rank:
+            raise ValueError("Logits warmup diagnostic requires the V2 last PP rank")
+        # Logits are outside the decode graph. First-use cuBLAS attribute
+        # changes must finish before outstanding cross-rank work can overlap.
+        torch.accelerator.synchronize()
+        with torch.inference_mode():
+            for lane, stream in [
+                ("decode", self.decode_stream),
+                ("prefill", self.lane_streams["prefill"]),
+            ]:
+                self._set_prefill_parallel_overrides(lane == "prefill")
+                try:
+                    with torch.cuda.stream(stream):
+                        hidden = torch.zeros(
+                            (runner.max_num_reqs, self.model_config.get_hidden_size()),
+                            dtype=self.model_config.dtype,
+                            device=self.device,
+                        )
+                        for rows in range(1, runner.max_num_reqs + 1):
+                            logits = runner.model.compute_logits(hidden[:rows])
+                            del logits
+                        del hidden
+                    stream.synchronize()
+                finally:
+                    self._set_prefill_parallel_overrides(False)
+        return result
+
     def init_colocated_pooling(self, model_id, config):
         from vllm.v1.worker.colocated_pooling import initialize
 
