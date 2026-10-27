@@ -117,6 +117,7 @@ class MultiModelBackend:
         mask_calibration="off",
         mask_calibration_dir=None,
         mask_rule="queue",
+        mask_calibration_sizes=None,
     ):
         if max_requests <= 0 or output_capacity <= decode_depth + 2:
             raise ValueError("invalid ingress/output capacity")
@@ -166,6 +167,14 @@ class MultiModelBackend:
         if mask_rule not in ("queue", "progress", "progress_queue"):
             raise ValueError("mask policy rule must be queue, progress or progress_queue")
         self.mask_rule = mask_rule
+        sizes = None
+        if mask_calibration_sizes:
+            sizes = tuple(
+                sorted({int(x) for x in str(mask_calibration_sizes).split(",") if x})
+            )
+            if not sizes or any(n < 1 for n in sizes):
+                raise ValueError("calibration decode sizes must be positive integers")
+        self.mask_calibration_sizes = sizes
         self.mask_calibration_dir = (
             Path(
                 mask_calibration_dir
@@ -541,6 +550,12 @@ class MultiModelBackend:
                 "candidates": [c["indices"] for c in candidates],
                 # Keys of tables without a merged-batch candidate are unchanged.
                 **({"merged": merged} if merged else {}),
+                # Likewise for tables measured at the default decode sizes.
+                **(
+                    {"decode_sizes": list(self.mask_calibration_sizes)}
+                    if self.mask_calibration_sizes
+                    else {}
+                ),
                 "model": spec.model,
                 "revision": spec.revision,
                 "dtype": str(config.model_config.dtype),
@@ -568,7 +583,17 @@ class MultiModelBackend:
                 ", ".join(c["name"] for c in candidates),
             )
             table = run_calibration(
-                self, controller, self.lane_masks, model_id, candidates, key=key
+                self,
+                controller,
+                self.lane_masks,
+                model_id,
+                candidates,
+                key=key,
+                **(
+                    {"decode_sizes": self.mask_calibration_sizes}
+                    if self.mask_calibration_sizes
+                    else {}
+                ),
             )
             table.save(path)
             logger.info(

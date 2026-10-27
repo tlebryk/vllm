@@ -212,6 +212,9 @@ class BaseFrontendArgs:
     """
     slackserve_mask_calibration_dir: str | None = None
     """Cache directory for calibration tables (default ~/.cache/slackserve)."""
+    slackserve_mask_calibration_sizes: str | None = None
+    """Comma-separated resident decode batch sizes the calibration measures
+    (default 2,8,32). Larger sizes get shorter-context warmers (60% of KV)."""
     slackserve_mask_rule: str = "queue"
     """Decision rule over the calibrated table: queue (measured cost
     D × (1 + W + n × dilation)), progress (token progress over a common

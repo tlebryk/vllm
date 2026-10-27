@@ -438,15 +438,26 @@ def run_calibration(
     # the largest n, leaving room for the probe), capped at the defaults.
     pool = core.scheduler.kv_cache_manager.block_pool
     kv_tokens = pool.get_num_free_blocks() * core.scheduler.block_size
-    per_warmer = int(0.6 * kv_tokens / max(decode_sizes))
-    warmer_prompt = max(256, min(WARMER_PROMPT_TOKENS, per_warmer * 2 // 3))
-    warmer_output = max(128, min(WARMER_OUTPUT_TOKENS, per_warmer - warmer_prompt))
-    logger.info(
-        "mask calibration: KV %d tokens -> warmers %d prompt + %d output tokens",
-        kv_tokens,
-        warmer_prompt,
-        warmer_output,
-    )
+
+    def warmer_shape(n: int) -> tuple[int, int]:
+        """Warmer prompt/output tokens for batch size n: the n warmers take at
+        most 60% of KV, so large n means shorter context (the only resident
+        state a large batch can have on this KV)."""
+        per_warmer = int(0.6 * kv_tokens / n)
+        prompt_tokens = max(256, min(WARMER_PROMPT_TOKENS, per_warmer * 2 // 3))
+        output_tokens = max(
+            128, min(WARMER_OUTPUT_TOKENS, per_warmer - prompt_tokens)
+        )
+        return prompt_tokens, output_tokens
+
+    for n in decode_sizes:
+        logger.info(
+            "mask calibration: KV %d tokens -> n=%d warmers %d prompt + %d output",
+            kv_tokens,
+            n,
+            *warmer_shape(n),
+        )
+    current_warmer = {"prompt": 0, "output": 0}
 
     def wait_done(rid: str, what: str) -> None:
         driver.drive(lambda: not driver.active(rid), 300, what)
@@ -520,6 +531,8 @@ def run_calibration(
                     "window_ms": window_ms,
                     "dilation": dilation,
                     "progress": "blocked" if merged else "dilated",
+                    "warmer_prompt_tokens": current_warmer["prompt"],
+                    "warmer_output_tokens": current_warmer["output"],
                 }
             )
             logger.info(
@@ -535,6 +548,8 @@ def run_calibration(
             """Admit n warmers once, time decode alone once, probe every
             candidate against the same warmers, then release them."""
             release()
+            warmer_prompt, warmer_output = warmer_shape(n)
+            current_warmer.update(prompt=warmer_prompt, output=warmer_output)
             warmers = [submit(warmer_prompt, warmer_output) for _ in range(n)]
             driver.drive(lambda: driver.decode_ready() >= n, 180, f"warming n={n}")
             t0 = time.perf_counter()
