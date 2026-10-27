@@ -35,6 +35,13 @@ class ModelLaneMasks:
     masks do not override the mask baked into a graph at capture.
     """
 
+    # Defaults for the calibrated policy state (also valid before __init__).
+    rule = "queue"
+    force_merged = None
+    force_indices = None
+    calibration = None
+    calibrated_model = None
+
     def __init__(
         self,
         plan,
