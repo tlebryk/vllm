@@ -59,6 +59,7 @@ def prepare_models(path, *, mode, budget, decode_depth):
                 ["LlamaForCausalLM"],
                 ["Qwen3ForCausalLM"],
                 ["Gemma4ForCausalLM"],
+                ["Gemma4ForConditionalGeneration"],
                 ["LlamaForSequenceClassification"],
                 ["Qwen3ForSequenceClassification"],
             )
@@ -66,10 +67,14 @@ def prepare_models(path, *, mode, budget, decode_depth):
         ):
             raise ValueError("Unsupported native model/quantization combination")
         if (
-            config.model_config.hf_config.architectures == ["Gemma4ForCausalLM"]
+            architectures in (["Gemma4ForCausalLM"], ["Gemma4ForConditionalGeneration"])
             and mode != "private"
         ):
             raise ValueError("Gemma4 currently requires private KV pools")
+        if architectures == ["Gemma4ForConditionalGeneration"] and (
+            len(specs) != 1 or not spec.language_model_only
+        ):
+            raise ValueError("Gemma4 native port requires one text-only model")
         config.model_config.served_model_name = spec.model_id
         if spec.runner == "pooling":
             from vllm.config.compilation import CUDAGraphMode
