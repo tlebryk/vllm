@@ -371,6 +371,19 @@ class _Driver:
             1 for r in sched.running if r.num_computed_tokens >= r.num_prompt_tokens
         )
 
+    def prefill_idle(self) -> bool:
+        """No prefill-stream or merged ticket in flight. Async scheduling counts a
+        request as decode-ready once its last prefill chunk is *dispatched*, so a
+        decode-alone window opened on decode_ready() alone overlaps that chunk
+        (an unmasked prefill) and inflates the baseline."""
+        pending = getattr(self.controller, "_pending", None) or {}
+        return not pending.get("prefill") and not any(
+            t.lane == "default" for t in pending.get("decode", ())
+        )
+
+    def warmers_resident(self, n: int) -> bool:
+        return self.decode_ready() >= n and self.prefill_idle()
+
     def active(self, request_id: str) -> bool:
         with self.backend.lock:
             return (self.model_id, request_id) in self.backend.active
@@ -571,11 +584,11 @@ def run_calibration(
             warmer_prompt, warmer_output = warmer_shape(n)
             current_warmer.update(prompt=warmer_prompt, output=warmer_output)
             warmers = [submit(warmer_prompt, warmer_output) for _ in range(n)]
-            driver.drive(lambda: driver.decode_ready() >= n, 180, f"warming n={n}")
+            driver.drive(lambda: driver.warmers_resident(n), 180, f"warming n={n}")
             t0 = time.perf_counter()
-            # Baseline on a settled batch: the first periods after the batch
-            # size jumps carry one-time costs (they made decode "alone" slower
-            # than decode under a mask on Llama/Gemma), so skip them.
+            # Baseline on a settled batch with the prefill stream idle (see
+            # _Driver.prefill_idle): the first periods after the batch size
+            # jumps are skipped as well.
             settle = 12
             driver.drive(
                 lambda: len(driver.decode_periods(t0, time.perf_counter()))
