@@ -345,6 +345,9 @@ class Gemma4MoE(nn.Module):
 
         # FusedMoE experts with custom Gemma4 routing
         self.experts = FusedMoE(
+            # Every rank needs the sum before post-expert normalization and
+            # the residual addition. A rank-local partial is only valid at TP1.
+            reduce_results=True,
             num_experts=config.num_experts,
             top_k=config.top_k_experts,
             hidden_size=config.hidden_size,
@@ -1583,7 +1586,7 @@ class Gemma4ForCausalLM(
         if example_moe is not None:
             self.num_logical_experts = example_moe.num_experts
             self.num_physical_experts = example_moe.num_experts
-            self.num_local_physical_experts = example_moe.num_experts
+            self.num_local_physical_experts = example_moe.experts.local_num_experts
             self.num_routed_experts = example_moe.num_experts
         else:
             self.num_logical_experts = 0

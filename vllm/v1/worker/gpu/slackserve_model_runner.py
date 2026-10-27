@@ -259,6 +259,7 @@ class SlackServeModelRunner(GPUModelRunner):
             # The base profiling helper clears its mirrored state, but
             # SlackServe's lane-local mirror must also cease being pending.
             self.contexts[lane].execute_model_state = None
+            self.execute_model_state = None
             self._dummy_workspace_lane = previous_lane
 
     @torch.inference_mode()

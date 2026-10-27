@@ -47,14 +47,20 @@ def prepare_models(path, *, mode, budget, decode_depth):
             not in (
                 ["LlamaForCausalLM"],
                 ["Qwen3ForCausalLM"],
+                ["Gemma4ForCausalLM"],
                 ["LlamaForSequenceClassification"],
                 ["Qwen3ForSequenceClassification"],
             )
             or config.model_config.quantization is not None
         ):
             raise ValueError(
-                "native multi-model serving supports unquantized dense Llama/Qwen3"
+                "native multi-model serving supports unquantized text Llama/Qwen3/Gemma4"
             )
+        if (
+            config.model_config.hf_config.architectures == ["Gemma4ForCausalLM"]
+            and mode != "private"
+        ):
+            raise ValueError("Gemma4 currently requires private KV pools")
         config.model_config.served_model_name = spec.model_id
         if spec.runner == "pooling":
             from vllm.config.compilation import CUDAGraphMode
