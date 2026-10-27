@@ -287,6 +287,10 @@ class _SM90State:
             use_cuda_graph=True,
             backend="fa3",
         )
+        from vllm.v1.attention.backends.mla.slackserve_plan import budget_backend_type
+
+        self.wrapper._backend_type = budget_backend_type()
+        self._planned_sm_budget = None
         self._arange_cpu = torch.arange(self.max_tokens + 1, dtype=torch.int32)
         self._qo_cpu = torch.empty(self.max_tokens + 1, dtype=torch.int32)
         self._kv_cpu = torch.empty(self.max_tokens + 1, dtype=torch.int32)
@@ -325,6 +329,12 @@ class _SM90State:
                 "FlashInferMLASparseSM90 plan() called inside CUDA graph "
                 "capture; lengths must be planned host-side before capture."
             )
+        from vllm.v1.attention.backends.mla.slackserve_plan import current_sm_budget
+
+        sm_budget = current_sm_budget()
+        if sm_budget != self._planned_sm_budget:
+            self._planned_num_tokens = -1
+            self._planned_sm_budget = sm_budget
         kv_lens = kv_lens.to(torch.int32)
         if cam is None or req_id_per_token is None:
             self._plan(num_tokens, kv_lens)

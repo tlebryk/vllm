@@ -217,7 +217,11 @@ class SlackServeModelRunner(GPUModelRunner):
             r.mm_features for r in scheduler_output.scheduled_new_reqs
         ):
             raise ValueError("Modern native overlap currently accepts text-only inputs")
-        with self._use_lane(lane) as context:
+        from vllm.v1.attention.backends.mla.slackserve_plan import use_mla_sm_budget
+
+        indices = getattr(scheduler_output, "execution_mask", None)
+        sms = 2 * len(indices) if lane != "decode" and indices and not dummy else None
+        with self._use_lane(lane) as context, use_mla_sm_budget(sms):
             if not dummy and context.execute_model_state is not None:
                 raise RuntimeError(
                     "Sampling must be enqueued before reusing stream inputs"
