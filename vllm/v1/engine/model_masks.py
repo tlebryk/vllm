@@ -211,9 +211,7 @@ class ModelLaneMasks:
         decode_ready, decode_load, decode_tickets = self._decode_load(
             model, pending_tickets
         )
-        candidate, _, score = self.calibration.choose(
-            tokens, decode_load, waiting, rule=self.rule
-        )
+        candidate, _, score = self._choose(model, tokens, decode_load, waiting)
         merged = self.calibration.is_merged(candidate)
         return merged, self.merged_record(
             model,
@@ -225,20 +223,33 @@ class ModelLaneMasks:
             partner_decode_ready_requests=decode_ready,
             partner_decode_load=decode_load,
             partner_decode_tickets=len(decode_tickets),
-            **self._prediction(tokens, decode_load),
+            **self._prediction(model, tokens, decode_load, waiting),
         )
 
-    def _prediction(self, tokens, n):
+    def _prediction(self, model, tokens, n, waiting=0):
         """Per-candidate predictions behind a calibrated choice: the Section 2
-        progress (tokens over the common window) under the progress rule, the
+        progress (tokens over the common window) under the progress rules, the
         cost in seconds under the queue rule."""
-        if self.rule == "progress":
-            gains, timings = self.calibration.progress(tokens, n)
+        if self.rule in ("progress", "progress_queue"):
+            queued, unit = (
+                self._queue_context(model, tokens)
+                if self.rule == "progress_queue"
+                else (0, None)
+            )
+            gains, timings = self.calibration.progress(
+                tokens,
+                n,
+                queued_tokens=queued,
+                queued_requests=waiting if self.rule == "progress_queue" else 0,
+                work_unit=unit,
+            )
             return {
-                "rule": "progress",
+                "rule": self.rule,
                 "predicted_progress": {k: round(v, 2) for k, v in gains.items()},
                 "window_s": timings["window_s"],
                 "decode_next_s": timings["decode_next_s"],
+                "queued_tokens": timings["queued_tokens"],
+                "queued_requests": timings["queued_requests"],
             }
         return {
             "rule": "queue",
@@ -351,15 +362,17 @@ class ModelLaneMasks:
                 estimated_tokens, waiting_behind = self._estimate_ticket(model)
                 # A prefill-stream ticket: the controller already decided
                 # against the merged batch for it (MultiModelController).
-                candidate, indices, score = self.calibration.choose(
+                candidate, indices, score = self._choose(
+                    model,
                     estimated_tokens,
                     decode_load,
                     waiting_behind,
                     exclude_merged=True,
-                    rule=self.rule,
                 )
                 cost_s = score if self.rule == "queue" else None
-                prediction = self._prediction(estimated_tokens, decode_load)
+                prediction = self._prediction(
+                    model, estimated_tokens, decode_load, waiting_behind
+                )
                 masked = indices is not None
                 selected_indices = list(indices) if masked else ()
             if self.ctrl is None:
@@ -464,6 +477,42 @@ class ModelLaneMasks:
         )
         return int(tokens or min(budget, 1 << 14)), remaining
 
+    def _queue_context(self, model, tokens) -> tuple[int, int]:
+        """Prefill tokens queued behind this ticket on its CUDA stream (own and
+        partner models' pending prompts beyond the ticket) and the stream's
+        work unit, for the remaining-work window of the progress_queue rule."""
+        sched = model.core.scheduler
+        unit = int(
+            getattr(sched, "_hb_step_token_budget", None)
+            or getattr(sched, "max_num_scheduled_tokens", 0)
+            or tokens
+        )
+        pending = sum(
+            r.num_prompt_tokens - r.num_computed_tokens
+            for other in self.models
+            if other is model or self._shares_prefill(model, other)
+            for r in self._pending_prefills(other)
+        )
+        return max(0, int(pending) - int(tokens)), unit
+
+    def _choose(self, model, tokens, n, waiting, *, exclude_merged=False):
+        """calibration.choose under this policy's rule, with the queued work
+        the progress_queue rule needs."""
+        queued, unit = (
+            self._queue_context(model, tokens)
+            if self.rule == "progress_queue"
+            else (0, None)
+        )
+        return self.calibration.choose(
+            tokens,
+            n,
+            waiting,
+            exclude_merged=exclude_merged,
+            rule=self.rule,
+            queued_tokens=queued,
+            work_unit=unit,
+        )
+
     def prefill_priority_indices(self, indices):
         """Bound partner waiting by one predicted generator-prefill service time.
 
@@ -491,7 +540,7 @@ class ModelLaneMasks:
             if getattr(m, "decode_enabled", True)
             for r in m.core.scheduler.running
         )
-        candidate, _, _ = self.calibration.choose(tokens, n, waiting, rule=self.rule)
+        candidate, _, _ = self._choose(primary, tokens, n, waiting)
         duration = self.calibration.duration(candidate, tokens, n)
         now = self.clock()
         urgent = {}

@@ -163,8 +163,8 @@ class MultiModelBackend:
             raise ValueError("mask calibration requires --slackserve-smctrl-mask")
         self.mask_candidates = mask_candidates
         self.mask_calibration = mask_calibration
-        if mask_rule not in ("queue", "progress"):
-            raise ValueError("mask policy rule must be queue or progress")
+        if mask_rule not in ("queue", "progress", "progress_queue"):
+            raise ValueError("mask policy rule must be queue, progress or progress_queue")
         self.mask_rule = mask_rule
         self.mask_calibration_dir = (
             Path(

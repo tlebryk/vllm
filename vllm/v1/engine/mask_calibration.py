@@ -33,6 +33,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import queue
 import random
 import statistics
@@ -168,7 +169,16 @@ class CalibrationTable:
         cand = next(iter(self.by_name.values()))
         return max(1e-3, _interp(cand["n"], cand["alone_ms"], n))
 
-    def progress(self, tokens: int, n: int, *, horizon_s: float | None = None):
+    def progress(
+        self,
+        tokens: int,
+        n: int,
+        *,
+        horizon_s: float | None = None,
+        queued_tokens: int = 0,
+        queued_requests: int = 0,
+        work_unit: int | None = None,
+    ):
         """Paper Section 2: output tokens each candidate produces over one
         common window, for B = n resident decodes and an incoming prefill of
         ``tokens``. Spatial sharing under mask m: B rounds of concurrent decode
@@ -176,21 +186,38 @@ class CalibrationTable:
         token, then (B+1)-request decode at T_d(B+1) for the rest of the
         window. Merged batching: one hybrid step T_m, then (B+1)-request
         decode. Fractional rounds; the window is the slowest candidate's
-        prefill unless ``horizon_s`` is given. Returns {name: tokens} plus
-        the per-candidate timings used."""
+        prefill unless ``horizon_s`` is given.
+
+        With ``queued_tokens`` / ``queued_requests`` (the prefill work queued
+        behind this ticket on the same stream) the window instead covers the
+        remaining prefill work R = tokens + queued: the prefill stream stays
+        busy for R / rate(m), the k = 1 + queued_requests completing prefills
+        each add a first token and grow the batch (mean batch B + (k-1)/2
+        while busy, B + k after), and the merged batch serves R in
+        ceil(R / work_unit) steps, each advancing every resident decode once.
+        With no queue this is exactly the single-ticket rule. Returns
+        {name: tokens} plus the per-candidate timings used."""
         alone_now = self.decode_alone_ms(n) / 1000
-        t_next = self.decode_alone_ms(n + 1) / 1000
+        k = 1 + max(0, int(queued_requests))
+        total = tokens + max(0, int(queued_tokens))
+        t_next = self.decode_alone_ms(n + k) / 1000
+        unit = max(1, int(work_unit or tokens or 1))
+        busy_batch = n + (k - 1) / 2.0
         timings = {}
         for name, cand in self.by_name.items():
             rate = max(1.0, _interp(cand["n"], cand["rate"], n))
-            prefill_s = tokens / rate
+            busy_s = total / rate
             if cand["mode"] == "merged":
-                timings[name] = {"mode": "merged", "step_s": prefill_s}
+                timings[name] = {
+                    "mode": "merged",
+                    "step_s": busy_s,
+                    "steps": max(1, math.ceil(total / unit)),
+                }
             else:
                 dilation = max(0.0, _interp(cand["n"], cand["dilation"], n))
                 timings[name] = {
                     "mode": "split",
-                    "prefill_s": prefill_s,
+                    "prefill_s": busy_s,
                     "decode_par_s": alone_now * (1.0 + dilation),
                 }
         window = horizon_s
@@ -202,15 +229,21 @@ class CalibrationTable:
         for name, t in timings.items():
             if t["mode"] == "merged":
                 remaining = max(0.0, window - t["step_s"])
-                out[name] = (n + 1) * (1.0 + remaining / t_next)
+                out[name] = busy_batch * t["steps"] + k + (n + k) * remaining / t_next
             else:
                 remaining = max(0.0, window - t["prefill_s"])
                 out[name] = (
-                    n * t["prefill_s"] / t["decode_par_s"]
-                    + 1.0
-                    + (n + 1) * remaining / t_next
+                    busy_batch * t["prefill_s"] / t["decode_par_s"]
+                    + k
+                    + (n + k) * remaining / t_next
                 )
-        return out, {"window_s": window, "decode_next_s": t_next, **timings}
+        return out, {
+            "window_s": window,
+            "decode_next_s": t_next,
+            "queued_tokens": max(0, int(queued_tokens)),
+            "queued_requests": max(0, int(queued_requests)),
+            **timings,
+        }
 
     def choose(
         self,
@@ -220,18 +253,28 @@ class CalibrationTable:
         *,
         exclude_merged: bool = False,
         rule: str = "queue",
+        queued_tokens: int = 0,
+        work_unit: int | None = None,
     ) -> tuple[str, list[int] | None, float]:
         """Best candidate name, its TPC set (None for unrestricted and for the
         merged batch; see ``is_merged``) and its score: seconds of cost under
         the ``queue`` rule (D × (1 + W + n × dilation)), output tokens over
-        the common window under the ``progress`` rule (Section 2; W unused)."""
+        the common window under the ``progress`` rule (Section 2; W unused)
+        or over the remaining-prefill-work window under ``progress_queue``
+        (W queued requests holding ``queued_tokens``)."""
         names = [
             name
             for name, cand in self.by_name.items()
             if not (exclude_merged and cand["mode"] == "merged")
         ]
-        if rule == "progress":
-            gains, timings = self.progress(tokens, n)
+        if rule in ("progress", "progress_queue"):
+            gains, timings = self.progress(
+                tokens,
+                n,
+                queued_tokens=queued_tokens if rule == "progress_queue" else 0,
+                queued_requests=waiting if rule == "progress_queue" else 0,
+                work_unit=work_unit,
+            )
             # Ties go to the sooner first token.
             best = max(
                 names,
@@ -242,7 +285,7 @@ class CalibrationTable:
             )
             return best, self.by_name[best]["indices"], gains[best]
         if rule != "queue":
-            raise ValueError("mask policy rule must be queue or progress")
+            raise ValueError("mask policy rule must be queue, progress or progress_queue")
         best = min(names, key=lambda name: self.cost(name, tokens, n, waiting))
         return best, self.by_name[best]["indices"], self.cost(best, tokens, n, waiting)
 
