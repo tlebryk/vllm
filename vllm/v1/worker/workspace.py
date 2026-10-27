@@ -46,6 +46,20 @@ def use_workspace_lane(lane: int) -> Iterator[None]:
         _workspace_lane.reset(token)
 
 
+_override: ContextVar["WorkspaceManager | None"] = ContextVar(
+    "slackserve_workspace", default=None
+)
+
+
+@contextmanager
+def use_workspace_manager(manager: "WorkspaceManager"):
+    token = _override.set(manager)
+    try:
+        yield
+    finally:
+        _override.reset(token)
+
+
 class WorkspaceManager:
     """Manager for workspace allocation.
 
@@ -297,11 +311,12 @@ def current_workspace_manager() -> "WorkspaceManager":
         AssertionError: If workspace manager has not been initialized.
 
     """
-    assert _manager is not None, (
+    manager = _override.get() or _manager
+    assert manager is not None, (
         "WorkspaceManager not initialized. Call init_workspace_manager() "
         "with a device before using workspace functions."
     )
-    return _manager
+    return manager
 
 
 def init_workspace_manager(

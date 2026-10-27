@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import gc
+import json
 import os
 import queue
 import signal
@@ -8,7 +9,8 @@ import threading
 import time
 from collections import defaultdict, deque
 from collections.abc import Callable, Generator, Sequence
-from concurrent.futures import Future
+from concurrent.futures import FIRST_COMPLETED, Future
+from concurrent.futures import wait as futures_wait
 from contextlib import ExitStack, contextmanager
 from enum import IntEnum
 from functools import partial
@@ -81,6 +83,7 @@ from vllm.v1.engine import (
     PauseMode,
     ReconfigureDistributedRequest,
     ReconfigureRankType,
+    StepTicket,
     UtilityOutput,
     UtilityResult,
 )
@@ -232,6 +235,17 @@ class EngineCore:
         self.step_fn = (
             self.step if self.batch_queue is None else self.step_with_batch_queue
         )
+        # Slack Serve two-lane serving controller. When HB_P2_SERVE=1 (with the
+        # SlackServe worker + HB_LANE_ROUTING=1), the API server busy loop drives
+        # a per-lane decode/prefill controller instead of the ordinary step. See
+        # step_two_lane below (an incremental port of the validated offline
+        # drain_p2_pd_event_driven controller from slackserve/bench.py).
+        self._hb_serve_ready = False
+        if os.environ.get("HB_P2_SERVE") == "1":
+            self.step_fn = self.step_two_lane
+        # Slack Serve two-model SERVE sidecar (Thread C). Built eagerly below
+        # (default-off unless HB_P2_EMBED_SIDECAR=1).
+        self._hb_embed_sidecar = None
         self.async_scheduling = vllm_config.scheduler_config.async_scheduling
 
         self.aborts_queue = queue.Queue[list[str]]()
@@ -246,6 +260,20 @@ class EngineCore:
         # Enable environment variable cache (e.g. assume no more
         # environment variable overrides after this point)
         enable_envs_cache()
+
+        # Slack Serve two-model SERVE sidecar: build the in-process embedding
+        # engine ONCE, here, before the busy loop starts (no live LLM forward
+        # to race, and the ~60s load stays out of served-request TTFT). Its
+        # build() temporarily disables the envs cache to force an in-process
+        # core. Default-off; requires the two-lane serve controller.
+        if (
+            os.environ.get("HB_P2_EMBED_SIDECAR") == "1"
+            and os.environ.get("HB_P2_SERVE") == "1"
+        ):
+            from vllm.v1.engine.hb_embed_sidecar import HbEmbedSidecar
+
+            self._hb_embed_sidecar = HbEmbedSidecar(self)
+            self._hb_embed_sidecar.build()
 
     @instrument(span_name="Prepare model")
     def _initialize_kv_caches(self, vllm_config: VllmConfig) -> KVCacheConfig:
@@ -323,6 +351,18 @@ class EngineCore:
         )
         for kv_cache_config in kv_cache_configs:
             kv_cache_config.kv_cache_layout = vllm_config.cache_config.kv_cache_layout
+
+        if vllm_config.additional_config.get("shared_kv") is not None:
+            from vllm.v1.core.shared_kv import shared_kv_for_config
+
+            shared, model_id = shared_kv_for_config(vllm_config)
+            if len(kv_cache_configs) != 1:
+                raise ValueError("shared KV requires an in-process single GPU executor")
+            cache = kv_cache_configs[0]
+            _, spec = shared.validate_config(model_id, cache)
+            cache.num_blocks = shared.logical_capacity(model_id)
+            for tensor in cache.kv_cache_tensors:
+                tensor.size = cache.num_blocks * spec.page_size_bytes
 
         # If auto-fit reduced max_model_len, sync the new value to workers.
         # This is needed because workers were spawned before memory profiling
@@ -515,6 +555,59 @@ class EngineCore:
             )
         return metadata
 
+    def submit_hb_embedding(self, request_id: str, text: str) -> Future[Any]:
+        """Submit one embedding request to Slack Serve's in-process sidecar.
+
+        A utility method, not a primary-scheduler request: the auxiliary model
+        has its own EngineCore and scheduler but runs on the LLM prefill
+        stream. EngineCoreProc resolves the returned Future over its normal
+        utility-RPC response path.
+        """
+        sidecar = self._hb_embed_sidecar
+        if sidecar is None:
+            raise RuntimeError(
+                "Slack Serve dense sidecar is disabled; set "
+                "HB_P2_EMBED_SIDECAR=1 and HB_P2_DENSE_LIVE=1"
+            )
+        if sidecar.pooling_task != "embed":
+            raise RuntimeError(
+                "Slack Serve embeddings require --slackserve-dense-task embed"
+            )
+        return sidecar.submit(request_id, text)
+
+    def submit_hb_classification(
+        self, request_id: str, text: str, use_activation: bool | None
+    ) -> Future[Any]:
+        """Submit one reward/verifier prompt to the dense sidecar."""
+        sidecar = self._hb_embed_sidecar
+        if sidecar is None or sidecar.pooling_task != "classify":
+            raise RuntimeError(
+                "Slack Serve classification requires --slackserve-dense-task classify"
+            )
+        return sidecar.submit(request_id, text, use_activation)
+
+    def submit_hb_score(
+        self,
+        request_id: str,
+        query: str,
+        document: str,
+        use_activation: bool | None,
+        truncate_prompt_tokens: int | None,
+        truncation_side: str | None,
+    ) -> Future[Any]:
+        """Submit one cross-encoder pair to the dense sidecar."""
+        sidecar = self._hb_embed_sidecar
+        if sidecar is None:
+            raise RuntimeError("Slack Serve dense sidecar is disabled")
+        return sidecar.submit_score(
+            request_id,
+            query,
+            document,
+            use_activation,
+            truncate_prompt_tokens,
+            truncation_side,
+        )
+
     def add_request(self, request: Request, request_wave: int = 0):
         """Add request to the scheduler.
 
@@ -664,6 +757,79 @@ class EngineCore:
         Overridden by the DP engine core; never throttles otherwise."""
         return False
 
+    def dispatch(self, lane: str = "default") -> StepTicket:
+        # HB_P2_ASYNC_DECODE=1: the decode lane may hold multiple in-flight
+        # tickets (depth bounded by the controller's FIFO). The AsyncScheduler
+        # placeholder accounting makes re-scheduling the same decode requests
+        # safe, so neither the single-flight guard nor the inflight-id mark
+        # applies to decode in that mode.
+        async_decode = getattr(self, "_hb_decode_depth", 1) > 1 and lane == "decode"
+        inflight_lanes: set[str] = getattr(self, "_hb_inflight_lanes", set())
+        if lane in inflight_lanes and not async_decode:
+            raise RuntimeError(
+                f"Slack Serve lane already has an in-flight ticket: {lane}"
+            )
+        scheduler_output = self.scheduler.schedule(lane=lane)
+        scheduler_output.execution_lane = lane
+        if lane not in ("decode", "default"):
+            scheduler_output.execution_mask = getattr(
+                self.scheduler, "_hb_lane_mask", None
+            )
+        request_ids = set(scheduler_output.num_scheduled_tokens)
+        if async_decode and request_ids:
+            self.scheduler.mark_hb_async_decode(request_ids)
+        if (
+            request_ids
+            and not async_decode
+            and hasattr(self.scheduler, "mark_hb_inflight")
+        ):
+            self.scheduler.mark_hb_inflight(request_ids)
+        inflight_lanes.add(lane)
+        self._hb_inflight_lanes = inflight_lanes
+        try:
+            future = self.model_executor.execute_model(scheduler_output, non_block=True)
+        except Exception:
+            if async_decode and request_ids:
+                self.scheduler.release_hb_async_decode(request_ids)
+            if hasattr(self.scheduler, "release_hb_inflight"):
+                self.scheduler.release_hb_inflight(request_ids)
+            inflight_lanes.discard(lane)
+            raise
+        grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+
+        return StepTicket(scheduler_output, future, grammar_output)
+
+    def finish(self, ticket: StepTicket):
+        output = ticket.future.result()
+        if output is None:
+            output = self.model_executor.sample_tokens(
+                ticket.grammar_output, lane=ticket.scheduler_output.execution_lane
+            )
+        return output
+
+    def complete(self, ticket: StepTicket, model_output: ModelRunnerOutput):
+        """Publish one finished ticket and make its request ids schedulable."""
+        lane = ticket.scheduler_output.execution_lane
+        async_decode = getattr(self, "_hb_decode_depth", 1) > 1 and lane == "decode"
+        try:
+            self._process_aborts_queue()
+            return self.scheduler.update_from_output(
+                ticket.scheduler_output, model_output
+            )
+        finally:
+            # Async-decode tickets never marked their ids (see dispatch), so
+            # they must not release ids a concurrent prefill ticket owns.
+            if async_decode:
+                self.scheduler.release_hb_async_decode(
+                    set(ticket.scheduler_output.num_scheduled_tokens)
+                )
+            if not async_decode and hasattr(self.scheduler, "release_hb_inflight"):
+                self.scheduler.release_hb_inflight(
+                    set(ticket.scheduler_output.num_scheduled_tokens)
+                )
+            if not (async_decode and self._hb_decode_fifo):
+                self._hb_inflight_lanes.discard(lane)
+
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output.
 
@@ -704,6 +870,353 @@ class EngineCore:
             draft_token_ids = self.model_executor.take_draft_token_ids()
             if draft_token_ids is not None:
                 self.scheduler.update_draft_token_ids(draft_token_ids)
+
+    # ------------------------------------------------------------------
+    # Slack Serve two-lane serving controller (HB_P2_SERVE=1)
+    #
+    # Incremental port of drain_p2_pd_event_driven (slackserve/bench.py) into
+    # the EngineCore busy loop so `vllm serve` can drive the P2 candidate. Each
+    # lane owns at most one in-flight ticket; a ticket whose future is ready is
+    # finished + published immediately (decode first) so a completed prefill
+    # never waits behind a decode. Prefill dispatch (~25 ms host prep) happens
+    # only right after a decode dispatch (its cost hides under the fresh decode
+    # step) or when the decode lane is idle, at most one per pass, gated on a
+    # KV-block watermark. An empty ticket latches its lane blocked until a
+    # nonempty completion frees KV. Controller state persists on self across
+    # step calls; requests arrive continuously via the input queue between
+    # passes. All scheduler mutation stays on this (busy-loop) thread.
+    # ------------------------------------------------------------------
+
+    def _hb_serve_init(self) -> None:
+        """Lazily build controller state once the scheduler/KV pool exist."""
+        if self._hb_serve_ready:
+            return
+        prefill_depth = 2 if os.environ.get("HB_P2_PREFILL_LANES") == "2" else 1
+        self._hb_prefill_lanes = ("prefill", "prefill1")[:prefill_depth]
+        self._hb_lanes = ("decode", *self._hb_prefill_lanes)
+        self._hb_tickets: dict[str, StepTicket | None] = {
+            lane: None for lane in self._hb_lanes
+        }
+        # Decode lane may keep multiple in-flight tickets
+        # (FIFO), so ticket N+1's host prep (schedule + input staging) hides
+        # under ticket N's GPU execution instead of serializing between
+        # steps — the same effect vLLM's async scheduling gives stock, which
+        # otherwise costs the sync two-lane controller ~2x step time on
+        # small-batch decode tails. Requires the AsyncScheduler (placeholder
+        # accounting); the sbatch wires --scheduler-cls when the env is set.
+        raw_depth = os.environ.get("HB_P2_ASYNC_DECODE_DEPTH")
+        self._hb_decode_depth = (
+            int(raw_depth)
+            if raw_depth is not None
+            else (2 if os.environ.get("HB_P2_ASYNC_DECODE") == "1" else 1)
+        )
+        if not 1 <= self._hb_decode_depth <= 4:
+            raise ValueError(
+                "HB_P2_ASYNC_DECODE_DEPTH must be between 1 and 4; "
+                f"got {self._hb_decode_depth}"
+            )
+        if self._hb_decode_depth > 1:
+            from vllm.v1.core.sched.async_scheduler import AsyncScheduler
+
+            if not isinstance(self.scheduler, AsyncScheduler):
+                raise RuntimeError(
+                    "HB_P2_ASYNC_DECODE=1 requires the AsyncScheduler "
+                    "(pass --scheduler-cls vllm.v1.core.sched."
+                    "async_scheduler.AsyncScheduler)."
+                )
+        self._hb_decode_fifo: deque[StepTicket] = deque()
+        self._hb_lane_blocked = {lane: False for lane in self._hb_lanes}
+        scheduler: Any = self.scheduler
+        block_pool = scheduler.kv_cache_manager.block_pool
+        self._hb_block_pool = block_pool
+        kv_watermark = float(os.environ.get("HB_P2_PREFILL_KV_WATERMARK", "0") or "0")
+        if kv_watermark:
+            self._hb_watermark_unit = int(block_pool.num_gpu_blocks * kv_watermark)
+        else:
+            block_size = self.vllm_config.cache_config.block_size
+            chunk_blocks = -(-scheduler.max_num_scheduled_tokens // block_size)
+            self._hb_watermark_unit = chunk_blocks + 256
+        self._hb_watermark_skips = 0
+        self._hb_empty_dispatches = {lane: 0 for lane in self._hb_lanes}
+        # Three-stream token accounting (HB_TOKLOG): timestamped cumulative
+        # prefill/decode tokens per published ticket, for interior-window
+        # rate comparison (decode+prefill+embed measured separately).
+        self._hb_tok = {"prefill": 0, "decode": 0}
+        toklog = os.environ.get("HB_TOKLOG")
+        # handle outlives this scope, written across the engine's life
+        self._hb_toklog = open(f"{toklog}.llm.jsonl", "a") if toklog else None  # noqa: SIM115
+        self._hb_toklog_n = 0
+        self._hb_serve_ready = True
+        logger.info(
+            "[hb-p2-serve] two-lane serving controller active: lanes=%s "
+            "watermark=%.3f watermark_unit_blocks=%d num_gpu_blocks=%d",
+            self._hb_lanes,
+            kv_watermark,
+            self._hb_watermark_unit,
+            block_pool.num_gpu_blocks,
+        )
+
+    def _hb_inflight_prefills(self) -> int:
+        return sum(
+            1 for lane in self._hb_prefill_lanes if self._hb_tickets[lane] is not None
+        )
+
+    def _hb_prefill_headroom_ok(self) -> bool:
+        required = self._hb_watermark_unit * (self._hb_inflight_prefills() + 1)
+        return self._hb_block_pool.get_num_free_blocks() >= required
+
+    def _hb_has_dispatchable_prefill(self) -> bool:
+        """True if any not-in-flight request still has prompt KV to compute."""
+        scheduler: Any = self.scheduler
+        return any(
+            not scheduler.is_hb_inflight(r.request_id) for r in scheduler.waiting
+        ) or any(
+            not scheduler.is_hb_inflight(r.request_id)
+            and r.num_computed_tokens < r.num_prompt_tokens
+            for r in scheduler.running
+        )
+
+    def _hb_has_dispatchable_decode(self) -> bool:
+        """True if any not-in-flight request is decode-ready (prompt KV done)."""
+        scheduler: Any = self.scheduler
+        inflight = scheduler._hb_inflight_req_ids
+        return any(
+            r.request_id not in inflight
+            and r.num_computed_tokens >= r.num_prompt_tokens
+            for r in scheduler.running
+        )
+
+    def _hb_free_prefill_lane(self) -> str | None:
+        for lane in self._hb_prefill_lanes:
+            if self._hb_tickets[lane] is None and not self._hb_lane_blocked[lane]:
+                return lane
+        return None
+
+    @staticmethod
+    def _hb_ticket_tokens(ticket: StepTicket) -> int:
+        return ticket.scheduler_output.total_num_scheduled_tokens
+
+    def _hb_complete(
+        self, lane: str, ticket: StepTicket
+    ) -> tuple[dict[int, EngineCoreOutputs], bool]:
+        """Finish + publish one ready ticket; unblock lanes on real work."""
+        model_output = self.finish(ticket)
+        engine_core_outputs = self.complete(ticket, model_output)
+        completed_at = time.perf_counter()
+        tokens = self._hb_ticket_tokens(ticket)
+        executed = tokens > 0
+        if executed:
+            for name in self._hb_lane_blocked:
+                self._hb_lane_blocked[name] = False
+            if self._hb_toklog is not None:
+                key = "decode" if lane == "decode" else "prefill"
+                self._hb_tok[key] += tokens
+                dispatched_at = getattr(ticket, "_hb_dispatched_at", completed_at)
+                self._hb_toklog.write(
+                    json.dumps(
+                        {
+                            "t": time.monotonic(),
+                            "prefill_tokens_cum": self._hb_tok["prefill"],
+                            "decode_tokens_cum": self._hb_tok["decode"],
+                            "lane": lane,
+                            "scheduled_tokens": tokens,
+                            "scheduled_requests": len(
+                                ticket.scheduler_output.num_scheduled_tokens
+                            ),
+                            "dispatch_ms": getattr(ticket, "_hb_dispatch_ms", 0.0),
+                            "ticket_wall_ms": (completed_at - dispatched_at) * 1000,
+                            "running": len(self.scheduler.running),
+                            "waiting": len(self.scheduler.waiting),
+                            "free_kv_blocks": (
+                                self._hb_block_pool.get_num_free_blocks()
+                            ),
+                        }
+                    )
+                    + "\n"
+                )
+                self._hb_toklog_n += 1
+                if self._hb_toklog_n % 20 == 0:
+                    self._hb_toklog.flush()
+        return engine_core_outputs, executed
+
+    def _hb_dispatch(
+        self, lane: str
+    ) -> tuple[dict[int, EngineCoreOutputs], bool] | None:
+        """Dispatch one lane. Returns published outputs if the ticket was empty
+        (completed inline and its lane latched blocked); else None with the
+        nonempty ticket stored in flight.
+
+        Embed sidecar note: prefill x embed exclusion lives entirely in the
+        shared-dense-stream launch mutex (hb_embed_sidecar.DENSE_LAUNCH_LOCK,
+        taken by SlackServeGPUWorker.execute_model on the executor thread) —
+        the controller never blocks on embed."""
+        if lane not in ("decode", "default"):
+            # Load hint for the worker's load-conditional prefill mask
+            # (HB_SMCTRL_MASK_MIN_RUNNING): decode-ready running count at
+            # prefill-dispatch time. Same-process (UniProcExecutor) handoff.
+            from vllm.v1.worker import hb_smctrl
+
+            scheduler: Any = self.scheduler
+            hb_smctrl.RUNNING_DECODE_HINT = len(
+                [
+                    r
+                    for r in scheduler.running
+                    if r.num_computed_tokens >= r.num_prompt_tokens
+                ]
+            )
+        dispatch_started = time.perf_counter()
+        ticket = self.dispatch(lane)
+        ticket._hb_dispatched_at = dispatch_started
+        ticket._hb_dispatch_ms = (time.perf_counter() - dispatch_started) * 1000
+        if self._hb_ticket_tokens(ticket) > 0:
+            if lane == "decode":
+                self._hb_decode_fifo.append(ticket)
+            else:
+                self._hb_tickets[lane] = ticket
+            return None
+        self._hb_empty_dispatches[lane] += 1
+        self._hb_lane_blocked[lane] = True
+        return self._hb_complete(lane, ticket)
+
+    def step_two_lane(
+        self, lane: str = "default"
+    ) -> tuple[dict[int, EngineCoreOutputs], bool]:
+        """One incremental pass of the two-lane controller for the busy loop.
+
+        Returns (engine_core_outputs, model_executed) exactly like step(); at
+        most one ticket is published per call so the busy loop keeps draining
+        the input queue (admitting new requests) between publishes.
+        """
+        self._hb_serve_init()
+        tickets = self._hb_tickets
+
+        # Embed sidecar: start its drain THREAD lazily once real load exists
+        # (maybe_start gates on unfinished-request count). The thread runs the
+        # embed engine concurrently on the SHARED dense stream; prefill x
+        # embed launch exclusion is the worker-side mutex, never this loop.
+        sc = self._hb_embed_sidecar
+        if sc is not None:
+            sc.maybe_start()
+            # Prefill-priority hint from the validated topology-B controller:
+            # dense work may run only when prefill has neither an in-flight
+            # ticket nor dispatchable work with KV headroom. Read-only for the
+            # sidecar.
+            prefill_inflight = self._hb_inflight_prefills() > 0
+            prefill_dispatchable = self._hb_has_dispatchable_prefill()
+            sc.prefill_busy = prefill_inflight or (
+                prefill_dispatchable and self._hb_prefill_headroom_ok()
+            )
+            # post_prefill phase gate: latch once ALL prompt KV is computed
+            # (no waiting requests, no mid-prompt running requests, no
+            # in-flight prefill ticket). Latched — finite-N inf benchmark is
+            # monotone; a latch avoids flapping on stray publishes.
+            if (
+                sc.phase == "post_prefill"
+                and not sc.prefill_exhausted
+                and sc._started
+                and self._hb_inflight_prefills() == 0
+                and not self._hb_has_dispatchable_prefill()
+            ):
+                sc.prefill_exhausted = True
+                logger.info("[hb-p2-serve] prefill exhausted -> embed released")
+
+        # HB_NSYS_CAPTURE=1 (nsys --capture-range=cudaProfilerApi): profile
+        # exactly the measured region — start at first real load, stop once
+        # the engine goes idle after having been busy (and, when the sidecar
+        # is present, its drain has finished). Startup/warmup and post-bench
+        # idle are excluded regardless of startup-time jitter.
+        if os.environ.get("HB_NSYS_CAPTURE") == "1":
+            import torch
+
+            busy = self.scheduler.get_num_unfinished_requests() > 0
+            state = getattr(self, "_hb_nsys_state", "armed")
+            if state == "armed" and self.scheduler.get_num_unfinished_requests() >= 8:
+                torch.cuda.profiler.start()
+                self._hb_nsys_state = "running"
+                logger.info("[hb-nsys] capture START (load detected)")
+            elif (
+                state == "running"
+                and not busy
+                and all(t is None for t in tickets.values())
+                and not self._hb_decode_fifo
+                and (sc is None or sc.capture_complete())
+            ):
+                torch.cuda.profiler.stop()
+                self._hb_nsys_state = "done"
+                logger.info("[hb-nsys] capture STOP (idle after drain)")
+
+        # (a) Publish any ready ticket, decode first. Decode publishes
+        #     strictly FIFO: with HB_P2_ASYNC_DECODE the second ticket's
+        #     schedule assumed the first's placeholder tokens, so
+        #     update_from_output must apply in dispatch order.
+        fifo = self._hb_decode_fifo
+        if fifo and fifo[0].future.done():
+            return self._hb_complete("decode", fifo.popleft())
+        for cur in self._hb_prefill_lanes:
+            ticket = tickets[cur]
+            if ticket is not None and ticket.future.done():
+                tickets[cur] = None
+                return self._hb_complete(cur, ticket)
+
+        # (b) Dispatch decode while the FIFO has room (depth 1 unless
+        #     HB_P2_ASYNC_DECODE=1) and decode-ready work exists; one per
+        #     pass. Ticket N+1's host prep hides under ticket N's GPU step.
+        decode_dispatched_now = False
+        if (
+            len(fifo) < self._hb_decode_depth
+            and not self._hb_lane_blocked["decode"]
+            and self._hb_has_dispatchable_decode()
+        ):
+            result = self._hb_dispatch("decode")
+            decode_dispatched_now = True
+            if result is not None:  # empty decode ticket completed inline
+                return result
+
+        # (c) Dispatch prefill only right behind a decode dispatch (host prep
+        #     hides under the fresh decode step) or with an idle decode lane;
+        #     at most one per pass; KV-watermark gated.
+        pf_lane = self._hb_free_prefill_lane()
+        if (
+            pf_lane is not None
+            and (decode_dispatched_now or not fifo)
+            and self._hb_has_dispatchable_prefill()
+        ):
+            if self._hb_prefill_headroom_ok():
+                result = self._hb_dispatch(pf_lane)
+                if result is not None:
+                    return result
+            else:
+                self._hb_watermark_skips += 1
+
+        # (d) Tickets in flight but nothing publishable yet: wait briefly on the
+        #     first completion, then return so input keeps getting admitted.
+        inflight = [t for t in tickets.values() if t is not None]
+        inflight.extend(fifo)
+        if inflight:
+            futures_wait(
+                [t.future for t in inflight],
+                return_when=FIRST_COMPLETED,
+                timeout=0.05,
+            )
+            return {}, False
+
+        # (e) Nothing in flight. Flush finished-but-unpublished request ids
+        #     (they need one more scheduler pass to reach the worker), then any
+        #     dispatchable work; otherwise fall through so the busy loop blocks
+        #     on the input queue.
+        if self.scheduler.has_finished_requests():
+            result = self._hb_dispatch("decode")
+            if result is not None:
+                return result
+            # A nonempty ticket was stored in flight; nothing published this
+            # call, so report not-executed (post_step belongs to the publish).
+            return {}, False
+        pf_lane = self._hb_free_prefill_lane()
+        if pf_lane is not None and self._hb_has_dispatchable_prefill():
+            result = self._hb_dispatch(pf_lane)
+            if result is not None:
+                return result
+        return {}, False
 
     def step_with_batch_queue(
         self,

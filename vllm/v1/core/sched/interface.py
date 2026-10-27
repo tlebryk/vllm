@@ -51,7 +51,9 @@ class SchedulerInterface(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def schedule(self, throttle_prefills: bool = False) -> "SchedulerOutput":
+    def schedule(
+        self, throttle_prefills: bool = False, *, lane: str = "default"
+    ) -> "SchedulerOutput":
         """Schedule the requests to process in this scheduling step.
 
         The scheduling decision is made at the iteration level. Each scheduling
@@ -71,6 +73,7 @@ class SchedulerInterface(ABC):
         preparing inputs to the model.
 
         Args:
+            lane: Native execution stream to schedule, or default batching.
             throttle_prefills: DP prefill balancing. When True (set by the DP
                 engine core on non-cadence-aligned steps), new prefill compute is
                 deferred to a later step so prefills stay aligned across DP ranks;

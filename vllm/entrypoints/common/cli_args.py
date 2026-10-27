@@ -233,6 +233,112 @@ class BaseFrontendArgs:
     fingerprint_value: str | None = None
     """Literal fingerprint string used when ``--fingerprint-mode=custom``."""
 
+    slackserve_models: str | None = None
+    """JSON configuration for one or two native models on one GPU.
+
+    A single-model P/D run requires --slackserve-shared-kv private.
+    """
+    slackserve_shared_kv: Literal["private", "head", "layer"] = "layer"
+    """KV capacity layout for the native dual-model backend."""
+    slackserve_kv_memory_bytes: int | None = None
+    """Total shared KV bytes; defaults to the sum of model budgets."""
+    slackserve_kv_admission: Literal["current", "full-output"] = "current"
+    """Native footprint admission or full requested-output reservation."""
+    slackserve_stream_topology: Literal[
+        "single-stream", "two-stream", "three-stream-ordered", "three-stream-overlap"
+    ] = "three-stream-overlap"
+    """Execution streams; single-stream serializes both models' GPU work."""
+    slackserve_decode_depth: int = 2
+    """Global number of decode tickets, shared across models."""
+    slackserve_max_requests: int = 8192
+    """Bound on active/queued native requests and live HTTP streams."""
+    slackserve_offline_serial_counts: str | None = None
+    """JSON request counts by model ID for one server-gated model-serial drain.
+
+    Accept both queues immediately; run models in configuration order. The
+    expected counts prevent an initial arrival gap from releasing model B.
+    """
+    slackserve_step_trace: str | None = None
+    """Optional streamed JSONL step records and NVTX labels for diagnostics."""
+    slackserve_smctrl_mask: str | None = None
+    """Optional MODEL:prefill:TPCS spread mask while a partner has decode work.
+
+    Restricted to concurrent topology and eager prefill. Decode graphs retain
+    their original placement; replay-time stream masks cannot restrict them.
+    """
+    slackserve_smctrl_lib: str | None = None
+    """libsmctrl shared library required by --slackserve-smctrl-mask."""
+    slackserve_smctrl_indices: str | None = None
+    """Optional JSON list of enabled physical TPC indices, replacing spread."""
+    slackserve_mask_tiers: str | None = None
+    """Optional JSON list of load tiers for the generation prefill mask:
+    [{"min_decode": N, "indices": [TPC...]}, ...]. While the mask is active,
+    the tier with the largest min_decode not above the decode load is applied.
+    """
+    slackserve_mask_candidates: str | None = None
+    """Optional JSON list of prefill-mask candidates for the calibrated policy:
+    [{"name": "spread48", "indices": [TPC...]}, {"name": "none", "indices": null}].
+    Defaults to the mask's own indices, every tier's indices, and unrestricted.
+    """
+    slackserve_mask_calibration: str = "off"
+    """Calibrated per-ticket mask policy: off, auto (reuse a cached table for
+    this deployment key, else measure at startup), or force (always measure).
+    """
+    slackserve_mask_calibration_dir: str | None = None
+    """Cache directory for calibration tables (default ~/.cache/slackserve)."""
+    slackserve_smctrl_max_dense_wait_ms: float = 0
+    """Restore full-GPU dense access once its oldest request reaches this age.
+
+    Zero disables the age guard. Generation prefill retains its decode gate.
+    """
+    slackserve_smctrl_min_decode_requests: int = 1
+    """Apply the prefill mask only at this many decode-ready requests.
+
+    This controls placement, not admission or scheduler batch capacity.
+    """
+    slackserve_hybrid_min_decode: int = 0
+    """Below this many decode-ready requests, run stock hybrid batching.
+
+    The controller dispatches the scheduler's merged batch (prefill chunks and
+    decodes in one forward) on the decode stream, unmasked, instead of split
+    prefill/decode steps. Zero disables the fallback.
+    """
+    slackserve_dense_model: str | None = None
+    """Auxiliary pooling checkpoint for the native multi-model controller.
+
+    Runs on the shared prefill stream, with generation prefill taking priority.
+    Uses private KV and the same request transport as native dual LLM serving.
+    """
+    slackserve_dense_step_tokens: int = 0
+    """Candidate dense work-unit tokens per dispatch (0 uses full capacity).
+
+    Does not resize engine buffers or reduce scheduler capacity. Sequential
+    controls should leave this unset and tune the dense engine capacity.
+    """
+    slackserve_dense_adaptive_step: bool = False
+    """Use small dense work units only while its dispatch is masked.
+
+    Full capacity is restored with little decode demand or an age override.
+    Requires a mask and a positive --slackserve-dense-step-tokens.
+    """
+    slackserve_dense_served_model_name: str = "embed"
+    """Public ``model`` name accepted by the Slack Serve dense endpoint."""
+    slackserve_dense_task: Literal["embed", "score", "classify"] = "embed"
+    """Auxiliary model task: embedding, cross-encoder reranking, or reward
+    classification."""
+    slackserve_dense_hf_overrides: str | None = None
+    """Optional JSON Hugging Face config overrides for the auxiliary model."""
+    slackserve_dense_gpu_memory_utilization: float = 0.18
+    """GPU-memory fraction reserved for the auxiliary embedding engine."""
+    slackserve_dense_kv_memory_bytes: int | None = None
+    """Explicit private dense KV bytes; otherwise use utilization-based sizing."""
+    slackserve_dense_max_model_len: int = 11264
+    """Maximum input length served by the auxiliary embedding engine."""
+    slackserve_dense_max_num_batched_tokens: int = 8192
+    """Embedding token budget per shared-dense-stream work unit."""
+    slackserve_dense_max_num_seqs: int = 192
+    """Auxiliary scheduler capacity; physical memory remains the residency limit."""
+
     @classmethod
     def _customize_cli_kwargs(
         cls,

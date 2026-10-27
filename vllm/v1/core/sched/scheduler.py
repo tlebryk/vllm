@@ -126,6 +126,16 @@ class Scheduler(SchedulerInterface):
         )
         # Track requests scheduled in prior step (MRV1-only).
         self.prev_step_scheduled_req_ids: set[str] = set()
+        # Slack Serve P2 only: schedule() advances logical token counts before
+        # the GPU ticket completes. Keep those request ids out of both lanes
+        # until EngineCore finalizes that ticket.
+        self._hb_inflight_req_ids: set[str] = set()
+        # Async decode intentionally schedules the same request into multiple
+        # FIFO tickets. Refcounts keep those requests from being preempted or
+        # resumed on the prefill lane until every older decode ticket has
+        # published.
+        self._hb_async_decode_refs: dict[str, int] = defaultdict(int)
+        self._hb_preemptions_by_lane: dict[str, int] = defaultdict(int)
 
         # Scheduling constraints.
         self.max_num_running_reqs = self.scheduler_config.max_num_seqs
@@ -376,6 +386,14 @@ class Scheduler(SchedulerInterface):
         if self.connector is not None:
             self.connector.bind_kv_cache_manager(self.kv_cache_manager)
 
+        if vllm_config.additional_config.get("shared_kv") is not None:
+            from vllm.v1.core.shared_kv import (
+                install_shared_block_pool,
+                shared_kv_for_config,
+            )
+
+            shared, model_id = shared_kv_for_config(vllm_config)
+            install_shared_block_pool(self.kv_cache_manager, shared, model_id)
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
         self._pending_encoder_input_ids: dict[str, set[int]] = {}
@@ -685,7 +703,9 @@ class Scheduler(SchedulerInterface):
             num_new_tokens -= self.num_prefill_lookahead - remaining
         return max(num_new_tokens, 0)
 
-    def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+    def schedule(
+        self, throttle_prefills: bool = False, *, lane: str = "default"
+    ) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -698,10 +718,32 @@ class Scheduler(SchedulerInterface):
         # chunked prefills, prefix caching, speculative decoding,
         # and the "jump decoding" optimization in the future.
 
+        # "prefill1" is the optional second prefill lane (HB_P2_PREFILL_LANES=2);
+        # it admits the same prefill-phase work as "prefill".
+        if lane not in ("default", "prefill", "prefill1", "decode"):
+            raise ValueError(f"Unknown execution lane: {lane!r}")
+
+        # P1 Slack Serve policy. The caller selects a lane; the scheduler
+        # constrains its otherwise normal admission policy to that phase.
+        # A request becomes decode-ready after its prompt KV has been computed.
+        # The default path is intentionally unchanged.
+        def lane_accepts(request: Request) -> bool:
+            if self.is_hb_inflight(
+                request.request_id,
+                include_async_decode=lane != "decode",
+            ):
+                return False
+            if lane == "default":
+                return True
+            is_decode_ready = request.num_computed_tokens >= request.num_prompt_tokens
+            return is_decode_ready if lane == "decode" else not is_decode_ready
+
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
         scheduled_running_reqs: list[Request] = []
         preempted_reqs: list[Request] = []
+        kv_reclamation_needed_blocks = 0
+        kv_admission_deferred = False
 
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
@@ -709,6 +751,12 @@ class Scheduler(SchedulerInterface):
         spec = self.vllm_config.speculative_config
         draft_slots = spec.max_num_new_slots_for_drafting if spec is not None else 0
         input_budget = self.scheduler_config.max_num_batched_tokens
+
+        # Candidate work-unit shaping belongs to the launch policy. Engine
+        # buffers and scheduling capacity retain their full configured size.
+        step_budget = getattr(self, "_hb_step_token_budget", None)
+        if lane == "prefill" and step_budget is not None:
+            token_budget = min(token_budget, step_budget)
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
             token_budget = 0
@@ -785,6 +833,23 @@ class Scheduler(SchedulerInterface):
             request = self.running[req_index]
             if input_budget <= draft_slots:
                 break
+
+            if not lane_accepts(request):
+                req_index += 1
+                continue
+
+            # Measurement-only generation boundary used by Slack Serve.
+            # During untimed wave setup, keep decode-ready requests resident
+            # in KV but do not advance them while other requests are still
+            # prefilling. The harness clears this instance attribute once
+            # every request in the admitted wave has emitted its setup token.
+            # Normal serving never sets the attribute and is unchanged.
+            if (
+                getattr(self, "_hb_hold_decode_ready", False)
+                and request.num_computed_tokens >= request.num_prompt_tokens
+            ):
+                req_index += 1
+                continue
 
             if (
                 request.num_output_placeholders > 0
@@ -910,6 +975,15 @@ class Scheduler(SchedulerInterface):
                         # The request can be scheduled.
                         break
 
+                    if self.kv_cache_manager.allocation_pending_blocks:
+                        # Eviction has already made enough capacity available
+                        # once its GPU fences finish. Yield instead of evicting
+                        # more requests while those same releases are pending.
+                        kv_reclamation_needed_blocks = (
+                            self.kv_cache_manager.allocation_pending_blocks
+                        )
+                        break
+
                     if (
                         self.connector is not None
                         and self.connector.has_pending_block_frees()
@@ -918,9 +992,15 @@ class Scheduler(SchedulerInterface):
 
                     # The request cannot be scheduled.
                     # Preempt the lowest-priority request.
+                    safe_victims = self.hb_safe_preemption_victims()
+                    if not safe_victims:
+                        # A pending async-decode ticket still owns every
+                        # possible victim's logical/KV state. Wait for the
+                        # oldest ticket to publish instead of invalidating it.
+                        break
                     if self.policy == SchedulingPolicy.PRIORITY:
                         preempted_req = max(
-                            self.running,
+                            safe_victims,
                             key=lambda r: (r.priority, r.arrival_time),
                         )
                     else:
@@ -956,8 +1036,10 @@ class Scheduler(SchedulerInterface):
                                 )
                                 encoder_compute_budget += num_embeds_to_restore
                     else:
-                        preempted_req = self.running.pop()
+                        preempted_req = safe_victims[-1]
+                        self.running.remove(preempted_req)
 
+                    self._hb_preemptions_by_lane[lane] += 1
                     self._preempt_request(
                         preempted_req,
                         scheduled_timestamp,
@@ -1036,7 +1118,12 @@ class Scheduler(SchedulerInterface):
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
         # Next, schedule the WAITING requests.
-        if not preempted_reqs and self._pause_state != PauseState.PAUSED_ALL:
+        if (
+            lane != "decode"
+            and not preempted_reqs
+            and not kv_reclamation_needed_blocks
+            and self._pause_state != PauseState.PAUSED_ALL
+        ):
             step_skipped_waiting: deque[Request] = deque()
             step_skipped_kv_holding: deque[Request] = deque()
 
@@ -1064,6 +1151,12 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+
+                if self.is_hb_inflight(
+                    request_id, include_async_decode=lane != "decode"
+                ):
+                    skip_request(request_queue)
+                    continue
 
                 ready_to_schedule = self._handle_blocked_waiting_request(request)
                 if not ready_to_schedule:
@@ -1421,6 +1514,12 @@ class Scheduler(SchedulerInterface):
                 # Replayed tokens are already counted in the adopted hit; a
                 # chunk that ends inside the replayed range needs no new slots.
                 num_tokens_past_hit = max(num_new_tokens - num_replay_tokens, 0)
+
+                admission_guard = getattr(self, "_hb_kv_admission_guard", None)
+                if admission_guard is not None and not admission_guard(request):
+                    kv_admission_deferred = True
+                    break
+
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
                     num_tokens_past_hit,
@@ -1442,6 +1541,9 @@ class Scheduler(SchedulerInterface):
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
+                    kv_reclamation_needed_blocks = (
+                        self.kv_cache_manager.allocation_pending_blocks
+                    )
 
                     # NOTE: we need to untouch the request from the encode cache
                     # manager
@@ -1721,6 +1823,8 @@ class Scheduler(SchedulerInterface):
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             skip_drafts=not drafts_needed,
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
+            kv_reclamation_needed_blocks=kv_reclamation_needed_blocks,
+            kv_admission_deferred=kv_admission_deferred,
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -1756,6 +1860,49 @@ class Scheduler(SchedulerInterface):
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
         return scheduler_output
+
+    def mark_hb_inflight(self, request_ids: set[str]) -> None:
+        overlap = self._hb_inflight_req_ids.intersection(request_ids)
+        if overlap:
+            raise RuntimeError(f"Slack Serve scheduled in-flight requests: {overlap}")
+        self._hb_inflight_req_ids.update(request_ids)
+
+    def release_hb_inflight(self, request_ids: set[str]) -> None:
+        self._hb_inflight_req_ids.difference_update(request_ids)
+
+    def mark_hb_async_decode(self, request_ids: set[str]) -> None:
+        for request_id in request_ids:
+            self._hb_async_decode_refs[request_id] += 1
+
+    def release_hb_async_decode(self, request_ids: set[str]) -> None:
+        for request_id in request_ids:
+            refs = self._hb_async_decode_refs.get(request_id, 0)
+            if refs == 0:
+                raise RuntimeError(
+                    f"released unreferenced async-decode request {request_id!r}"
+                )
+            if refs == 1:
+                self._hb_async_decode_refs.pop(request_id, None)
+            else:
+                self._hb_async_decode_refs[request_id] = refs - 1
+
+    def hb_has_async_decode_ref(self, request_id: str) -> bool:
+        return self._hb_async_decode_refs.get(request_id, 0) > 0
+
+    def is_hb_inflight(
+        self, request_id: str, *, include_async_decode: bool = True
+    ) -> bool:
+        return request_id in self._hb_inflight_req_ids or (
+            include_async_decode and self.hb_has_async_decode_ref(request_id)
+        )
+
+    def hb_safe_preemption_victims(self) -> list[Request]:
+        """Return running requests not owned by an outstanding GPU ticket."""
+        return [
+            request
+            for request in self.running
+            if not self.is_hb_inflight(request.request_id)
+        ]
 
     def _build_kv_connector_meta(
         self, connector: KVConnectorBase_V1, scheduler_output: SchedulerOutput
@@ -2637,6 +2784,8 @@ class Scheduler(SchedulerInterface):
                 cudagraph_stats,
                 perf_stats,
                 ec_connector_stats=ec_connector_stats,
+                num_scheduled_reqs=len(scheduler_output.num_scheduled_tokens),
+                total_num_scheduled_tokens=scheduler_output.total_num_scheduled_tokens,
             )
         ) is not None:
             # Return stats to only one of the front-ends.
@@ -3208,6 +3357,8 @@ class Scheduler(SchedulerInterface):
         cudagraph_stats: CUDAGraphStat | None = None,
         perf_stats: PerfStats | None = None,
         ec_connector_stats: ECConnectorStats | None = None,
+        num_scheduled_reqs: int = 0,
+        total_num_scheduled_tokens: int = 0,
     ) -> SchedulerStats | None:
         if not self.log_stats:
             return None
@@ -3236,6 +3387,8 @@ class Scheduler(SchedulerInterface):
             num_waiting_reqs=num_waiting - num_deferred,
             num_skipped_waiting_reqs=num_deferred,
             num_kv_fetch_reqs_by_stage=self._kv_fetch_counts.copy(),
+            num_scheduled_reqs=num_scheduled_reqs,
+            total_num_scheduled_tokens=total_num_scheduled_tokens,
             kv_cache_usage=self.kv_cache_manager.usage,
             prefix_cache_stats=prefix_cache_stats,
             connector_prefix_cache_stats=connector_prefix_cache_stats,

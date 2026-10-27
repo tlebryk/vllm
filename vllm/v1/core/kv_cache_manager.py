@@ -203,6 +203,9 @@ class KVCacheManager:
             if manager.retains_longer_hit
         )
         self.kv_cache_config = kv_cache_config
+        # A failed allocation may need GPU-fenced releases, rather than more
+        # eviction. Reset for every attempt; private pools leave this at zero.
+        self.allocation_pending_blocks = 0
 
         # Watermark: minimum number of KV cache blocks to keep free when
         # admitting waiting/preempted requests, to avoid frequent preemptions.
@@ -477,6 +480,7 @@ class KVCacheManager:
             A list of new allocated blocks.
 
         """
+        self.allocation_pending_blocks = 0
         # A step may need no slots of its own while still adopting computed
         # tokens: an async KV load, or a chunk that ends inside the replayed
         # range of a hit (SWA bounded replay).
@@ -584,6 +588,13 @@ class KVCacheManager:
         available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
         required_blocks = num_blocks_to_allocate + watermark_blocks
         if required_blocks > available_blocks:
+            after_reclamation = getattr(
+                self.block_pool, "can_allocate_after_reclamation", None
+            )
+            if after_reclamation is not None and after_reclamation(
+                required_blocks + reserved_blocks
+            ):
+                self.allocation_pending_blocks = required_blocks + reserved_blocks
             # Cannot allocate new blocks
             return None
 

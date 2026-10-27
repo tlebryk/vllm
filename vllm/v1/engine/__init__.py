@@ -4,6 +4,7 @@
 import enum
 import time
 from collections.abc import Mapping
+from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -17,13 +18,19 @@ from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.outputs import RequestError
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
+from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_hints import KvHintsEnvelope
 from vllm.v1.metrics.stats import (
     PrefillStats,
     RequestSpecDecodeMetrics,
     SchedulerStats,
 )
-from vllm.v1.outputs import LogprobsLists, LogprobsTensors, SamplingMaskLists
+from vllm.v1.outputs import (
+    LogprobsLists,
+    LogprobsTensors,
+    ModelRunnerOutput,
+    SamplingMaskLists,
+)
 from vllm.v1.serial_utils import UtilityResult
 
 # Type for pause_generation mode parameter.
@@ -333,3 +340,10 @@ class EngineStatusType(enum.IntEnum):
     HEALTHY = 0
     DEAD = 1
     UNHEALTHY = 2
+
+
+@dataclass
+class StepTicket:
+    scheduler_output: SchedulerOutput
+    future: Future[ModelRunnerOutput | None]
+    grammar_output: GrammarOutput | None

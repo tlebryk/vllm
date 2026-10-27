@@ -38,6 +38,15 @@ async def build_async_engine_client(
     usage_context: UsageContext = UsageContext.OPENAI_API_SERVER,
     client_config: dict[str, Any] | None = None,
 ) -> AsyncIterator[EngineClient]:
+    from vllm.entrypoints.slackserve.config import configure_dense_sidecar
+
+    configure_dense_sidecar(args, native=True)
+    if getattr(args, "slackserve_models", None):
+        from vllm.entrypoints.slackserve.multi_model import build_multi_model_clients
+
+        async with build_multi_model_clients(args) as engine:
+            yield engine
+        return
     if os.getenv("VLLM_WORKER_MULTIPROC_METHOD") == "forkserver":
         # The executor is expected to be mp.
         # Pre-import heavy modules in the forkserver process
@@ -130,6 +139,11 @@ async def build_and_serve(
         uvicorn_kwargs["log_config"] = log_config
 
     supported_tasks = await engine_client.get_supported_tasks()
+    if hasattr(engine_client, "model_clients"):
+        all_tasks = []
+        for client in engine_client.model_clients.values():
+            all_tasks.extend(await client.get_supported_tasks())
+        supported_tasks = tuple(dict.fromkeys(all_tasks))
     model_config = engine_client.model_config
 
     logger.info("Supported tasks: %s", supported_tasks)

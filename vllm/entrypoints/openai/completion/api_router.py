@@ -31,7 +31,9 @@ ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL = "endpoint-load-metrics-format"
 
 
 def completion(request: Request) -> OpenAIServingCompletion | None:
-    return request.app.state.openai_serving_completion
+    return getattr(
+        request.state, "slackserve_model_state", request.app.state
+    ).openai_serving_completion
 
 
 @router.post(

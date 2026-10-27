@@ -40,6 +40,12 @@ def build_app(
     else:
         app = FastAPI(lifespan=lifespan)
     app.state.args = args
+    if getattr(args, "slackserve_models", None):
+        from vllm.entrypoints.slackserve.multi_model import MultiModelRoutingMiddleware
+
+        app.add_middleware(
+            MultiModelRoutingMiddleware, max_requests=args.slackserve_max_requests
+        )
     app.root_path = args.root_path
 
     register_api_routers(args, app, supported_tasks, model_config)

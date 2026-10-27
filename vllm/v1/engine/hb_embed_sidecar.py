@@ -1,0 +1,941 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Slack Serve two-model SERVE sidecar (Thread C) — shared dense stream.
+
+An in-process Qwen3-Embedding-4B pooling engine that lives inside the serve
+EngineCore process and backfills the P2 two-lane controller's slack with a
+fixed embedding queue. Active only when HB_P2_EMBED_SIDECAR=1; a strict no-op
+otherwise.
+
+ARCHITECTURE (2 streams total; the validated offline-bridge discipline)
+-----------------------------------------------------------------------
+Decode runs FULL-cudagraph on its own stream, untouched. Prefill and embed
+SHARE the prefill lane's CUDA stream, and their eager forwards are
+HOST-SERIALIZED by one launch mutex (DENSE_LAUNCH_LOCK), equal priority,
+FIFO — exactly the structure the offline 3-model bridge validated ("prefill
+and embed host-serialized on one dense stream, decode on the other").
+
+The mutex is the whole mechanism. It simultaneously guarantees:
+  * no per-kernel interleaving on the dense stream (two free-running
+    enqueuers interleave EVERY kernel — probe 275206 — and that interleaving
+    is what produced the FA3 TMA crash in the free-running design);
+  * no forward-context race (the module-global is only touched by one eager
+    forward at a time; decode's graph-replay path is empirically immune);
+  * launch-ahead: the winner enqueues its unit while the loser's previous
+    kernels are still executing, so the dense stream never idles between
+    units — the stream FIFO is the scheduler.
+
+There is NO overlap dispatch policy: no yield-first, staleness guard, stream
+drain, or ticket gate. Optional idle uncapping only changes embed's SM target
+after LLM work ends. During overlap, the only contention is a lock handoff on
+the executor thread.
+
+Embed's pooling execute has an inline GPU sync (readback), so the embed
+thread holds the mutex for its full micro-step; budget 4096 keeps that unit
+small. The drain starts only once the LLM is under real load
+(HB_P2_EMBED_START_MIN_REQS, default 8) so no embed work escapes the
+measured window during harness warmup.
+
+UVA: each V2 runner owns its staged-buffer fence registry. The LLM can
+only fence its own pools; the stock pooling runner keeps its ordinary
+unfenced behavior without a thread-local registration opt-out.
+
+Build happens ONCE, eagerly, during EngineCore.__init__ (before the busy
+loop, so no live forward to race and the ~30-60 s load stays out of served
+TTFT). The embed engine's core is forced in-process (InprocClient).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import queue
+import threading
+import time
+from concurrent.futures import Future
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any
+
+import torch
+
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
+# The two eager model forwards share vLLM's module-global forward context.
+# Shared CUDA-stream FIFO orders kernels, but it does not protect that Python
+# context. This narrow mutex serializes only the forward-context scope; unlike
+# DENSE_LAUNCH_LOCK it never waits for a dense GPU unit to complete.
+FORWARD_CONTEXT_LOCK = threading.Lock()
+
+
+def install_forward_context_mutex() -> None:
+    """Protect eager forwards from the two in-process engines."""
+    import vllm.forward_context as forward_context
+
+    if getattr(forward_context, "_hb_forward_context_mutex_installed", False):
+        return
+    original = forward_context.set_forward_context
+
+    @contextmanager
+    def guarded(*args: Any, **kwargs: Any):  # noqa: ANN202
+        with FORWARD_CONTEXT_LOCK, original(*args, **kwargs) as value:
+            yield value
+
+    forward_context.set_forward_context = guarded
+    forward_context._hb_forward_context_mutex_installed = True
+
+
+# One launch mutex for the shared dense stream: prefill's eager forward
+# (SlackServeGPUWorker.execute_model, prefill lanes) and embed micro-steps
+# acquire it around their enqueue windows. Plain Lock, equal priority.
+DENSE_LAUNCH_LOCK = threading.Lock()
+
+# CUDA event recorded on the dense stream at the end of every prefill launch
+# window (single writer, under the lock). The embed thread starts a unit only
+# once this has fired: its inline pooling sync then waits only on its OWN
+# ~50ms of kernels, never on a prefill unit ahead of it — a lock hold that
+# includes a prefill wait blocks the prefill executor worker ~530ms and
+# queues decode dispatch behind it (jobs 275449-52: p99 ITL ~500ms). The
+# poll gap between prefill-end and embed-launch is ~1-2ms of Python.
+PREFILL_TAIL = {"event": None}
+
+
+def record_prefill_tail(stream: torch.cuda.Stream) -> None:
+    """Worker-side (under the lock): mark the end of a prefill launch."""
+    event = PREFILL_TAIL["event"]
+    if event is None:
+        event = torch.cuda.Event()
+    event.record(stream)
+    PREFILL_TAIL["event"] = event
+
+
+def prefill_tail_clear() -> bool:
+    """True once the last prefill unit's kernels have retired."""
+    event = PREFILL_TAIL["event"]
+    return event is None or event.query()
+
+
+# Telemetry (GIL-atomic enough for counters; read at drain report time).
+LOCK_STATS = {
+    "prefill_wait_ms": 0.0,
+    "prefill_waits": 0,
+    "prefill_max_wait_ms": 0.0,
+    "embed_wait_ms": 0.0,
+    "embed_waits": 0,
+    "embed_max_wait_ms": 0.0,
+}
+
+
+def _lock_acquire(side: str) -> None:
+    t0 = time.perf_counter()
+    DENSE_LAUNCH_LOCK.acquire()
+    waited = (time.perf_counter() - t0) * 1000
+    LOCK_STATS[f"{side}_wait_ms"] += waited
+    if waited > 1.0:
+        LOCK_STATS[f"{side}_waits"] += 1
+        if waited > LOCK_STATS[f"{side}_max_wait_ms"]:
+            LOCK_STATS[f"{side}_max_wait_ms"] = waited
+
+
+# Fairness: threading.Lock has no FIFO handoff, and the embed drain loop
+# re-acquires within microseconds of releasing while the prefill executor
+# thread is still being woken — prefill then loses 3-5 consecutive handoffs
+# (jobs 275475-77: embed unit p50 65ms but prefill wait avg ~250ms, max
+# ~525ms). Prefill announces itself here; the embed loop defers while any
+# prefill launcher is waiting, bounding prefill's wait to ONE embed unit.
+PREFILL_WAITING = {"n": 0}
+
+
+def prefill_launch_lock_acquire() -> None:
+    """Called by SlackServeGPUWorker around a prefill-lane launch."""
+    PREFILL_WAITING["n"] += 1
+    try:
+        _lock_acquire("prefill")
+    finally:
+        PREFILL_WAITING["n"] -= 1
+
+
+def prefill_launch_lock_release() -> None:
+    DENSE_LAUNCH_LOCK.release()
+
+
+def _model_runner(engine: Any) -> Any:
+    worker = engine.engine_core.engine_core.model_executor.driver_worker
+    worker = getattr(worker, "worker", worker)
+    return worker.model_runner
+
+
+def _count_marked_linears(engine: Any) -> int:
+    runner = _model_runner(engine)
+    model = getattr(runner, "model", None)
+    if model is None:
+        model = runner.get_model()
+    return sum(1 for m in model.modules() if getattr(m, "_hb_embed_sm_capped", False))
+
+
+class HbEmbedSidecar:
+    """Owns the in-process dense engine and its shared-stream drain thread.
+
+    The file-backed embedding drain stays the default benchmark path.
+    ``HB_P2_DENSE_LIVE=1`` turns the sidecar into an in-process service:
+    :meth:`submit` returns a Future resolved with that request's pooling
+    output. The sidecar thread stays the sole caller of the auxiliary
+    engine's add/step methods.
+    """
+
+    def __init__(self, host_core: Any) -> None:
+        self.host_core = host_core
+        self.engine: Any = None
+
+        self.embed_model = os.environ.get(
+            "HB_P2_EMBED_MODEL", "Qwen/Qwen3-Embedding-4B"
+        )
+        self.pooling_task = os.environ.get("HB_P2_DENSE_TASK", "embed")
+        if self.pooling_task not in ("embed", "score", "classify"):
+            raise ValueError(f"unsupported dense task: {self.pooling_task!r}")
+        self.live = os.environ.get("HB_P2_DENSE_LIVE") == "1"
+        self.embed_gmu = float(os.environ.get("HB_P2_EMBED_GMU", "0.18"))
+        # 4096: the embed micro-step is the unit of dense-stream FIFO
+        # granularity; a 4K step keeps the worst prefill lock handoff ~40ms.
+        self.embed_budget = int(os.environ.get("HB_P2_EMBED_BUDGET", "4096"))
+        self.embed_max_model_len = int(
+            os.environ.get("HB_P2_EMBED_MAX_MODEL_LEN", "2048")
+        )
+        self.embed_max_num_seqs = int(os.environ.get("HB_P2_EMBED_MAX_NUM_SEQS", "512"))
+        self.embed_n = int(os.environ.get("HB_P2_EMBED_N", "512"))
+        self.embed_queue_path = os.environ.get(
+            "HB_P2_EMBED_QUEUE",
+            "/mnt/weka/theo/heterogenious-batching-vllm/data/prompts/embed_rag.jsonl",
+        )
+        self.embed_sm_target = int(os.environ.get("HB_P2_EMBED_SM_TARGET", "96"))
+        # Protect live LLM work, but do not cap an embed-only tail.
+        self.embed_uncap_when_llm_idle = (
+            os.environ.get("HB_P2_EMBED_UNCAP_IDLE", "0") == "1"
+        )
+        # Async scheduling pipelines the embed engine's own steps: one
+        # get_output() = launch step k+1, then harvest step k (whose forward
+        # and D2H already overlapped via AsyncPoolingOutput's copy stream).
+        # The lock hold shrinks from launch+full-GPU-sync to launch+residual
+        # (~25ms), so back-to-back units keep the dense stream fed and the
+        # worst prefill wait behind embed roughly halves. Stock machinery —
+        # the sync path was just async_scheduling=False calling
+        # AsyncPoolingOutput.get_output() inline.
+        # The finite offline drain can pipeline sidecar steps; live PD-E keeps
+        # the step synchronous until the batch-queue completion protocol is
+        # wired into the server controller. Decode stays async either way.
+        self.embed_async_sched = (
+            os.environ.get("HB_P2_EMBED_ASYNC_SCHED", "0" if self.live else "1") == "1"
+        )
+        # Don't start draining before the LLM is under real load, so no embed
+        # work escapes the measured window during harness warmup (the bench's
+        # initial single-prompt test would otherwise free-run the queue).
+        self.start_min_reqs = int(os.environ.get("HB_P2_EMBED_START_MIN_REQS", "8"))
+        # HB_P2_EMBED_PHASE=post_prefill: embed runs ONLY once the LLM's
+        # prefill work is exhausted (all prompts admitted and computed), then
+        # free-runs overlapped with the decode-only region + tail. Measured
+        # price ladder per embed-second: decode-only overlap <<1 (PE regime),
+        # tail =1.0, admission-phase overlap 0.99-1.27 (worst) — so never
+        # place embed during admission. Default remains "any" (gap-fitting).
+        self.phase = os.environ.get("HB_P2_EMBED_PHASE", "any")
+        self.prefill_exhausted = False
+        # Published by EngineCore's two-lane controller. True means prefill
+        # either owns a ticket or is dispatchable with KV headroom; live dense
+        # work yields until this becomes false.
+        self.prefill_busy = False
+
+        self.marked_linears = 0
+        self.prompt_count = 0
+        self.req_tokens: dict[str, int] = {}
+
+        self._thread: threading.Thread | None = None
+        self._started = False
+        self._done = False
+        self._pooled_seen: set[str] = set()
+        self.embed_tokens_cum = 0
+        # Three-stream token accounting: cumulative embed tokens, timestamped.
+        toklog = os.environ.get("HB_TOKLOG")
+        self._toklog = (
+            open(f"{toklog}.embed.jsonl", "a")  # noqa: SIM115
+            if toklog
+            else None
+        )
+        self.pooled: set[str] = set()
+        self.norm_samples: list[float] = []
+        self.step_records: list[dict[str, Any]] = []
+        self.drain_start = 0.0
+        self.drain_end = 0.0
+        self.idle_uncapped_steps = 0
+        self._live_pending: queue.Queue[tuple[str, dict[str, Any], Future[Any]]] = (
+            queue.Queue()
+        )
+        self._live_futures: dict[str, Future[Any]] = {}
+        self._live_wakeup = threading.Event()
+        self._live_failure: BaseException | None = None
+        self._live_state_lock = threading.Lock()
+
+    # -- build (eager, at EngineCore init) ---------------------------------
+    def build(self) -> None:
+        from vllm import LLMEngine
+        from vllm.engine.arg_utils import EngineArgs
+        from vllm.envs import disable_envs_cache, enable_envs_cache
+        from vllm.pooling_params import PoolingParams
+
+        parallel = self.host_core.vllm_config.parallel_config
+        if any(
+            value != 1
+            for value in (
+                parallel.tensor_parallel_size,
+                parallel.pipeline_parallel_size,
+                parallel.data_parallel_size,
+                parallel.prefill_context_parallel_size,
+            )
+        ):
+            raise RuntimeError(
+                "Slack Serve's live embedding sidecar currently requires "
+                "one GPU (TP=PP=DP=PCP=1): it binds directly to the primary "
+                "driver worker's CUDA stream."
+            )
+
+        t0 = time.perf_counter()
+
+        pop_keys = (
+            "HB_P2_EMBED_SIDECAR",
+            "HB_P2_SERVE",
+            "HB_LANE_ROUTING",
+            "HB_P2_DECODE_GRAPHS_ONLY",
+        )
+        popped = {k: os.environ.pop(k) for k in pop_keys if k in os.environ}
+        saved_mp = os.environ.get("VLLM_ENABLE_V1_MULTIPROCESSING")
+        saved_v2_runner = os.environ.get("VLLM_USE_V2_MODEL_RUNNER")
+        saved_embed_target = os.environ.get("HB_EMBED_SM_COUNT_TARGET")
+        saved_prefill_target = os.environ.pop("HB_PREFILL_SM_COUNT_TARGET", None)
+        os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+        # vLLM's V2 pooling runner currently implements embedding only.
+        # Score and classify use the mature legacy pooling runner while the
+        # primary LLM remains on the V2 Slack Serve runner.
+        if self.pooling_task != "embed":
+            os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
+        # Clamp to >=1 so the Lt hook installs even when the starting target
+        # is low (runtime switching needs it). Explicit 0 = hook fully off:
+        # smctrl mask arms want plain torch kernels for embed GEMMs.
+        if self.embed_sm_target > 0:
+            os.environ["HB_EMBED_SM_COUNT_TARGET"] = str(self.embed_sm_target)
+        else:
+            os.environ.pop("HB_EMBED_SM_COUNT_TARGET", None)
+        # Isolate the embed torch.compile cache: Qwen3-Embedding-4B and the
+        # serve LLM Qwen3-4B are the SAME qwen3 arch and otherwise share vLLM's
+        # compile cache; the embed build's (1, embed_budget) shape range then
+        # shadows the LLM's, crashing an LLM prefill of 32768 with
+        # 'Shape: 32768 out of considered ranges [(1,4096)]'.
+        saved_cache_root = os.environ.get("VLLM_CACHE_ROOT")
+        os.environ["VLLM_CACHE_ROOT"] = (
+            f"/tmp/hb_embed_cache_{os.environ.get('SLURM_JOB_ID', os.getpid())}"
+        )
+        disable_envs_cache()
+        try:
+            kwargs: dict[str, Any] = dict(
+                model=self.embed_model,
+                dtype="bfloat16",
+                trust_remote_code=self.host_core.vllm_config.model_config.trust_remote_code,
+                gpu_memory_utilization=self.embed_gmu,
+                enforce_eager=False,
+                enable_prefix_caching=False,
+                max_model_len=self.embed_max_model_len,
+                max_num_seqs=self.embed_max_num_seqs,
+                max_num_batched_tokens=self.embed_budget,
+                disable_log_stats=True,
+                runner="pooling",
+                async_scheduling=self.embed_async_sched,
+                compilation_config={
+                    "mode": 3,
+                    "cudagraph_mode": "NONE",
+                    "max_cudagraph_capture_size": 512,
+                },
+            )
+            if raw_overrides := os.environ.get("HB_P2_DENSE_HF_OVERRIDES"):
+                kwargs["hf_overrides"] = json.loads(raw_overrides)
+            logger.info(
+                "[hb-embed-sidecar] building dense engine model=%s task=%s "
+                "gmu=%.3f budget=%d max_model_len=%d sm_target=%d",
+                self.embed_model,
+                self.pooling_task,
+                self.embed_gmu,
+                self.embed_budget,
+                self.embed_max_model_len,
+                self.embed_sm_target,
+            )
+            self.engine = LLMEngine.from_engine_args(EngineArgs(**kwargs))
+        finally:
+            os.environ.pop("HB_EMBED_SM_COUNT_TARGET", None)
+            os.environ.pop("VLLM_ENABLE_V1_MULTIPROCESSING", None)
+            if saved_mp is not None:
+                os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = saved_mp
+            os.environ.pop("VLLM_USE_V2_MODEL_RUNNER", None)
+            if saved_v2_runner is not None:
+                os.environ["VLLM_USE_V2_MODEL_RUNNER"] = saved_v2_runner
+            os.environ.pop("HB_EMBED_SM_COUNT_TARGET", None)
+            if saved_embed_target is not None:
+                os.environ["HB_EMBED_SM_COUNT_TARGET"] = saved_embed_target
+            if saved_prefill_target is not None:
+                os.environ["HB_PREFILL_SM_COUNT_TARGET"] = saved_prefill_target
+            os.environ.pop("VLLM_CACHE_ROOT", None)
+            if saved_cache_root is not None:
+                os.environ["VLLM_CACHE_ROOT"] = saved_cache_root
+            for k, v in popped.items():
+                os.environ[k] = v
+            enable_envs_cache()
+
+        supported_tasks = self.engine.get_supported_tasks()
+        if self.pooling_task not in supported_tasks:
+            raise RuntimeError(
+                f"dense model {self.embed_model!r} does not support task "
+                f"{self.pooling_task!r}; supported tasks: {supported_tasks}"
+            )
+
+        core_name = type(self.engine.engine_core).__name__
+        if "Inproc" not in core_name:
+            raise RuntimeError(
+                f"[hb-embed-sidecar] embed engine is not in-process: {core_name}"
+            )
+        self.marked_linears = _count_marked_linears(self.engine)
+        if self.marked_linears <= 0 and self.embed_sm_target > 0:
+            # With an explicit target of 0 the Lt hook is intentionally off
+            # (smctrl mask arms use plain torch kernels for embed GEMMs).
+            raise RuntimeError("[hb-embed-sidecar] SM hook marked no embed linears")
+
+        if self.live:
+            if os.environ.get("HB_P2_DENSE_LOCK", "1") == "0":
+                install_forward_context_mutex()
+                logger.info("[hb-embed-sidecar] narrow forward-context mutex active")
+            logger.info(
+                "[hb-embed-sidecar] live dense mode ready task=%s; "
+                "awaiting API submissions",
+                self.pooling_task,
+            )
+            return
+
+        rows = [
+            json.loads(line)
+            for line in Path(self.embed_queue_path).read_text().splitlines()
+            if line.strip()
+        ]
+        if not rows:
+            raise ValueError(
+                f"[hb-embed-sidecar] empty embed queue: {self.embed_queue_path}"
+            )
+        prompts = [rows[i % len(rows)] for i in range(self.embed_n)]
+        tokenizer = self.engine.tokenizer
+        params = PoolingParams(task=self.pooling_task)
+        for i, text in enumerate(prompts):
+            ids = tokenizer.encode(text)
+            self.req_tokens[f"hbembed_{i}"] = len(ids)
+            self.engine.add_request(
+                f"hbembed_{i}", {"prompt_token_ids": ids}, params.clone()
+            )
+        self.prompt_count = self.embed_n
+        logger.info(
+            "[hb-embed-sidecar] built in %.1fs: marked_linears=%d queued=%d core=%s",
+            time.perf_counter() - t0,
+            self.marked_linears,
+            self.prompt_count,
+            core_name,
+        )
+
+    # -- lazy drain-thread start (from step_two_lane, under real load) ------
+    def maybe_start(self) -> None:
+        if self.live:
+            return
+        if self.engine is None or self._started:
+            return
+        try:
+            live = self.host_core.scheduler.get_num_unfinished_requests()
+        except Exception:  # noqa: BLE001
+            live = 0
+        if live < self.start_min_reqs:
+            return
+        self._started = True
+        self._thread = threading.Thread(
+            target=self._drain, name="hb_embed_sidecar", daemon=True
+        )
+        self._thread.start()
+
+    def capture_complete(self) -> bool:
+        """Whether finite work is drained for an Nsight capture boundary."""
+        if not self.live:
+            return self._done
+        return (
+            self._started
+            and self._live_pending.empty()
+            and not self._live_futures
+            and self.engine is not None
+            and not self.engine.has_unfinished_requests()
+        )
+
+    def submit(
+        self,
+        request_id: str,
+        text: str,
+        use_activation: bool | None = None,
+    ) -> Future[Any]:
+        """Queue one live dense request and return its result Future.
+
+        Runs on the host EngineCore thread via a utility RPC; it does not call
+        ``engine.add_request`` because only the sidecar thread mutates or steps
+        the auxiliary EngineCore.
+        """
+        if not self.live:
+            raise RuntimeError("live dense submissions require HB_P2_DENSE_LIVE=1")
+        if self.engine is None:
+            raise RuntimeError("dense sidecar is not built")
+        if not request_id:
+            raise ValueError("dense request_id must be non-empty")
+        return self._enqueue_live(
+            request_id,
+            {
+                "kind": self.pooling_task,
+                "text": text,
+                "use_activation": use_activation,
+            },
+        )
+
+    def submit_score(
+        self,
+        request_id: str,
+        query: str,
+        document: str,
+        use_activation: bool | None,
+        truncate_prompt_tokens: int | None,
+        truncation_side: str | None,
+    ) -> Future[Any]:
+        """Queue one native cross-encoder query/document pair."""
+        if self.pooling_task != "score":
+            raise RuntimeError(
+                "rerank submissions require --slackserve-dense-task score"
+            )
+        if not self.live or self.engine is None:
+            raise RuntimeError("live dense sidecar is not available")
+        return self._enqueue_live(
+            request_id,
+            {
+                "kind": "score",
+                "query": query,
+                "document": document,
+                "use_activation": use_activation,
+                "truncate_prompt_tokens": truncate_prompt_tokens,
+                "truncation_side": truncation_side,
+            },
+        )
+
+    def _enqueue_live(self, request_id: str, payload: dict[str, Any]) -> Future[Any]:
+        future: Future[Any] = Future()
+        # Keep the state transition atomic with _fail_live_requests(). Without
+        # this lock a submitter could pass the failure check, then enqueue just
+        # after the failed drain thread had emptied its queue.
+        with self._live_state_lock:
+            if self._live_failure is not None:
+                raise RuntimeError("dense sidecar has stopped") from self._live_failure
+            self._live_pending.put((request_id, payload, future))
+            if not self._started:
+                self._started = True
+                self._thread = threading.Thread(
+                    target=self._drain_live, name="hb_dense_sidecar", daemon=True
+                )
+                self._thread.start()
+        self._live_wakeup.set()
+        return future
+
+    def _bind_dense_stream(self) -> Any:
+        """Bind this sidecar thread and its runner to LLM's dense stream."""
+        from vllm.utils.torch_utils import current_stream
+
+        llm_worker = self.host_core.model_executor.driver_worker
+        llm_worker = getattr(llm_worker, "worker", llm_worker)
+        dense_stream = llm_worker.lane_streams["prefill"]
+        torch.cuda.set_stream(dense_stream)
+        runner = _model_runner(self.engine)
+        runner.__dict__["main_stream"] = dense_stream
+        assert current_stream().cuda_stream == dense_stream.cuda_stream
+        return dense_stream
+
+    def _submit_live_pending(self) -> None:
+        """Move all API-admitted work into the sidecar engine on its thread."""
+        assert self.engine is not None
+        from vllm.pooling_params import PoolingParams
+
+        while True:
+            try:
+                request_id, payload, future = self._live_pending.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                if payload["kind"] == "score":
+                    from vllm.entrypoints.pooling.score.protocol import RerankRequest
+                    from vllm.entrypoints.pooling.score.utils import (
+                        compress_token_type_ids,
+                        get_score_prompt,
+                    )
+
+                    request = RerankRequest(
+                        query=payload["query"],
+                        documents=[payload["document"]],
+                        use_activation=payload["use_activation"],
+                        truncate_prompt_tokens=payload["truncate_prompt_tokens"],
+                        truncation_side=payload["truncation_side"],
+                    )
+                    tokenization_kwargs = request.build_tok_params(
+                        self.engine.model_config
+                    ).get_encode_kwargs()
+                    _, engine_prompt = get_score_prompt(
+                        model_config=self.engine.model_config,
+                        tokenizer=self.engine.tokenizer,
+                        tokenization_kwargs=tokenization_kwargs,
+                        data_1=payload["query"],
+                        data_2=payload["document"],
+                    )
+                    token_type_ids = engine_prompt.pop("token_type_ids", None)
+                    pooling_params = request.to_pooling_params("score")
+                    if token_type_ids:
+                        pooling_params.extra_kwargs = {
+                            "compressed_token_type_ids": compress_token_type_ids(
+                                token_type_ids
+                            )
+                        }
+                else:
+                    (engine_prompt,) = self.engine.renderer.render_cmpl(
+                        [{"prompt": payload["text"]}]
+                    )
+                    pooling_params = PoolingParams(
+                        task=self.pooling_task,
+                        use_activation=payload["use_activation"],
+                    )
+                token_ids = engine_prompt["prompt_token_ids"]
+                if len(token_ids) > self.embed_max_model_len:
+                    raise ValueError(
+                        f"dense input has {len(token_ids)} tokens, exceeding "
+                        f"max_model_len={self.embed_max_model_len}"
+                    )
+                internal_request_id = self.engine.add_request(
+                    request_id,
+                    engine_prompt,
+                    pooling_params,
+                )
+                # LLMEngine randomizes its internal request id. Outputs use
+                # that id, while the API owns the external one, so the Future
+                # map and token accounting must use the returned id.
+                self.req_tokens[internal_request_id] = len(token_ids)
+                self._live_futures[internal_request_id] = future
+                self.prompt_count += 1
+            except Exception as exc:  # noqa: BLE001 - return failure to API caller
+                if not future.done():
+                    future.set_exception(exc)
+
+    def _resolve_live_outputs(self, output: Any) -> None:
+        """Resolve live API futures from one auxiliary-engine output batch."""
+        for item in output.outputs:
+            future = self._live_futures.pop(item.request_id, None)
+            if future is None:
+                continue
+            try:
+                pooling = getattr(item, "pooling_output", None)
+                if pooling is None:
+                    raise RuntimeError(
+                        "dense request finished without a pooling output"
+                    )
+                data = pooling.data.detach().cpu().reshape(-1).tolist()
+                # Keep the token count until _drain_live records this
+                # completed work unit in the per-step provenance log.
+                prompt_tokens = self.req_tokens.get(item.request_id, 0)
+                if not future.done():
+                    future.set_result(
+                        {
+                            "request_id": item.request_id,
+                            "data": data,
+                            "prompt_tokens": prompt_tokens,
+                        }
+                    )
+            except Exception as exc:  # noqa: BLE001 - propagate to utility caller
+                if not future.done():
+                    future.set_exception(exc)
+
+    def _fail_live_requests(self, exc: BaseException) -> None:
+        with self._live_state_lock:
+            self._live_failure = exc
+            while True:
+                try:
+                    _, _, future = self._live_pending.get_nowait()
+                except queue.Empty:
+                    break
+                if not future.done():
+                    future.set_exception(exc)
+            for future in self._live_futures.values():
+                if not future.done():
+                    future.set_exception(exc)
+            self._live_futures.clear()
+
+    def _drain_live(self) -> None:
+        """Serve API-admitted dense work indefinitely on the shared stream."""
+        from vllm.v1.worker.embed_sm_linear_hook import set_runtime_sm_target
+
+        try:
+            # Binding touches the primary worker's CUDA stream. It must be
+            # inside the failure boundary: otherwise a bind error kills this
+            # daemon thread before pending API Futures are failed, leaving
+            # the HTTP request hanging forever.
+            dense_stream = self._bind_dense_stream()
+            engine = self.engine
+            assert engine is not None
+            coarse_lock = os.environ.get("HB_P2_DENSE_LOCK", "1") != "0"
+            logger.info("[hb-embed-sidecar] live drain started")
+            while True:
+                self._submit_live_pending()
+                if not engine.has_unfinished_requests():
+                    self._live_wakeup.clear()
+                    # Avoid a lost wakeup between draining the queue and
+                    # sleeping: submit() sets the event after enqueueing.
+                    if self._live_pending.empty():
+                        self._live_wakeup.wait(timeout=0.1)
+                    continue
+                # Controller-published prefill priority. An already-running
+                # dense unit is not preemptible, so prefill waits behind at
+                # most one bounded unit; no new dense unit launches while
+                # prefill wants or owns the shared stream.
+                if self.prefill_busy:
+                    time.sleep(0.001)
+                    continue
+                if coarse_lock and (
+                    PREFILL_WAITING["n"] > 0 or not prefill_tail_clear()
+                ):
+                    time.sleep(0.001)
+                    continue
+                if coarse_lock:
+                    _lock_acquire("embed")
+                try:
+                    if coarse_lock and not prefill_tail_clear():
+                        continue
+                    idle_uncapped = (
+                        self.embed_uncap_when_llm_idle
+                        and self.host_core.scheduler.get_num_unfinished_requests() == 0
+                    )
+                    set_runtime_sm_target(0 if idle_uncapped else self.embed_sm_target)
+                    from vllm.v1.worker.hb_smctrl import apply_prefill_uncap
+
+                    apply_prefill_uncap(dense_stream, idle_uncapped)
+                    step_started = time.perf_counter()
+                    self._process_step()
+                    step_finished = time.perf_counter()
+                finally:
+                    set_runtime_sm_target(None)
+                    if coarse_lock:
+                        DENSE_LAUNCH_LOCK.release()
+                newly = set(self.pooled) - self._pooled_seen
+                self._pooled_seen |= newly
+                tokens = sum(self.req_tokens.pop(request_id, 0) for request_id in newly)
+                self.embed_tokens_cum += tokens
+                if newly or tokens:
+                    record = {
+                        "t_start": step_started,
+                        "t": step_finished,
+                        "wall_ms": (step_finished - step_started) * 1000,
+                        "scheduled_tokens": tokens,
+                        "embed_tokens_cum": self.embed_tokens_cum,
+                        "newly_pooled": len(newly),
+                        "pooled": len(self.pooled),
+                        "submitted": self.prompt_count,
+                        "llm_unfinished": (
+                            self.host_core.scheduler.get_num_unfinished_requests()
+                        ),
+                        "prefill_busy": self.prefill_busy,
+                        "idle_uncapped": idle_uncapped,
+                    }
+                    self.step_records.append(record)
+                    if self._toklog is not None:
+                        self._toklog.write(json.dumps(record) + "\n")
+                        self._toklog.flush()
+        except BaseException as exc:
+            logger.exception("[hb-embed-sidecar] live drain failed")
+            self._fail_live_requests(exc)
+
+    def _drain(self) -> None:
+        from vllm.utils.torch_utils import current_stream
+        from vllm.v1.worker.embed_sm_linear_hook import set_runtime_sm_target
+
+        # SHARED dense stream: the LLM prefill lane's stream, pinned as this
+        # thread's ambient stream. Two streams total in the process.
+        llm_worker = self.host_core.model_executor.driver_worker
+        llm_worker = getattr(llm_worker, "worker", llm_worker)
+        dense_stream = llm_worker.lane_streams["prefill"]
+        torch.cuda.set_stream(dense_stream)
+        runner = _model_runner(self.engine)
+        runner.__dict__["main_stream"] = dense_stream
+        assert current_stream().cuda_stream == dense_stream.cuda_stream
+
+        engine = self.engine
+        self.drain_start = time.perf_counter()
+        try:
+            while engine.has_unfinished_requests():
+                # post_prefill phase: hold until the controller marks all
+                # prompt KV computed, then free-run (decode-only + tail).
+                if self.phase == "post_prefill" and not self.prefill_exhausted:
+                    time.sleep(0.002)
+                    continue
+                # Fairness handoff: never outrace a waiting prefill launcher.
+                if PREFILL_WAITING["n"] > 0:
+                    time.sleep(0.0005)
+                    continue
+                # Launch only onto a quiescent dense stream (see PREFILL_TAIL).
+                if not prefill_tail_clear():
+                    time.sleep(0.001)
+                    continue
+                _lock_acquire("embed")
+                # Re-validate INSIDE the lock: a prefill unit may have taken
+                # the lock first and enqueued after our check above; without
+                # this, the step stacks behind ~600ms of still-executing
+                # prefill and holds the lock for its whole remainder (trace
+                # 275502: 31/40 embed ranges at ~720ms vs ~65ms clean).
+                if not prefill_tail_clear():
+                    DENSE_LAUNCH_LOCK.release()
+                    time.sleep(0.001)
+                    continue
+                idle_uncapped = (
+                    self.embed_uncap_when_llm_idle
+                    and self.host_core.scheduler.get_num_unfinished_requests() == 0
+                )
+                set_runtime_sm_target(0 if idle_uncapped else self.embed_sm_target)
+                # smctrl arms: mirror the Lt uncap on the stream TPC mask so
+                # an embed-only tail gets the whole GPU back (no-op unless
+                # HB_SMCTRL_* is configured).
+                from vllm.v1.worker.hb_smctrl import apply_prefill_uncap
+
+                apply_prefill_uncap(dense_stream, idle_uncapped)
+                if idle_uncapped:
+                    self.idle_uncapped_steps += 1
+                step_start = time.perf_counter()
+                torch.cuda.nvtx.range_push("dense/embed")
+                try:
+                    # Enqueues on the shared dense stream behind whatever unit
+                    # is already in flight; the pooling execute's inline sync
+                    # completes the step before the lock is released.
+                    self._process_step()
+                finally:
+                    torch.cuda.nvtx.range_pop()
+                    set_runtime_sm_target(None)
+                    DENSE_LAUNCH_LOCK.release()
+                wall = (time.perf_counter() - step_start) * 1000
+                # Count embed tokens directly from the pooled requests' prompt
+                # lengths (the SchedulerStats attr never resolved -> always 0).
+                newly = set(self.pooled) - self._pooled_seen
+                self._pooled_seen |= newly
+                tokens = sum(
+                    self.req_tokens.get(r)
+                    or self.req_tokens.get(r.rsplit("-", 1)[0], 0)
+                    for r in newly
+                )
+                self.embed_tokens_cum += tokens
+                newly_pooled = len(newly)
+                if newly_pooled > 0 or tokens > 0:
+                    self.step_records.append(
+                        {
+                            "t": time.perf_counter(),
+                            "wall_ms": wall,
+                            "scheduled_tokens": tokens,
+                            "embed_tokens_cum": self.embed_tokens_cum,
+                            "newly_pooled": newly_pooled,
+                            "pooled": len(self.pooled),
+                        }
+                    )
+                    if self._toklog is not None:
+                        self._toklog.write(
+                            json.dumps(
+                                {
+                                    "t": time.perf_counter(),
+                                    "embed_tokens_cum": self.embed_tokens_cum,
+                                }
+                            )
+                            + "\n"
+                        )
+                        self._toklog.flush()
+                    n = len(self.step_records)
+                    if n <= 4 or n % 8 == 0:
+                        logger.info(
+                            "[hb-embed-sidecar] step #%d tokens=%d newly_pooled=%d "
+                            "wall_ms=%.1f pooled=%d/%d",
+                            n,
+                            tokens,
+                            newly_pooled,
+                            wall,
+                            len(self.pooled),
+                            self.prompt_count,
+                        )
+        finally:
+            set_runtime_sm_target(None)
+            self.drain_end = time.perf_counter()
+            self._done = True
+        self._report()
+
+    def _process_step(self) -> Any:
+        """One embed engine step (offline process_step pattern) + harvest."""
+        engine = self.engine
+        output = engine.engine_core.get_output()
+        if self.live:
+            self._resolve_live_outputs(output)
+        for item in output.outputs:
+            if getattr(item, "pooling_output", None) is not None:
+                self.pooled.add(item.request_id)
+                if len(self.norm_samples) < 8:
+                    try:
+                        data = item.pooling_output.data
+                        self.norm_samples.append(
+                            float(torch.linalg.vector_norm(data.reshape(-1)).item())
+                        )
+                    except Exception:  # noqa: BLE001
+                        self.norm_samples.append(float("nan"))
+        processed = engine.output_processor.process_outputs(
+            output.outputs,
+            engine_core_timestamp=output.timestamp,
+            iteration_stats=None,
+        )
+        engine.output_processor.update_scheduler_stats(output.scheduler_stats)
+        engine.engine_core.abort_requests(processed.reqs_to_abort)
+        return output.scheduler_stats
+
+    def _report(self) -> None:
+        wall_ms = (self.drain_end - self.drain_start) * 1000
+        n_nan = sum(1 for x in self.norm_samples if x != x)
+        total_tokens = sum(r["scheduled_tokens"] for r in self.step_records)
+        frac = len(self.pooled) / self.prompt_count if self.prompt_count else 0.0
+        logger.info(
+            "[hb-embed-sidecar] HB_SIDECAR_DONE pooled=%d expected=%d "
+            "drained_frac=%.3f "
+            "wall_ms=%.1f steps=%d embed_tokens=%d budget=%d "
+            "idle_uncapped_steps=%d "
+            "lock{prefill_wait_ms=%.1f prefill_waits=%d prefill_max_ms=%.1f "
+            "embed_wait_ms=%.1f embed_waits=%d embed_max_ms=%.1f} "
+            "norm_samples=%s nan=%d",
+            len(self.pooled),
+            self.prompt_count,
+            frac,
+            wall_ms,
+            len(self.step_records),
+            total_tokens,
+            self.embed_budget,
+            self.idle_uncapped_steps,
+            LOCK_STATS["prefill_wait_ms"],
+            LOCK_STATS["prefill_waits"],
+            LOCK_STATS["prefill_max_wait_ms"],
+            LOCK_STATS["embed_wait_ms"],
+            LOCK_STATS["embed_waits"],
+            LOCK_STATS["embed_max_wait_ms"],
+            [round(x, 3) for x in self.norm_samples],
+            n_nan,
+        )
+        if len(self.pooled) != self.prompt_count:
+            logger.warning(
+                "[hb-embed-sidecar] embed drain incomplete: pooled=%d/%d (frac=%.3f)",
+                len(self.pooled),
+                self.prompt_count,
+                frac,
+            )
+        if n_nan:
+            logger.error("[hb-embed-sidecar] CORRECTNESS FAIL %d NaN norms", n_nan)

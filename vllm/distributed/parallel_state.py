@@ -26,6 +26,7 @@ If you only need to use the distributed environment without model/pipeline
 import contextlib
 import gc
 import pickle
+import threading as _threading
 import weakref
 from collections import deque, namedtuple
 from collections.abc import Callable
@@ -196,11 +197,22 @@ def resume_device_comms() -> None:
     _apply_to_device_comms(lambda comm: comm.resume())
 
 
+def _stream_collective_group(group):
+    # Compiled operators retain the original group name. Eager prefill uses
+    # separate communicators from decode, including MoE reductions.
+    for default, state in ((_TP, _TP_OVERRIDE), (_EP, _EP_OVERRIDE)):
+        override = getattr(state, "group", None)
+        if override is not None and default is not None and group is default:
+            return override
+    return group
+
+
 def all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
     assert group_name in _groups, f"Group {group_name} is not found."
     group = _groups[group_name]()
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
+    group = _stream_collective_group(group)
     return group._all_reduce_out_place(tensor)
 
 
@@ -215,6 +227,7 @@ def reduce_scatter(
     group = _groups[group_name]()
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
+    group = _stream_collective_group(group)
     return group._reduce_scatter_out_place(tensor, dim)
 
 
@@ -233,6 +246,7 @@ def all_gather(
     group = _groups[group_name]()
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
+    group = _stream_collective_group(group)
     return group._all_gather_out_place(tensor, dim)
 
 
@@ -1589,9 +1603,18 @@ def _replace_active_groups(
 
 
 _TP: GroupCoordinator | None = None
+# Per-thread override so a SlackServe lane thread can run the same model with
+# its own TP communicator while the main thread keeps the default group.
+
+_TP_OVERRIDE = _threading.local()
+_PP_OVERRIDE = _threading.local()
+_EP_OVERRIDE = _threading.local()
 
 
 def get_tp_group() -> GroupCoordinator:
+    override = getattr(_TP_OVERRIDE, "group", None)
+    if override is not None:
+        return override
     assert _TP is not None, "tensor model parallel group is not initialized"
     return _TP
 
@@ -1642,6 +1665,9 @@ _PP: GroupCoordinator | None = None
 
 
 def get_pp_group() -> GroupCoordinator:
+    override = getattr(_PP_OVERRIDE, "group", None)
+    if override is not None:
+        return override
     assert _PP is not None, "pipeline model parallel group is not initialized"
     return _PP
 
@@ -1658,6 +1684,9 @@ _EP: GroupCoordinator | None = None
 
 
 def get_ep_group() -> GroupCoordinator:
+    override = getattr(_EP_OVERRIDE, "group", None)
+    if override is not None:
+        return override
     assert _EP is not None, (
         "expert parallel group is not initialized. "
         "EP group is only created for MoE models with num_experts > 0. "

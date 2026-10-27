@@ -759,6 +759,21 @@ class CompilationConfig:
     Map from layer name to layer objects that need to be accessed outside
     model code, e.g., Attention, FusedMOE when dp_size>1."""
 
+    cudagraph_pool: Any = Field(default=None, init=False, exclude=True, repr=False)
+    """Runtime-only graph pool for this model's runner and compilation wrappers.
+
+    Created lazily in the GPU process, never supplied as a user option or
+    included in serialized configuration or compilation cache keys. Like
+    static_forward_context, this configuration must be private to one model.
+    Graphs sharing this pool must execute with the runner's existing ordering.
+    """
+
+    def get_cudagraph_pool(self) -> Any:
+        """Get this model's pool without consulting process-global state."""
+        if self.cudagraph_pool is None:
+            self.cudagraph_pool = current_platform.graph_pool_handle()
+        return self.cudagraph_pool
+
     static_all_moe_layers: list[str] = field(default_factory=list, init=False)
     """The names of all the MOE layers in the model
     """
@@ -809,6 +824,7 @@ class CompilationConfig:
             "enabled_custom_ops",
             "disabled_custom_ops",
             "static_forward_context",
+            "cudagraph_pool",
             "pass_config",  # handled separately below
             "dynamic_shapes_config",  # handled separately below
         }

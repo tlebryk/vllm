@@ -563,6 +563,9 @@ class FlashAttentionMetadata:
     rswa_prefix_lens: torch.Tensor | None = None
     rswa_window: int | None = None
     rswa_window_tensor: torch.Tensor | None = None
+    # Nonzero only for SlackServe's explicit per-head shared-page mapping.
+    shared_kv_heads: int = 0
+    shared_kv_num_tokens: int = 0
 
 
 def _get_sliding_window_configs(
@@ -1227,6 +1230,23 @@ class FlashAttentionImpl(AttentionImpl):
             # Profiling run.
             return output.fill_(0)
 
+        if attn_metadata.shared_kv_heads:
+            from vllm.v1.worker.gpu.shared_kv import forward_head_attention
+
+            if (
+                self.attn_type != AttentionType.DECODER
+                or self.dcp_world_size != 1
+                or self.sliding_window != (-1, -1)
+                or self.alibi_slopes is not None
+                or self.sinks is not None
+                or attn_metadata.use_cascade
+                or self.kv_cache_dtype.startswith("fp8")
+            ):
+                raise ValueError(
+                    "shared head KV requires unquantized full decoder attention"
+                )
+            return forward_head_attention(self, query, kv_cache, attn_metadata, output)
+
         attn_type = self.attn_type
 
         # IMPORTANT!
@@ -1437,6 +1457,11 @@ class FlashAttentionImpl(AttentionImpl):
         kv_cache: torch.Tensor,
         slot_mapping: torch.Tensor,
     ) -> None:
+        if slot_mapping.ndim == 2:
+            from vllm.v1.worker.gpu.shared_kv import write_head_cache
+
+            write_head_cache(key, value, kv_cache, slot_mapping)
+            return
         if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
             # For encoder attention,
             # we use direct Q, K, V tensors without caching

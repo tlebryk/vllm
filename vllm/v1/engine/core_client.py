@@ -13,7 +13,7 @@ from concurrent.futures import Future
 from dataclasses import dataclass
 from multiprocessing.queues import Queue
 from threading import Thread
-from typing import Any, TypeAlias, TypeVar
+from typing import Any, TypeAlias, TypeVar, cast
 
 import msgspec
 import msgspec.msgpack
@@ -171,6 +171,11 @@ class EngineCoreClient(ABC):
             *client_args,
             renderer=renderer,
         )
+
+    @property
+    def engine_dead(self) -> bool:
+        """Client health, independent of a particular transport implementation."""
+        return self.resources.engine_dead
 
     @abstractmethod
     def shutdown(self, timeout: float | None = None) -> None: ...
@@ -395,8 +400,16 @@ class InprocClient(EngineCoreClient):
         # reachable and the finalizer would never run.
         self._finalizer = weakref.finalize(self, self.engine_core.shutdown)
 
-    def get_output(self) -> EngineCoreOutputs:
-        outputs, model_executed = self.engine_core.step_fn()
+    def get_output(self, lane: str = "default") -> EngineCoreOutputs:
+        # P0 lane routing only supports the ordinary synchronous step. When
+        # async scheduling is enabled, step_fn is step_with_batch_queue(),
+        # which deliberately has no lane argument or lane semantics yet.
+        if self.engine_core.batch_queue is None:
+            outputs, model_executed = cast(Any, self.engine_core.step_fn)(lane=lane)
+        else:
+            if lane != "default":
+                raise RuntimeError("lane routing requires async_scheduling=False in P0")
+            outputs, model_executed = self.engine_core.step_fn()
         self.engine_core.post_step(model_executed=model_executed)
         return outputs and outputs.get(0) or EngineCoreOutputs()
 

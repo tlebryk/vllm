@@ -121,8 +121,11 @@ class AsyncOutput(AsyncModelRunnerOutput):
         num_sampled_tokens: torch.Tensor,
         main_stream: torch.cuda.Stream,
         copy_stream: torch.cuda.Stream,
-        check_ep_fault: bool,
-        pending_aux_output: "PendingAuxOutput | None",
+        check_ep_fault: bool = False,
+        pending_aux_output: "PendingAuxOutput | None" = None,
+        *,
+        copy_event: torch.cuda.Event | None = None,
+        completion_event: torch.cuda.Event | None = None,
     ):
         # NOTE(woosuk): We must retain references to the GPU tensors,
         # as the copy operations are performed on a different CUDA stream than
@@ -132,8 +135,11 @@ class AsyncOutput(AsyncModelRunnerOutput):
         self.num_sampled_tokens = num_sampled_tokens
         self.pending_aux_output = pending_aux_output
         # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
-        self.copy_event = torch.cuda.Event(blocking=True)
+        self.copy_event = (
+            copy_event if copy_event is not None else torch.cuda.Event(blocking=True)
+        )
         self._has_fault: torch.Tensor | None = None
+        self.completion_event = completion_event
 
         with stream(copy_stream, main_stream):
             copy_stream.wait_stream(main_stream)
@@ -172,6 +178,8 @@ class AsyncOutput(AsyncModelRunnerOutput):
             self.copy_event.record(copy_stream)
 
     def get_output(self) -> ModelRunnerOutput:
+        if self.completion_event is not None:
+            self.completion_event.synchronize()
         self.copy_event.synchronize()
 
         # NOTE(woosuk): The following code is to ensure compatibility with

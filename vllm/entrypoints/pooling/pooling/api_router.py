@@ -18,7 +18,11 @@ router = APIRouter()
 
 
 def pooling(request: Request) -> ServingPooling:
-    handler = getattr(request.app.state, "serving_pooling", None)
+    handler = getattr(
+        getattr(request.state, "slackserve_model_state", request.app.state),
+        "serving_pooling",
+        None,
+    )
     if handler is None:
         raise NotImplementedError("The model does not support Pooling API")
     return handler

@@ -10,6 +10,7 @@ from vllm.v1.worker.gpu.buffer_utils import (
     FusedStagedWriter,
     StagedWriteTensor,
     UvaBackedTensor,
+    UvaFenceRegistry,
     _load_ptr,
 )
 
@@ -31,6 +32,8 @@ class BlockTables:
         slot_mapping_enabled: list[bool] | None = None,
         dcp_sharded: list[bool] | None = None,
         sliding_window_reach: list[int] | None = None,
+        *,
+        fence_registry: UvaFenceRegistry | None = None,
     ):
         self.block_sizes = block_sizes
         self.max_num_reqs = max_num_reqs
@@ -66,18 +69,25 @@ class BlockTables:
         self.block_tables: list[StagedWriteTensor] = []
         for max_num_blocks in max_num_blocks_per_group:
             block_table = StagedWriteTensor(
-                (self.max_num_reqs, max_num_blocks), dtype=torch.int32, device=device
+                (self.max_num_reqs, max_num_blocks),
+                dtype=torch.int32,
+                device=device,
+                fence_registry=fence_registry,
             )
             self.block_tables.append(block_table)
 
         self.num_blocks = UvaBackedTensor(
-            (self.num_kv_cache_groups, self.max_num_reqs), dtype=torch.int32
+            (self.num_kv_cache_groups, self.max_num_reqs),
+            dtype=torch.int32,
+            fence_registry=fence_registry,
         )
         self.fused_writer: FusedStagedWriter | None = None
         if self.num_kv_cache_groups > 1:
             # Only the multi-group path uses the fused writer.
             self.fused_writer = FusedStagedWriter(
-                self.device, self.num_kv_cache_groups * self.max_num_reqs
+                self.device,
+                self.num_kv_cache_groups * self.max_num_reqs,
+                fence_registry=fence_registry,
             )
 
         # Block tables used for model's forward pass.

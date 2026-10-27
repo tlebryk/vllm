@@ -230,6 +230,8 @@ class SchedulerStats:
     num_skipped_waiting_reqs: int = 0
 
     num_kv_fetch_reqs_by_stage: dict[str, int] = field(default_factory=dict)
+    num_scheduled_reqs: int = 0
+    total_num_scheduled_tokens: int = 0
 
     # These are used for internal DP load-balancing.
     step_counter: int = 0

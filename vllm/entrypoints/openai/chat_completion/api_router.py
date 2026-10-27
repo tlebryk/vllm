@@ -33,7 +33,9 @@ ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL = "endpoint-load-metrics-format"
 
 
 def chat(request: Request) -> OpenAIServingChat | None:
-    return request.app.state.openai_serving_chat
+    return getattr(
+        request.state, "slackserve_model_state", request.app.state
+    ).openai_serving_chat
 
 
 def batch_chat(request: Request) -> OpenAIServingChatBatch | None:

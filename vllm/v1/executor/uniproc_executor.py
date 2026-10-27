@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
 from collections.abc import Callable
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
+from functools import cached_property
 from multiprocessing import Lock
 from typing import Any
 
@@ -65,6 +66,13 @@ class UniProcExecutor(Executor):
         # Set net device env vars for the worker if VLLM_GPU_NIC_PCIE_MAPPING is set
         set_worker_net_device(local_rank, self.vllm_config)
 
+        self.async_output_thread: ThreadPoolExecutor | None = None
+        if self.max_concurrent_batches > 1:
+            self.async_output_thread = ThreadPoolExecutor(
+                max_workers=self.max_concurrent_batches,
+                thread_name_prefix="WorkerAsyncOutput",
+            )
+
         self.driver_worker.init_worker(all_kwargs=[kwargs])
         self.driver_worker.init_device()
 
@@ -87,6 +95,37 @@ class UniProcExecutor(Executor):
         local_rank = int(device_info[1]) if len(device_info) > 1 else 0
         return distributed_init_method, 0, local_rank
 
+    @cached_property
+    def max_concurrent_batches(self) -> int:
+        additional = self.vllm_config.additional_config
+        if isinstance(additional, dict) and "slackserve" in additional:
+            from vllm.v1.worker.slackserve_config import SlackServeConfig
+
+            lanes = SlackServeConfig.from_vllm_config(self.vllm_config)
+            return lanes.prefill_lanes + lanes.async_decode_depth
+        # Slack Serve has one in-flight batch per lane even though it keeps
+        # vLLM's ordinary scheduler synchronous. Each lane needs its own
+        # output waiter so a long prefill copy cannot head-of-line block a
+        # completed decode result.
+        if os.environ.get("HB_LANE_ROUTING") == "1":
+            batches = 3 if os.environ.get("HB_P2_PREFILL_LANES") == "2" else 2
+            raw_depth = os.environ.get("HB_P2_ASYNC_DECODE_DEPTH")
+            decode_depth = (
+                int(raw_depth)
+                if raw_depth is not None
+                else (2 if os.environ.get("HB_P2_ASYNC_DECODE") == "1" else 1)
+            )
+            if not 1 <= decode_depth <= 4:
+                raise ValueError(
+                    "HB_P2_ASYNC_DECODE_DEPTH must be between 1 and 4; "
+                    f"got {decode_depth}"
+                )
+            # The base count includes one decode ticket. Every additional
+            # launch-ahead ticket needs its own async-output waiter.
+            batches += decode_depth - 1
+            return batches
+        return 2 if self.scheduler_config.async_scheduling else 1
+
     def collective_rpc(  # type: ignore[override]
         self,
         method: str | Callable,
@@ -108,6 +147,12 @@ class UniProcExecutor(Executor):
         try:
             result = run_method(self.driver_worker, method, args, kwargs)
             if isinstance(result, AsyncModelRunnerOutput):
+                if self.async_output_thread is not None:
+                    if single_value:
+                        return self.async_output_thread.submit(result.get_output)
+                    return self.async_output_thread.submit(
+                        lambda output=result: [output.get_output()]
+                    )
                 return AsyncOutputFuture(result, single_value)
             future = Future[Any]()
             future.set_result(result if single_value else [result])
@@ -132,11 +177,24 @@ class UniProcExecutor(Executor):
         return output
 
     def sample_tokens(  # type: ignore[override]
-        self, grammar_output: GrammarOutput | None, non_block: bool = False
+        self,
+        grammar_output: GrammarOutput | None,
+        non_block: bool = False,
+        *,
+        lane: str | None = None,
     ) -> ModelRunnerOutput | None | Future[ModelRunnerOutput | None]:
+        # The plain step() path tags tickets with lane='default'; the stock
+        # Worker.sample_tokens takes no lane argument, so only forward a lane
+        # to the slackserve worker's real lanes. (Sync scheduling on the stock
+        # worker previously crashed here: TypeError, 3 positional args.)
+        args = (
+            (grammar_output,)
+            if lane is None or lane == "default"
+            else (grammar_output, lane)
+        )
         return self.collective_rpc(
             "sample_tokens",
-            args=(grammar_output,),
+            args=args,
             non_block=non_block,
             single_value=True,
         )

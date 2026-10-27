@@ -17,7 +17,11 @@ router = APIRouter()
 
 
 def classify(request: Request) -> ServingClassification:
-    handler = getattr(request.app.state, "serving_classification", None)
+    handler = getattr(
+        getattr(request.state, "slackserve_model_state", request.app.state),
+        "serving_classification",
+        None,
+    )
     if handler is None:
         raise NotImplementedError("The model does not support Classification API")
     return handler

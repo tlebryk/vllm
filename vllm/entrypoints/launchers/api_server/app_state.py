@@ -26,7 +26,34 @@ async def init_app_state(
     state: State,
     args: Namespace,
     supported_tasks: tuple["SupportedTask", ...] | None = None,
+    *,
+    _single_model: bool = False,
 ) -> None:
+    if hasattr(engine_client, "model_clients") and not _single_model:
+        from copy import copy
+
+        states = {}
+        for spec in engine_client.multi_model_specs:
+            model_args = copy(args)
+            model_args.model = spec.model
+            model_args.served_model_name = [spec.model_id]
+            model_args.slackserve_dense_model = None
+            model_state = state if not states else State()
+            await init_app_state(
+                engine_client.model_clients[spec.model_id],
+                model_state,
+                model_args,
+                await engine_client.model_clients[spec.model_id].get_supported_tasks(),
+                _single_model=True,
+            )
+            states[spec.model_id] = model_state
+        state.multi_model_states = states
+        state.additional_model_cards = []
+        for model_state in list(states.values())[1:]:
+            cards = await model_state.openai_serving_models.show_available_models()
+            state.additional_model_cards.extend(cards.data)
+        state.args = args
+        return
     vllm_config = engine_client.vllm_config
 
     if args.tool_call_parser is not None:

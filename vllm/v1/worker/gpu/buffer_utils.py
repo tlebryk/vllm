@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import array
 from collections.abc import Collection, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import partial
 from typing import Any, TypeAlias
 
@@ -21,6 +23,63 @@ logger = init_logger(__name__)
 # Default round-robin depth for the UVA buffer pools. Must be >= the number of
 # concurrent in-flight steps (engine batch_queue_size).
 _DEFAULT_MAX_CONCURRENCY = 2
+
+# UVA staging buffers are recycled round-robin; without a guard, a host
+# rewrite can race GPU kernels still reading the buffer from an earlier
+# use. Slack Serve's multi-lane controller stretches the enqueue-to-
+# execution window enough to hit this. A caller that has enqueued every
+# consumer of the staged buffers calls its runner's registry.fence() once; each pool
+# written since the previous fence then records a per-buffer event on the
+# consuming stream, and the pool host-synchronizes that event before the
+# buffer is rewritten. Code that never fences (the ordinary single-lane
+# runner) behaves exactly as before.
+_ACTIVE_FENCE_REGISTRY = ContextVar("slackserve_uva_registry", default=None)
+
+
+@contextmanager
+def use_uva_fence_registry(registry):
+    token = _ACTIVE_FENCE_REGISTRY.set(registry)
+    try:
+        yield
+    finally:
+        _ACTIVE_FENCE_REGISTRY.reset(token)
+
+
+class UvaFenceRegistry:
+    """Pending UVA writes owned by one runner, never by a process or thread.
+
+    The runner must serialize staging/fencing and fence after the consuming
+    kernels have been enqueued on the supplied stream. Ownership isolation
+    does not replace ordering between that runner's execution lanes.
+    """
+
+    def __init__(self) -> None:
+        self._dirty_pools: list[UvaBufferPool] = []
+        self.isolate_lanes = False
+        self.lane: str | None = None
+
+    @contextmanager
+    def use_lane(self, lane: str):
+        """Select host staging slots on the runner's serialized owner thread.
+
+        Decode retains the original slots, including capture/warmup addresses.
+        Prefill lanes lazily allocate private slots with the same reuse guards.
+        """
+        previous = self.lane
+        self.lane = (
+            lane if self.isolate_lanes and lane not in ("decode", "default") else None
+        )
+        try:
+            yield
+        finally:
+            self.lane = previous
+
+    def fence(self, stream: torch.cuda.Stream | None = None) -> None:
+        """Record consumption of only this runner's pending buffers."""
+        pools, self._dirty_pools = self._dirty_pools, []
+        for pool in pools:
+            pool._record_pending(stream)
+
 
 # Elements copied per program in `_apply_write_kernel`.
 _WRITE_BLOCK_SIZE = 1024
@@ -78,22 +137,95 @@ class UvaBufferPool:
         size: int | Sequence[int],
         dtype: torch.dtype,
         max_concurrency: int | None = None,
+        *,
+        fence_registry: UvaFenceRegistry | None = None,
     ):
         if max_concurrency is None:
             max_concurrency = _DEFAULT_MAX_CONCURRENCY
         self.size = size
         self.dtype = dtype
         self.max_concurrency = max_concurrency
+        self.fence_registry = fence_registry or _ACTIVE_FENCE_REGISTRY.get()
 
         # UVA buffers for concurrency
         self._buffer_cls = UvaBuffer if is_uva_available() else NonUvaBuffer
         self._uva_bufs = [self._buffer_cls(size, dtype) for _ in range(max_concurrency)]
         # Current buffer index
         self._curr = 0
+        # Optional consumption guard (see UvaFenceRegistry.fence).
+        self._events: list[torch.cuda.Event | None] = [None] * max_concurrency
+        self._event_pending = [False] * max_concurrency
+        self._dirty: set[int] = set()
+        self._lane_slots: dict[str | None, list[int]] = {
+            None: list(range(max_concurrency))
+        }
+        self._lane_cursors: dict[str | None, int] = {None: 0}
+        self._consumer_events: dict[int, dict[int, torch.cuda.Event]] = {}
+        self._consumer_pending: dict[int, set[int]] = {}
+
+    def _mark_used(self, index: int) -> None:
+        if self.fence_registry is not None:
+            if not self._dirty:
+                self.fence_registry._dirty_pools.append(self)
+            self._dirty.add(index)
+
+    def mark_read(self) -> None:
+        """Fence fresh consumers even when an immutable UVA view was not copied."""
+        if self.fence_registry is not None and self.fence_registry.isolate_lanes:
+            self._mark_used(self._curr)
+
+    def _record_pending(self, stream: torch.cuda.Stream | None) -> None:
+        if stream is None:
+            stream = torch.cuda.current_stream()
+        for index in self._dirty:
+            if self.fence_registry is not None and self.fence_registry.isolate_lanes:
+                # One snapshot can be read by its owning lane and another
+                # lane without being recopied. Retain every stream's fence;
+                # a fast later reader must not replace a slow earlier one.
+                stream_key = stream.cuda_stream
+                events = self._consumer_events.setdefault(index, {})
+                event = events.get(stream_key)
+                if event is None:
+                    event = torch.cuda.Event()
+                    events[stream_key] = event
+                event.record(stream)
+                self._consumer_pending.setdefault(index, set()).add(stream_key)
+                continue
+            event = self._events[index]
+            if event is None:
+                event = torch.cuda.Event()
+                self._events[index] = event
+            event.record(stream)
+            self._event_pending[index] = True
+        self._dirty.clear()
 
     def _next_buf(self, n: int) -> UvaBuffer | NonUvaBuffer:
-        # Round robin to the next buffer.
-        self._curr = (self._curr + 1) % self.max_concurrency
+        lane = self.fence_registry.lane if self.fence_registry is not None else None
+        if lane not in self._lane_slots:
+            start = len(self._uva_bufs)
+            self._uva_bufs.extend(
+                self._buffer_cls(self.size, self.dtype)
+                for _ in range(self.max_concurrency)
+            )
+            self._events.extend([None] * self.max_concurrency)
+            self._event_pending.extend([False] * self.max_concurrency)
+            self._lane_slots[lane] = list(range(start, start + self.max_concurrency))
+            self._lane_cursors[lane] = 0
+        cursor = (self._lane_cursors[lane] + 1) % self.max_concurrency
+        self._lane_cursors[lane] = cursor
+        self._curr = self._lane_slots[lane][cursor]
+        for stream_key in self._consumer_pending.get(self._curr, ()):
+            self._consumer_events[self._curr][stream_key].synchronize()
+        if self._curr in self._consumer_pending:
+            self._consumer_pending[self._curr].clear()
+        if self._event_pending[self._curr]:
+            # A fenced consumer of this buffer's previous contents may still
+            # be in flight; wait before the host rewrites the memory.
+            event = self._events[self._curr]
+            assert event is not None
+            event.synchronize()
+            self._event_pending[self._curr] = False
+        self._mark_used(self._curr)
         buf = self._uva_bufs[self._curr]
         if n > buf.cpu.shape[0]:
             capacity = 1 << (n - 1).bit_length()
@@ -130,6 +262,8 @@ class UvaBackedTensor:
         size: int | Sequence[int],
         dtype: torch.dtype,
         max_concurrency: int | None = None,
+        *,
+        fence_registry: UvaFenceRegistry | None = None,
     ):
         self.dtype = dtype
 
@@ -138,8 +272,21 @@ class UvaBackedTensor:
         self.np = self.cpu.numpy()
 
         # Buffers for concurrency
-        self.pool = UvaBufferPool(size, dtype, max_concurrency)
+        self.pool = UvaBufferPool(
+            size, dtype, max_concurrency, fence_registry=fence_registry
+        )
         self.gpu = self.pool.copy_to_uva(self.np)
+
+    @property
+    def gpu(self) -> torch.Tensor:
+        # A future ticket can consume the last snapshot without copying it
+        # again (prompt lengths, for example). Extend its consumption fence.
+        self.pool.mark_read()
+        return self._gpu
+
+    @gpu.setter
+    def gpu(self, value: torch.Tensor) -> None:
+        self._gpu = value
 
     def copy_to_uva(self, n: int | None = None) -> torch.Tensor:
         # CPU-to-CPU copy
@@ -155,6 +302,8 @@ class StagedWriteTensor:
         device: torch.device,
         max_concurrency: int | None = None,
         uva_instead_of_gpu: bool = False,
+        *,
+        fence_registry: UvaFenceRegistry | None = None,
     ):
         if max_concurrency is None:
             max_concurrency = _DEFAULT_MAX_CONCURRENCY
@@ -189,7 +338,11 @@ class StagedWriteTensor:
         self._staged_write_chunks: list[_Chunk] = []
         self._staged_write_len = 0
 
-        new_buffer = partial(UvaBufferPool, max_concurrency=max_concurrency)
+        new_buffer = partial(
+            UvaBufferPool,
+            max_concurrency=max_concurrency,
+            fence_registry=fence_registry,
+        )
 
         self.write_indices = new_buffer(self.num_rows, dtype=torch.int32)
         self.write_starts = new_buffer(self.num_rows, dtype=torch.int32)
@@ -283,10 +436,18 @@ class FusedStagedWriter:
     """Applies the staged writes of several `StagedWriteTensor`s at once."""
 
     def __init__(
-        self, device: torch.device, max_writes: int, max_concurrency: int | None = None
+        self,
+        device: torch.device,
+        max_writes: int,
+        max_concurrency: int | None = None,
+        *,
+        fence_registry: UvaFenceRegistry | None = None,
     ):
         new_pool = partial(
-            UvaBufferPool, dtype=torch.int32, max_concurrency=max_concurrency
+            UvaBufferPool,
+            dtype=torch.int32,
+            max_concurrency=max_concurrency,
+            fence_registry=fence_registry,
         )
         self.group_ids = new_pool(max_writes)
         self.indices = new_pool(max_writes)

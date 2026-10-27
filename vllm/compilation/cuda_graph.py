@@ -23,7 +23,6 @@ from vllm.forward_context import (
 )
 from vllm.logger import init_logger
 from vllm.model_executor.offloader.base import get_offloader
-from vllm.platforms import current_platform
 from vllm.utils.torch_utils import current_stream, weak_ref_tensors
 
 logger = init_logger(__name__)
@@ -194,10 +193,9 @@ class CUDAGraphWrapper:
         # assert runtime_mode is not NONE(no cudagraph), otherwise, we don't
         # need to initialize a CUDAGraphWrapper.
         assert self.runtime_mode != CUDAGraphMode.NONE
-        # TODO: in the future, if we want to use multiple
-        # streams, it might not be safe to share a global pool.
-        # only investigate this when we use multiple streams
-        self.graph_pool = current_platform.get_global_graph_pool()
+        # Piecewise wrappers and the runner's full graphs share only this
+        # model's pool. Different co-resident models must not share a pool.
+        self.graph_pool = self.compilation_config.get_cudagraph_pool()
 
         if cudagraph_options is None:
             cudagraph_options = CUDAGraphOptions()
