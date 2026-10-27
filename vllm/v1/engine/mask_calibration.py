@@ -573,12 +573,19 @@ def run_calibration(
             warmers = [submit(warmer_prompt, warmer_output) for _ in range(n)]
             driver.drive(lambda: driver.decode_ready() >= n, 180, f"warming n={n}")
             t0 = time.perf_counter()
+            # Baseline on a settled batch: the first periods after the batch
+            # size jumps carry one-time costs (they made decode "alone" slower
+            # than decode under a mask on Llama/Gemma), so skip them.
+            settle = 12
             driver.drive(
-                lambda: len(driver.decode_periods(t0, time.perf_counter())) >= 12,
+                lambda: len(driver.decode_periods(t0, time.perf_counter()))
+                >= settle + 12,
                 60,
                 f"timing decode alone n={n}",
             )
-            alone_ms = statistics.median(driver.decode_periods(t0, time.perf_counter()))
+            alone_ms = statistics.median(
+                driver.decode_periods(t0, time.perf_counter())[settle:]
+            )
             for cand, result in zip(candidates, results):
                 probe_cell(cand, result, n, alone_ms)
             backend.cancel(model_id, warmers)
