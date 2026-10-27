@@ -48,13 +48,15 @@ class SlackServeGPUWorker(GPUWorker):
                             dtype=self.model_config.dtype,
                             device=self.device,
                         )
-                        for rows in range(1, runner.max_num_reqs + 1):
+                        for rows in range(runner.max_num_reqs, 0, -1):
                             logits = runner.model.compute_logits(hidden[:rows])
                             del logits
                         del hidden
                     stream.synchronize()
                 finally:
                     self._set_prefill_parallel_overrides(False)
+        # Return temporary warmup buffers before real prefill allocations.
+        torch.accelerator.empty_cache()
         return result
 
     def init_colocated_pooling(self, model_id, config):
