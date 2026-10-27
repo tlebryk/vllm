@@ -53,6 +53,40 @@ class SlackServeGPUWorker(GPUWorker):
             pooling_models=list(getattr(self, "_colocated_pooling", {})),
         )
 
+    def describe_parallel_execution(self):
+        from vllm.distributed import parallel_state
+
+        model = self.model_runner.model
+        storage = {}
+        for tensor in list(model.parameters()) + list(model.buffers()):
+            if tensor.is_cuda:
+                block = tensor.untyped_storage()
+                storage[block.data_ptr()] = block.nbytes()
+        experts = [
+            dict(
+                name=name,
+                local=module.local_num_experts,
+                total=module.global_num_experts,
+                rank=module.ep_rank,
+                size=module.ep_size,
+            )
+            for name, module in model.named_modules()
+            if hasattr(module, "local_num_experts")
+            and hasattr(module, "global_num_experts")
+        ]
+        return dict(
+            rank=self.rank,
+            pid=os.getpid(),
+            tp_ranks=parallel_state.get_tp_group().ranks,
+            pp_ranks=parallel_state.get_pp_group().ranks,
+            model_storage_bytes=sum(storage.values()),
+            experts=experts,
+            prefill_stream=self.lane_streams["prefill"].cuda_stream,
+            decode_stream=self.decode_stream.cuda_stream,
+            separate_prefill_pp=self._prefill_pp_group is not None,
+            separate_prefill_ep=self._prefill_ep_group is not None,
+        )
+
     def init_device(self) -> None:
         self.slackserve_config = SlackServeConfig.from_vllm_config(self.vllm_config)
         super().init_device()

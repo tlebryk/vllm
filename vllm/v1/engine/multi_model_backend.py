@@ -591,6 +591,10 @@ class MultiModelBackend:
                 self.colocated_worker_streams = owner.collective_rpc(
                     "configure_colocated_streams", kwargs={"serial": serial}
                 )
+            owner = self.cores[self.specs[0].model_id].model_executor
+            self.parallel_worker_state = owner.collective_rpc(
+                "describe_parallel_execution"
+            )
             prefill = None
             streams = {}
         else:
@@ -882,6 +886,7 @@ class MultiModelBackend:
             "admission": self.admission,
             "topology": self.topology,
             "execution_stream_ids": self.execution_stream_ids,
+            "parallel_worker_state": getattr(self, "parallel_worker_state", None),
             "colocated_worker_streams": getattr(self, "colocated_worker_streams", None),
             "offline_model_serial": serial,
             "step_trace": str(self.step_trace) if self.step_trace is not None else None,
