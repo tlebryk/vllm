@@ -19,8 +19,10 @@ hardcoded offset in the driver's stream struct, keyed on driver version).
 """
 
 import ctypes
+import json
 import logging
 import os
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +57,31 @@ class SmCtrl:
             _CUint128,
         ]
         self.lib.libsmctrl_set_stream_mask_ext.restype = ctypes.c_int
+        # CUDA13's callback layout is probed per physical GPU. Never apply
+        # rank zero's bit mapping blindly to every rank in an allocation.
+        maps_file = os.environ.get("HB_SMCTRL_TPC_MAP_FILE")
+        if maps_file:
+            import torch
+
+            props = torch.cuda.get_device_properties(
+                torch.accelerator.current_device_index()
+            )
+            uuid = str(props.uuid)
+            maps = json.loads(Path(maps_file).read_text())
+            values = maps[uuid]["tpc_map"]
+            count = props.multi_processor_count // 2
+            if (
+                len(values) != count
+                or len(set(values)) != count
+                or any(not isinstance(bit, int) or not 0 <= bit < 128 for bit in values)
+            ):
+                raise ValueError(f"Invalid validated TPC mapping for GPU {uuid}")
+            configure = self.lib.libsmctrl_configure_tpc_map
+            configure.argtypes = [ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32)]
+            configure.restype = ctypes.c_int
+            ret = configure(count, (ctypes.c_uint32 * count)(*values))
+            if ret:
+                raise OSError(ret, f"Cannot configure GPU {uuid} TPC map")
 
     def _set_mask(self, stream, mask: int, desc: str, *, log: bool = True) -> None:
         arg = _CUint128(
