@@ -634,9 +634,26 @@ class MultiModelController:
                 if self.step_observer is not None:
                     self.step_observer(record)
             if productive:
+                # A residency-capped lane stays blocked until one of its
+                # residents finishes; clearing it on every productive decode
+                # ticket dispatched an empty prefill pass per step (job 454442).
+                keep = set()
+                if self._residency_cap:
+                    for key in admission_blocked:
+                        owner = next(
+                            (m for m in self.models if m.model_id == key[0]), None
+                        )
+                        if (
+                            owner is not None
+                            and owner.decode_enabled
+                            and len(owner.core.scheduler.running) >= self._residency_cap
+                        ):
+                            keep.add(key)
                 blocked.clear()
                 reclamation_blocked.clear()
                 admission_blocked.clear()
+                blocked.update(keep)
+                admission_blocked.update(keep)
 
         last_mode: dict[str, str] = {}
 
