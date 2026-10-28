@@ -10,12 +10,15 @@ lane contexts protect its buffers; each model has a distinct runner/KV cache.
 from __future__ import annotations
 
 import math
+import os
 import time
 from collections import deque
 from collections.abc import Callable, Sequence
 from concurrent.futures import FIRST_COMPLETED, wait
 from dataclasses import dataclass, field
 from typing import Any
+
+from vllm.v1.request import RequestStatus
 
 
 @dataclass(frozen=True)
@@ -212,6 +215,36 @@ class DecodeHeadroomGuard:
         return True
 
 
+class ResidencyCap:
+    """Admission guard that caps the number of running requests on a model.
+
+    ``SLACKSERVE_MAX_RUNNING`` (per generation model) refuses new admissions once
+    the scheduler's running set reaches the cap; resumptions of preempted requests
+    pass through. It wraps the lane's KV guard, so KV sizing, memory profiling and
+    the profiled MoE workspace are unchanged (a ``max_num_seqs`` cap shrinks the
+    profiled workspace; a fixed ``kv_cache_memory_bytes`` skips profiling).
+    """
+
+    def __init__(self, sched, cap: int, inner=None):
+        self.sched = sched
+        self.cap = cap
+        self.inner = inner
+        self.name = f"{getattr(inner, 'name', 'none')}+cap{cap}"
+
+    def __call__(self, request) -> bool:
+        if (
+            len(self.sched.running) >= self.cap
+            and request.status != RequestStatus.PREEMPTED
+        ):
+            return False
+        return self.inner is None or self.inner(request)
+
+
+def _residency_cap() -> int | None:
+    value = os.environ.get("SLACKSERVE_MAX_RUNNING")
+    return int(value) if value else None
+
+
 class MultiModelController:
     """One shared prefill ticket and a bounded set of decode tickets.
 
@@ -285,6 +318,7 @@ class MultiModelController:
         if kv_admission not in ("current", "full-output"):
             raise ValueError("unknown KV admission policy")
         self.kv_admission = kv_admission
+        self._residency_cap = _residency_cap()
         if model_policy not in ("round-robin", "bulk-tail"):
             raise ValueError("unknown model policy")
         if not 0 < tail_fraction <= 1:
@@ -625,6 +659,12 @@ class MultiModelController:
                     self._growth_blocks(sched.block_size),
                     model.prefill_step_tokens,
                 )
+            if (
+                self._residency_cap
+                and lane in ("prefill", "default")
+                and model.decode_enabled
+            ):
+                guard = ResidencyCap(sched, self._residency_cap, guard)
             previous_guard = getattr(sched, "_hb_kv_admission_guard", None)
             previous_budget = getattr(sched, "_hb_step_token_budget", None)
             sched._hb_kv_admission_guard = guard
