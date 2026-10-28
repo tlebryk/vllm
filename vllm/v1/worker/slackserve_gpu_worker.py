@@ -201,6 +201,32 @@ class SlackServeGPUWorker(GPUWorker):
             from vllm.v1.worker.hb_smctrl import SmCtrl
 
             self._mask_ctrl = SmCtrl(self.slackserve_config.smctrl_lib)
+            self._mask_by_rank = self._load_mask_by_rank()
+
+    def _load_mask_by_rank(self) -> dict[tuple[int, ...], list[int]]:
+        """Per-rank TPC lists for physically labelled masks on multi-GPU workers.
+
+        ``SLACKSERVE_MASK_BY_RANK`` is JSON ``{"name": [[rank0 indices], [rank1
+        indices], ...]}``. Tickets carry rank 0's list (the floorswept GPC layout
+        differs per board), and this rank applies its own entry instead. Lists
+        are matched by their sorted contents, so candidates, calibration keys
+        and step traces keep rank 0's list unchanged.
+        """
+        raw = os.environ.get("SLACKSERVE_MASK_BY_RANK")
+        if not raw:
+            return {}
+        import json
+
+        from vllm.distributed import parallel_state
+
+        local_rank = parallel_state.get_world_group().local_rank
+        table: dict[tuple[int, ...], list[int]] = {}
+        for name, lists in json.loads(raw).items():
+            if local_rank >= len(lists):
+                raise ValueError(f"mask {name!r} has no entry for rank {local_rank}")
+            key = tuple(sorted(int(i) for i in lists[0]))
+            table[key] = [int(i) for i in lists[local_rank]]
+        return table
 
     def _remote_lane(self, lane: str) -> bool:
         return lane not in ("decode", "default") and (
@@ -230,11 +256,15 @@ class SlackServeGPUWorker(GPUWorker):
             return
         from vllm.v1.worker.hb_smctrl import _disable_mask_from_indices
 
+        # Physically labelled masks: this rank's own list for the ticket's rank-0 list.
+        applied = list(wanted)
+        if wanted:
+            applied = getattr(self, "_mask_by_rank", {}).get(tuple(sorted(wanted)), applied)
         stream = self._lane_stream(lane)
         self._mask_ctrl._set_mask(
             stream,
-            _disable_mask_from_indices(list(wanted)) if wanted else 0,
-            f"TPCs {list(wanted)}" if wanted else "unrestricted",
+            _disable_mask_from_indices(applied) if wanted else 0,
+            f"TPCs {applied}" if wanted else "unrestricted",
             log=False,
         )
         self._applied_mask = wanted
