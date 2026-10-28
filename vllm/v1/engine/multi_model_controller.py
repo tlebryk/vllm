@@ -231,11 +231,19 @@ class ResidencyCap:
         self.inner = inner
         self.name = f"{getattr(inner, 'name', 'none')}+cap{cap}"
 
-    def __call__(self, request) -> bool:
-        if (
+    def _capped(self, request) -> bool:
+        return (
             len(self.sched.running) >= self.cap
             and request.status != RequestStatus.PREEMPTED
-        ):
+        )
+
+    def can_admit(self, request) -> bool:
+        if self._capped(request):
+            return False
+        return self.inner is None or self.inner.can_admit(request)
+
+    def __call__(self, request) -> bool:
+        if self._capped(request):
             return False
         return self.inner is None or self.inner(request)
 
@@ -821,6 +829,11 @@ class MultiModelController:
                         )
                     else:
                         budget = SharedKVAdmissionBudget(self.models, model)
+                    if self._residency_cap and model.decode_enabled:
+                        # A capped lane stays blocked until a resident finishes;
+                        # re-arming it on KV alone dispatches an empty pass per
+                        # decode step (a worker round-trip on every rank).
+                        budget = ResidencyCap(sched, self._residency_cap, budget)
                     inflight = set(sched._hb_inflight_req_ids)
                     inflight.update(getattr(sched, "_hb_async_decode_refs", ()))
                     request = next(
