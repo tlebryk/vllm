@@ -50,6 +50,7 @@ def prepare_models(path, *, mode, budget, decode_depth):
                 ["Gemma4ForCausalLM"],
                 ["LlamaForSequenceClassification"],
                 ["Qwen3ForSequenceClassification"],
+                ["KevQwen3DecisionModel"],  # Qwen3 backbone + Kev pointer head
             )
             or config.model_config.quantization is not None
         ):
@@ -165,7 +166,9 @@ class MultiModelBackend:
         self.mask_candidates = mask_candidates
         self.mask_calibration = mask_calibration
         if mask_rule not in ("queue", "progress", "progress_queue"):
-            raise ValueError("mask policy rule must be queue, progress or progress_queue")
+            raise ValueError(
+                "mask policy rule must be queue, progress or progress_queue"
+            )
         self.mask_rule = mask_rule
         sizes = None
         if mask_calibration_sizes:

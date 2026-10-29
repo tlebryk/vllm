@@ -295,6 +295,8 @@ _TOKEN_CLASSIFICATION_MODELS = {
 }
 
 _SEQUENCE_CLASSIFICATION_MODELS = {
+    "KevDecisionModel": ("kev", "KevDecisionModel"),
+    "KevQwen3DecisionModel": ("kev", "KevQwen3DecisionModel"),
     "BertForSequenceClassification": ("bert", "BertForSequenceClassification"),
     "GPT2ForSequenceClassification": ("gpt2", "GPT2ForSequenceClassification"),
     "ErnieForSequenceClassification": ("ernie", "ErnieForSequenceClassification"),

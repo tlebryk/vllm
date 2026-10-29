@@ -783,6 +783,8 @@ class MultiModelController:
 
         merged_models: set[str] = set()
 
+        pooling_first = os.environ.get("SLACKSERVE_PREFILL_PRIORITY") == "pooling"
+
         def choose(
             lane: str, *, bypass_watermark: bool = False, exclusive_only: bool = False
         ):
@@ -811,7 +813,11 @@ class MultiModelController:
                 (cursor[lane] + offset) % len(self.models)
                 for offset in range(len(self.models))
             ]
-            if lane == "prefill":
+            if lane == "prefill" and pooling_first:
+                # SLACKSERVE_PREFILL_PRIORITY=pooling: a ready pooling ticket
+                # (the pipeline's last stage) goes before generation prefill.
+                indices.sort(key=lambda i: self.models[i].decode_enabled)
+            elif lane == "prefill":
                 # Stable partition retains round-robin within each role.
                 # Pooling fills dense-stream slack only when generation
                 # prefill cannot dispatch (including KV watermark blocking).

@@ -100,6 +100,7 @@ class RequestFuncOutput:
     error: str = ""
     start_time: float = 0.0
     pooling_data: list[dict[str, Any]] | None = None
+    finish_reason: str | None = None
     output_token_ids: list[int] | None = None
     input_audio_duration: float = 0.0  # in seconds
     aux_success: bool | None = None
@@ -234,6 +235,8 @@ async def async_request_openai_completions(
                                 # Note that text could be empty here
                                 # e.g. for special tokens
                                 text = choices[0].get("text")
+                                if reason := choices[0].get("finish_reason"):
+                                    output.finish_reason = reason
                                 if token_ids := choices[0].get("token_ids"):
                                     if output.output_token_ids is None:
                                         output.output_token_ids = []

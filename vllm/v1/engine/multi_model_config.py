@@ -27,6 +27,12 @@ class ModelSpec:
     runner: str = "generate"
     pooling_task: str | None = None
     hf_overrides: dict | None = None
+    # pooling models with their own pooler (Kev) keep it: "none" skips the
+    # classify/embed adapter; multimodal checkpoints run text-only with
+    # {"image": 0, "video": 0}
+    convert: str | None = None
+    limit_mm_per_prompt: dict | None = None
+    gdn_prefill_backend: str | None = None
     tokenizer: str | None = None
     trust_remote_code: bool = False
     compilation: dict | None = None
@@ -75,6 +81,8 @@ class ModelSpec:
             "score",
         ):
             raise ValueError("pooling runner requires an embed/classify/score task")
+        if self.convert not in (None, "none", "embed", "classify"):
+            raise ValueError("convert must be none, embed or classify")
         if self.runner == "generate" and self.pooling_task is not None:
             raise ValueError("generation runner cannot specify a pooling task")
         if type(self.exclusive_execution) is not bool:
@@ -190,7 +198,13 @@ class ModelSpec:
                 "enable_flashinfer_autotune": self.enable_flashinfer_autotune
             }
         if pooling:
-            kwargs["convert"] = "embed" if self.pooling_task == "embed" else "classify"
+            kwargs["convert"] = self.convert or (
+                "embed" if self.pooling_task == "embed" else "classify"
+            )
+        if self.gdn_prefill_backend is not None:
+            kwargs["gdn_prefill_backend"] = self.gdn_prefill_backend
+        if self.limit_mm_per_prompt is not None:
+            kwargs["limit_mm_per_prompt"] = self.limit_mm_per_prompt
         return kwargs
 
 
