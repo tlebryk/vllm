@@ -29,7 +29,11 @@ logger = logging.getLogger(__name__)
 def prepare_models(path, *, mode, budget, decode_depth):
     """Validate model configurations before starting the CUDA owner thread."""
     specs = load_specs(path if isinstance(path, (list, tuple)) else Path(path), 0, 0)
-    if mode != "private" and any(s.enable_prefix_caching for s in specs):
+    if (
+        mode != "private"
+        and any(s.enable_prefix_caching for s in specs)
+        and os.environ.get("SLACKSERVE_SHARED_PREFIX_CACHE") != "1"
+    ):
         raise ValueError("prefix caching currently requires private KV pools")
     if len(specs) == 1 and mode != "private":
         raise ValueError("single-model native serving requires private KV")

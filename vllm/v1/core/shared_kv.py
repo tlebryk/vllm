@@ -6,6 +6,7 @@ Only startup binding uses a ContextVar. Runners and schedulers retain explicit
 manager references afterwards. There is no process-global allocator singleton.
 """
 
+import os
 from collections import deque
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -103,6 +104,8 @@ class SharedKVManager:
         self._pending_blocks = {x.model_id: 0 for x in layouts}
         self._events: dict[str, dict[str, Any]] = {x.model_id: {} for x in layouts}
         self.allocation_listeners = {}
+        # Opt-in prefix caching: model_id -> pool holding leased free blocks.
+        self.cache_pools = {}
         self._thread_id = get_ident()
         self.storage = None
         self.device = None
@@ -201,7 +204,7 @@ class SharedKVManager:
         self._owned_pages[model_id] += count
         return result
 
-    def retire(self, lease, callback=None):
+    def retire(self, lease, callback=None, *, collect=True):
         self._check_thread()
         self.check_healthy()
         key = (lease.model_id, lease.block_id)
@@ -214,6 +217,30 @@ class SharedKVManager:
         self._owned_pages[lease.model_id] -= len(lease.pages)
         self._pending_pages += len(lease.pages)
         self._pending_blocks[lease.model_id] += 1
+        if collect:
+            self.collect()
+
+    def reclaimable_pages(self, model_id, *, fenced=True):
+        """Pages other models' free cached blocks would release on eviction.
+
+        With ``fenced``, only models whose last recorded uses have completed,
+        i.e. pages that eviction makes free immediately.
+        """
+        return sum(
+            len(pool.cached_free) * self.units[other]
+            for other, pool in self.cache_pools.items()
+            if other != model_id
+            and pool.cached_free
+            and (not fenced or all(e.query() for e in self._events[other].values()))
+        )
+
+    def reclaim(self, model_id, pages):
+        """Evict other models' LRU free cached blocks covering ``pages``."""
+        self._check_thread()
+        for other, pool in self.cache_pools.items():
+            if other != model_id and pages > 0:
+                count = -(-pages // self.units[other])
+                pages -= pool.evict_cached(count) * self.units[other]
         self.collect()
 
     def record_use(self, model_id, lane, event):
@@ -239,6 +266,15 @@ class SharedKVManager:
         owned = dict(self._owned_pages)
         pending = self._pending_pages
         assert sum(owned.values()) + pending + len(self._free) + 1 == self.num_pages
+        cached = {}
+        if self.cache_pools:
+            # Owned pages of free cached blocks; evictable on demand.
+            cached = {
+                "cached_pages": {
+                    mid: len(pool.cached_free) * self.units[mid]
+                    for mid, pool in self.cache_pools.items()
+                }
+            }
         return {
             "mode": self.mode,
             "budget_bytes": self.budget_bytes,
@@ -252,6 +288,7 @@ class SharedKVManager:
             "owned_pages": owned,
             "failure": self.failure,
             **self.stats,
+            **cached,
         }
 
     def validate_config(self, model_id, kv_config):
@@ -310,15 +347,19 @@ def install_shared_block_pool(kv_manager, shared_manager, model_id):
     """Replace an empty model-private CPU pool, preserving vLLM request logic."""
     from vllm.v1.core.block_pool import BlockPool
 
+    prefix_cache = os.environ.get("SLACKSERVE_SHARED_PREFIX_CACHE") == "1"
+
     class SharedBlockPool(BlockPool):
         def __init__(self, old):
-            if old.enable_caching or any(b.ref_cnt for b in old.blocks):
+            if (old.enable_caching and not prefix_cache) or any(
+                b.ref_cnt for b in old.blocks
+            ):
                 raise ValueError(
                     "shared KV binding requires empty, non-prefix-cached pool"
                 )
             super().__init__(
                 old.num_gpu_blocks,
-                False,
+                old.enable_caching,
                 old.hash_block_size,
                 old.enable_kv_cache_events,
                 old.metrics_collector,
@@ -366,10 +407,127 @@ def install_shared_block_pool(kv_manager, shared_manager, model_id):
                         lease, lambda b=block: self.free_block_queue.append_n([b])
                     )
 
+    class PrefixCachedSharedBlockPool(SharedBlockPool):
+        """Free cached blocks keep their leases until evicted.
+
+        ``cached_free`` holds them in LRU order instead of the free queue, which
+        holds only lease-less logical IDs. Allocation takes free pages first,
+        then this model's LRU cached blocks (lease reused), then evicts other
+        models' cached blocks. Every pool is registered so either model can
+        reclaim from the other; a pool without caching never caches.
+        """
+
+        def __init__(self, old):
+            super().__init__(old)
+            self.cached_free = {}
+            shared_manager.cache_pools[model_id] = self
+
+        def get_num_free_blocks(self):
+            if shared_manager.failure is not None:
+                return 0
+            shared_manager.collect()
+            pages = len(shared_manager._free) + shared_manager.reclaimable_pages(
+                model_id
+            )
+            return len(self.cached_free) + min(
+                self.free_block_queue.num_free_blocks,
+                pages // shared_manager.units[model_id],
+            )
+
+        def get_new_blocks(self, num_blocks):
+            if num_blocks > self.get_num_free_blocks():
+                raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
+            units = shared_manager.units[model_id]
+            fresh = min(
+                num_blocks,
+                self.free_block_queue.num_free_blocks,
+                len(shared_manager._free) // units,
+            )
+            reuse = min(num_blocks - fresh, len(self.cached_free))
+            fresh = num_blocks - reuse
+            if fresh * units > len(shared_manager._free):
+                shared_manager.reclaim(
+                    model_id, fresh * units - len(shared_manager._free)
+                )
+            blocks = self.free_block_queue.popleft_n(fresh)
+            try:
+                leases = shared_manager.allocate(model_id, [b.block_id for b in blocks])
+            except Exception:
+                self.free_block_queue.append_n(blocks)
+                raise
+            self.shared_leases.update({x.block_id: x for x in leases})
+            for _ in range(reuse):
+                blocks.append(self.cached_free.pop(next(iter(self.cached_free))))
+            for block in blocks:
+                if self.enable_caching:
+                    self._maybe_evict_cached_block(block)
+                assert block.ref_cnt == 0
+                block.ref_cnt += 1
+                if self.metrics_collector:
+                    self.metrics_collector.on_block_allocated(block)
+            return blocks
+
+        def touch(self, blocks):
+            for block in blocks:
+                if block.ref_cnt == 0 and not block.is_null:
+                    del self.cached_free[block.block_id]
+                block.ref_cnt += 1
+                if self.metrics_collector:
+                    self.metrics_collector.on_block_accessed(block)
+
+        def free_blocks(self, ordered_blocks):
+            shared_manager.check_healthy()
+            for block in ordered_blocks:
+                if block.is_null:
+                    continue
+                if block.ref_cnt <= 0:
+                    raise ValueError("duplicate shared KV block release")
+                block.ref_cnt -= 1
+                if block.ref_cnt == 0:
+                    if block.block_hash is not None:
+                        self.cached_free[block.block_id] = block
+                        continue
+                    lease = self.shared_leases.pop(block.block_id)
+                    shared_manager.retire(
+                        lease, lambda b=block: self.free_block_queue.append_n([b])
+                    )
+
+        def evict_cached(self, count):
+            """Drop LRU free cached blocks; IDs return after the page fence."""
+            count = min(count, len(self.cached_free))
+            for _ in range(count):
+                block = self.cached_free.pop(next(iter(self.cached_free)))
+                self._maybe_evict_cached_block(block)
+                shared_manager.retire(
+                    self.shared_leases.pop(block.block_id),
+                    lambda b=block: self.free_block_queue.append_n([b]),
+                    collect=False,
+                )
+            return count
+
+        def can_allocate_after_reclamation(self, num_blocks):
+            shared_manager.collect()
+            if shared_manager.failure is not None:
+                return False
+            units = shared_manager.units[model_id]
+            need = num_blocks - len(self.cached_free)
+            available = len(shared_manager._free) + shared_manager._pending_pages
+            pages = available + shared_manager.reclaimable_pages(model_id, fenced=False)
+            logical = (
+                self.free_block_queue.num_free_blocks
+                + shared_manager._pending_blocks[model_id]
+            )
+            if need > min(pages // units, logical):
+                return False
+            if need * units > available:
+                # Pages become free once the other model's fences complete.
+                shared_manager.reclaim(model_id, need * units - available)
+            return True
+
     old = kv_manager.block_pool
     if old.num_gpu_blocks != shared_manager.logical_capacity(model_id):
         raise ValueError("shared KV scheduler capacity mismatch")
-    pool = SharedBlockPool(old)
+    pool = (PrefixCachedSharedBlockPool if prefix_cache else SharedBlockPool)(old)
     kv_manager.block_pool = kv_manager.coordinator.block_pool = pool
     for manager in kv_manager.coordinator.single_type_managers:
         manager.block_pool = pool

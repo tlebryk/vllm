@@ -202,6 +202,14 @@ class KVCacheManager:
         # num_computed_tokens to be block-size aligned. Removing this limitation
         # could slightly improve performance in the future.
         max_cache_hit_length = request.num_tokens - 1
+        stop = getattr(self, "cache_hit_stop_token_id", None)
+        if stop is not None and request.prompt_token_ids is not None:
+            cap = getattr(request, "_cache_hit_stop", None)
+            if cap is None:
+                ids = request.prompt_token_ids
+                cap = request._cache_hit_stop = ids.index(stop) if stop in ids else -1
+            if cap >= 0:
+                max_cache_hit_length = min(max_cache_hit_length, cap)
         computed_blocks, num_new_computed_tokens = (
             self.coordinator.find_longest_cache_hit(
                 request.block_hashes, max_cache_hit_length

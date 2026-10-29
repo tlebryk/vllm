@@ -145,7 +145,10 @@ class SharedKVAdmissionBudget:
             if sched.num_lookahead_tokens:
                 raise ValueError("output reservation does not support speculative KV")
             reserved = sum(self.pages(model, request) for request in sched.running)
-            occupied += max(reserved, state["owned_pages"][model.model_id])
+            owned = state["owned_pages"][model.model_id]
+            # Free prefix-cached blocks are evictable (opt-in shared caching).
+            owned -= state.get("cached_pages", {}).get(model.model_id, 0)
+            occupied += max(reserved, owned)
             accounted.add(model.model_id)
         occupied += sum(
             pages for mid, pages in state["owned_pages"].items() if mid not in accounted

@@ -248,6 +248,11 @@ class Scheduler(SchedulerInterface):
             hash_block_size=self.block_size,
             metrics_collector=self.kv_metrics_collector,
         )
+        kev = getattr(vllm_config.model_config.hf_config, "kev", None)
+        if kev is not None:
+            # Kev's pooler reads hidden states at every option of the question;
+            # a prefix hit may cover the shared state but never the question.
+            self.kv_cache_manager.cache_hit_stop_token_id = kev["special_ids"]["q"]
         if vllm_config.additional_config.get("shared_kv") is not None:
             from vllm.v1.core.shared_kv import (
                 install_shared_block_pool,
